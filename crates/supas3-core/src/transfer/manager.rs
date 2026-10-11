@@ -1,0 +1,3083 @@
+use super::{TransferEvent, TransferJob, TransferStatus, TransferType};
+use crate::credentials::{Profile, ProfileManager};
+use crate::host::{AppHandle, Emitter};
+use crate::s3::{
+    plan_multipart_upload, MultipartUploadGuard, S3ClientManager, MULTIPART_UPLOAD_THRESHOLD,
+};
+use aws_sdk_s3::error::{DisplayErrorContext, ProvideErrorMetadata};
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::Client;
+use aws_smithy_types::byte_stream::Length;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Mutex, Notify, RwLock};
+
+const MIN_TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MIN_ASSUMED_THROUGHPUT_BYTES_PER_SEC: u64 = 100 * 1024;
+const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn transfer_timeout_for(size_bytes: u64) -> Duration {
+    let scaled_secs = size_bytes.div_ceil(MIN_ASSUMED_THROUGHPUT_BYTES_PER_SEC);
+    Duration::from_secs(scaled_secs).clamp(MIN_TRANSFER_TIMEOUT, MAX_TRANSFER_TIMEOUT)
+}
+
+fn upload_timeout_for(size: u64, rate: u64) -> Duration {
+    if rate == 0 {
+        return transfer_timeout_for(size);
+    }
+    // Deliberate pacing and retry allowance, in addition to network time.
+    transfer_timeout_for(size).max(Duration::from_secs(
+        size.div_ceil(rate).saturating_mul(4).saturating_add(60),
+    ))
+}
+
+// Define a safe shared state for the manager
+pub struct TransferManager {
+    jobs: Arc<RwLock<HashMap<String, TransferJob>>>,
+    queue: Arc<Mutex<VecDeque<String>>>, // List of Job IDs
+    abort_handles: Arc<RwLock<HashMap<String, tokio::task::AbortHandle>>>,
+    max_concurrency: Arc<AtomicUsize>,
+    active_count: Arc<AtomicUsize>,
+    slot_notify: Arc<Notify>,
+    app_handle: Arc<RwLock<Option<AppHandle>>>,
+    journal: Mutex<Option<std::path::PathBuf>>,
+    bandwidth_limit: AtomicUsize,
+}
+
+struct ActiveSlotGuard {
+    active_count: Arc<AtomicUsize>,
+    slot_notify: Arc<Notify>,
+}
+
+impl Drop for ActiveSlotGuard {
+    fn drop(&mut self) {
+        self.active_count.fetch_sub(1, Ordering::AcqRel);
+        self.slot_notify.notify_waiters();
+    }
+}
+
+impl Default for TransferManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TransferManager {
+    pub fn new() -> Self {
+        Self {
+            jobs: Arc::new(RwLock::new(HashMap::new())),
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+            abort_handles: Arc::new(RwLock::new(HashMap::new())),
+            max_concurrency: Arc::new(AtomicUsize::new(5)),
+            active_count: Arc::new(AtomicUsize::new(0)),
+            slot_notify: Arc::new(Notify::new()),
+            app_handle: Arc::new(RwLock::new(None)),
+            journal: Mutex::new(None),
+            bandwidth_limit: AtomicUsize::new(0),
+        }
+    }
+
+    pub async fn set_app_handle(&self, app_handle: AppHandle) {
+        let mut handle = self.app_handle.write().await;
+        *handle = Some(app_handle);
+    }
+
+    /// Number of transfer tasks currently executing.
+    pub fn running_count(&self) -> usize {
+        self.active_count.load(Ordering::Acquire)
+    }
+
+    /// Stops emitting events and releases the host handle.
+    pub async fn clear_app_handle(&self) {
+        *self.app_handle.write().await = None;
+    }
+
+    pub async fn configure_journal(&self, path: std::path::PathBuf) -> crate::error::Result<()> {
+        *self.journal.lock().await = Some(path.clone());
+        if path.exists() {
+            let content = std::fs::read(&path)?;
+            let mut restored: Vec<TransferJob> = match serde_json::from_slice(&content) {
+                Ok(jobs) => jobs,
+                Err(error) => {
+                    let backup = path
+                        .with_file_name(format!("transfers.invalid-{}.json", uuid::Uuid::new_v4()));
+                    std::fs::rename(&path, &backup)?;
+                    log::error!(
+                        "Invalid transfer journal preserved at {}: {error}",
+                        backup.display()
+                    );
+                    Vec::new()
+                }
+            };
+            for job in &mut restored {
+                job.bytes_per_second = 0.0;
+                if matches!(
+                    job.status,
+                    TransferStatus::Pending | TransferStatus::InProgress
+                ) {
+                    job.status = TransferStatus::Failed(match job.transfer_type {
+                        TransferType::Upload => "Interrupted when the app closed. Check the destination before retrying; existing objects will not be replaced.".into(),
+                        TransferType::Download => "Interrupted when the app closed. Queue the download again to choose its destination.".into(),
+                    });
+                    job.finished_at = Some(chrono::Utc::now().timestamp_millis());
+                }
+            }
+            *self.jobs.write().await = restored
+                .into_iter()
+                .map(|job| (job.id.clone(), job))
+                .collect();
+        }
+        self.persist_jobs().await
+    }
+
+    async fn persist_jobs(&self) -> crate::error::Result<()> {
+        // Serialize snapshots and writes together, so an older snapshot cannot win.
+        let journal = self.journal.lock().await;
+        let Some(path) = journal.as_ref() else {
+            return Ok(());
+        };
+        let mut jobs = self.jobs.write().await;
+        let mut finished: Vec<_> = jobs
+            .values()
+            .filter(|job| {
+                matches!(
+                    job.status,
+                    TransferStatus::Completed
+                        | TransferStatus::Failed(_)
+                        | TransferStatus::Cancelled
+                )
+            })
+            .map(|job| (job.finished_at.unwrap_or(job.created_at), job.id.clone()))
+            .collect();
+        finished.sort_unstable();
+        let excess = finished.len().saturating_sub(1000);
+        for (_, id) in finished.into_iter().take(excess) {
+            jobs.remove(&id);
+        }
+        let bytes = serde_json::to_vec(&jobs.values().collect::<Vec<_>>())?;
+        drop(jobs);
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || crate::credentials::write_private_file(&path, &bytes))
+            .await
+            .map_err(|error| crate::error::AppError::IoError(error.to_string()))??;
+        Ok(())
+    }
+
+    async fn persist_or_log(&self) {
+        if let Err(error) = self.persist_jobs().await {
+            log::error!("Transfer recovery journal could not be saved: {error}");
+        }
+    }
+
+    pub async fn add_job(&self, job: TransferJob) {
+        self.add_jobs(vec![job]).await;
+    }
+
+    /// Queues transfers, recording a journal failure on the jobs themselves.
+    /// Callers that can report an error should use [`Self::try_add_jobs`].
+    pub async fn add_jobs(&self, added: Vec<TransferJob>) {
+        let _ = self.try_add_jobs(added).await;
+    }
+
+    pub async fn try_add_job(&self, job: TransferJob) -> crate::error::Result<()> {
+        self.try_add_jobs(vec![job]).await
+    }
+
+    /// Queues transfers and reports a journal failure to the caller. On
+    /// failure nothing is queued and the jobs stay listed as failed.
+    pub async fn try_add_jobs(&self, mut added: Vec<TransferJob>) -> crate::error::Result<()> {
+        for job in &mut added {
+            job.bandwidth_limit
+                .get_or_insert(self.bandwidth_limit.load(Ordering::Acquire) as u64);
+        }
+        {
+            let mut jobs = self.jobs.write().await;
+            for job in &added {
+                jobs.insert(job.id.clone(), job.clone());
+            }
+        }
+        if let Err(error) = self.persist_jobs().await {
+            let mut jobs = self.jobs.write().await;
+            for job in &added {
+                if let Some(current) = jobs.get_mut(&job.id) {
+                    current.status =
+                        TransferStatus::Failed(format!("Could not save queued transfer: {error}"));
+                }
+            }
+            return Err(crate::error::AppError::IoError(format!(
+                "Could not save queued transfer: {error}"
+            )));
+        }
+        {
+            let mut queue = self.queue.lock().await;
+            queue.extend(added.iter().map(|job| job.id.clone()));
+        }
+        for job in added {
+            if let Some(app) = self.app_handle.read().await.as_ref() {
+                let _ = app.emit("transfer-added", &job);
+            }
+            self.emit_update(&job).await;
+        }
+        Ok(())
+    }
+
+    pub fn set_max_concurrency(&self, max: usize) {
+        let clamped = max.clamp(1, 20);
+        self.max_concurrency.store(clamped, Ordering::Release);
+        self.slot_notify.notify_waiters();
+    }
+
+    pub fn set_bandwidth_limit(&self, rate: u64) -> crate::error::Result<()> {
+        super::controls::validate_bandwidth(rate)?;
+        self.bandwidth_limit.store(rate as usize, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) async fn pace_download(
+        &self,
+        job: &TransferJob,
+        bytes: u64,
+    ) -> crate::error::Result<()> {
+        let rate = job.bandwidth_limit.unwrap_or(0);
+        super::controls::validate_bandwidth(rate)?;
+        self.ensure_multipart_job_active(&job.id).await?;
+        if rate > 0 {
+            let deadline = {
+                let mut progress = job.progress.lock().unwrap();
+                let start = *progress
+                    .download_started
+                    .get_or_insert_with(tokio::time::Instant::now);
+                progress.download_bytes =
+                    progress.download_bytes.checked_add(bytes).ok_or_else(|| {
+                        crate::error::AppError::IoError("Download length overflow".into())
+                    })?;
+                start + super::controls::delay(progress.download_bytes, rate)
+            };
+            tokio::time::sleep_until(deadline).await;
+        }
+        self.ensure_multipart_job_active(&job.id).await
+    }
+
+    pub async fn get_job(&self, id: &str) -> Option<TransferJob> {
+        let jobs = self.jobs.read().await;
+        jobs.get(id).cloned()
+    }
+
+    pub async fn list_jobs(&self) -> Vec<TransferJob> {
+        let jobs = self.jobs.read().await;
+        let mut list: Vec<TransferJob> = jobs.values().cloned().collect();
+        list.sort_by_key(|job| std::cmp::Reverse(job.created_at)); // Newest first
+        list
+    }
+
+    /// Cancel a transfer job
+    pub async fn cancel_job(&self, id: &str) -> bool {
+        let mut jobs = self.jobs.write().await;
+        if let Some(job) = jobs.get_mut(id) {
+            // Can only cancel Pending or InProgress jobs
+            match job.status {
+                TransferStatus::Pending | TransferStatus::InProgress => {
+                    job.status = TransferStatus::Cancelled;
+                    job.progress.lock().unwrap().cancelled = true;
+                    job.bytes_per_second = 0.0;
+                    let job_clone = job.clone();
+                    let needs_graceful_cleanup = Self::is_multipart_upload_job(job);
+
+                    {
+                        let mut queue = self.queue.lock().await;
+                        queue.retain(|job_id| job_id != id);
+                    }
+
+                    // Multipart uploads finish their current bounded part and
+                    // abort by upload ID. Other transfers can stop immediately.
+                    let mut handles = self.abort_handles.write().await;
+                    if let Some(handle) = handles.remove(id) {
+                        if needs_graceful_cleanup {
+                            log::info!(
+                                "Cancellation requested for multipart job {}; waiting for the current part so the server-side upload can be aborted cleanly",
+                                id
+                            );
+                        } else {
+                            handle.abort();
+                            log::info!("Aborted job task: {}", id);
+                        }
+                    }
+
+                    drop(handles);
+                    drop(jobs);
+                    self.persist_or_log().await;
+                    self.emit_update(&job_clone).await;
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Remove a specific transfer job from history
+    pub async fn remove_job(&self, id: &str) -> bool {
+        let needs_graceful_cleanup = self
+            .get_job(id)
+            .await
+            .as_ref()
+            .is_some_and(Self::is_multipart_upload_job);
+
+        {
+            let mut queue = self.queue.lock().await;
+            queue.retain(|job_id| job_id != id);
+        }
+
+        let mut handles = self.abort_handles.write().await;
+        if let Some(handle) = handles.remove(id) {
+            if !needs_graceful_cleanup {
+                handle.abort();
+            }
+        }
+        drop(handles);
+
+        let mut jobs = self.jobs.write().await;
+        let removed = jobs.remove(id).is_some_and(|job| {
+            job.progress.lock().unwrap().cancelled = true;
+            true
+        });
+        drop(jobs);
+        self.persist_or_log().await;
+        removed
+    }
+
+    /// Clear all completed/failed/cancelled transfers
+    pub async fn clear_completed(&self) -> usize {
+        let mut jobs = self.jobs.write().await;
+        let initial_count = jobs.len();
+        jobs.retain(|_, job| {
+            matches!(
+                job.status,
+                TransferStatus::Pending | TransferStatus::InProgress
+            )
+        });
+        let removed = initial_count - jobs.len();
+        drop(jobs);
+        self.persist_or_log().await;
+        removed
+    }
+
+    /// Retry a failed transfer
+    pub async fn retry_job(&self, id: &str) -> Option<String> {
+        let jobs = self.jobs.read().await;
+        if let Some(job) = jobs.get(id) {
+            // Can only retry Failed or Cancelled jobs
+            match &job.status {
+                TransferStatus::Failed(_) | TransferStatus::Cancelled => {
+                    if job.url_import.as_ref().is_some_and(|s| s.url.is_empty()) {
+                        return None;
+                    }
+                    if job
+                        .remote_source
+                        .as_ref()
+                        .is_some_and(|s| !s.current_session)
+                    {
+                        return None;
+                    }
+                    // Create a new job with same details
+                    let mut new_job = TransferJob::new(
+                        job.transfer_type.clone(),
+                        job.profile_id.clone(),
+                        job.bucket.clone(),
+                        job.bucket_region.clone(),
+                        job.key.clone(),
+                        std::path::PathBuf::from(&job.local_path),
+                        job.total_bytes,
+                    );
+
+                    new_job.download_destination = job.download_destination.clone();
+                    new_job.sync_source = job.sync_source.clone();
+                    new_job.remote_source = job.remote_source.clone();
+                    new_job.url_import = job.url_import.clone();
+                    new_job.restore_guard = job.restore_guard.clone();
+                    new_job.bandwidth_limit = job.bandwidth_limit;
+
+                    // Preserve grouping info
+                    new_job.parent_group_id = job.parent_group_id.clone();
+                    new_job.group_name = job.group_name.clone();
+                    new_job.is_group_root = job.is_group_root;
+
+                    let new_id = new_job.id.clone();
+                    drop(jobs);
+
+                    // Add the new job to queue
+                    self.add_job(new_job).await;
+                    return Some(new_id);
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    async fn emit_update(&self, job: &TransferJob) {
+        if let Some(app) = self.app_handle.read().await.as_ref() {
+            let event = TransferEvent {
+                phase: job.phase.clone(),
+                job_id: job.id.clone(),
+                bytes_per_second: job.bytes_per_second,
+                processed_bytes: job.processed_bytes,
+                total_bytes: job.total_bytes,
+                status: job.status.clone(),
+                finished_at: job.finished_at,
+            };
+            let _ = app.emit("transfer-update", event);
+        }
+    }
+
+    fn is_multipart_upload_job(job: &TransferJob) -> bool {
+        if !matches!(job.transfer_type, TransferType::Upload) {
+            return false;
+        }
+
+        job.total_bytes >= MULTIPART_UPLOAD_THRESHOLD
+            || std::fs::metadata(&job.local_path)
+                .map(|metadata| metadata.len() >= MULTIPART_UPLOAD_THRESHOLD)
+                .unwrap_or(false)
+    }
+
+    pub(super) async fn ensure_multipart_job_active(&self, id: &str) -> crate::error::Result<()> {
+        match self.get_job(id).await.map(|job| job.status) {
+            Some(TransferStatus::InProgress) => Ok(()),
+            Some(TransferStatus::Cancelled) | None => Err(crate::error::AppError::ConfigError(
+                "Multipart upload was cancelled".to_string(),
+            )),
+            Some(status) => Err(crate::error::AppError::ConfigError(format!(
+                "Multipart upload stopped because the transfer is no longer active ({status:?})"
+            ))),
+        }
+    }
+
+    async fn acquire_slot(&self) -> ActiveSlotGuard {
+        loop {
+            let notified = self.slot_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let max = self.max_concurrency.load(Ordering::Acquire).max(1);
+            let active = self.active_count.load(Ordering::Acquire);
+
+            if active < max {
+                if self
+                    .active_count
+                    .compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return ActiveSlotGuard {
+                        active_count: self.active_count.clone(),
+                        slot_notify: self.slot_notify.clone(),
+                    };
+                }
+                continue;
+            }
+
+            notified.await;
+        }
+    }
+
+    // Process the queue using a worker pool that respects max concurrency
+    pub async fn process_queue(
+        self: Arc<Self>,
+        s3_manager: Arc<RwLock<S3ClientManager>>,
+        profile_manager: Arc<RwLock<ProfileManager>>,
+    ) {
+        let manager = self.clone();
+
+        tokio::spawn(async move {
+            loop {
+                // 1. Get next job from queue
+                let next_id = {
+                    let mut queue = manager.queue.lock().await;
+                    if queue.is_empty() {
+                        break;
+                    }
+                    queue.pop_front().expect("queue checked above")
+                };
+
+                // 2. Wait for a slot in the concurrency limit
+                let slot_guard = manager.acquire_slot().await;
+
+                // 3. Spawn the task
+                let manager_inner = manager.clone();
+                let s3_inner = s3_manager.clone();
+                let profiles_inner = profile_manager.clone();
+                let id_inner = next_id.clone();
+
+                let handle = tokio::spawn(async move {
+                    let _slot_guard = slot_guard;
+                    let should_run = matches!(
+                        manager_inner.get_job(&id_inner).await.map(|job| job.status),
+                        Some(TransferStatus::Pending)
+                    );
+
+                    if !should_run {
+                        return;
+                    }
+
+                    // Update status to InProgress
+                    manager_inner
+                        .update_job_status(&id_inner, TransferStatus::InProgress)
+                        .await;
+
+                    // Run the job
+                    let job_opt = manager_inner.get_job(&id_inner).await;
+                    if let Some(job) = job_opt {
+                        if job.status != TransferStatus::InProgress {
+                            return;
+                        }
+                        let profile_result = {
+                            let profiles = profiles_inner.read().await;
+                            profiles.get_profile(&job.profile_id).await
+                        };
+
+                        let result = match profile_result {
+                            Ok(profile) => {
+                                let execution = manager_inner.execute_queued_job(
+                                    &job,
+                                    s3_inner,
+                                    &profile,
+                                    profiles_inner.clone(),
+                                );
+                                tokio::pin!(execution);
+                                let mut timer = tokio::time::interval(Duration::from_millis(250));
+                                timer.set_missed_tick_behavior(
+                                    tokio::time::MissedTickBehavior::Skip,
+                                );
+                                let mut speed =
+                                    super::speed::SpeedWindow::new(std::time::Instant::now());
+                                loop {
+                                    tokio::select! {
+                                        result = &mut execution => break result,
+                                        _ = timer.tick() => {
+                                            let (position, attempt) = {
+                                                let progress = job.progress.lock().unwrap();
+                                                (progress.position, progress.attempt)
+                                            };
+                                            let rate = speed.sample(std::time::Instant::now(), position, attempt);
+                                            let mut jobs = manager_inner.jobs.write().await;
+                                            if let Some(current) = jobs.get_mut(&job.id) {
+                                                if current.status == TransferStatus::InProgress {
+                                                    current.processed_bytes = if current.total_bytes > 0 {
+                                                        position.min(current.total_bytes)
+                                                    } else {
+                                                        position
+                                                    };
+                                                    current.bytes_per_second = rate;
+                                                    manager_inner.emit_update(current).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => Err(err),
+                        };
+
+                        match result {
+                            Ok(_) => {
+                                // Double check if it was cancelled while we were working
+                                if let Some(current_job) = manager_inner.get_job(&id_inner).await {
+                                    if !matches!(current_job.status, TransferStatus::Cancelled) {
+                                        manager_inner
+                                            .update_job_status(&id_inner, TransferStatus::Completed)
+                                            .await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let was_cancelled = matches!(
+                                    manager_inner.get_job(&id_inner).await.map(|job| job.status),
+                                    Some(TransferStatus::Cancelled) | None
+                                );
+                                if !was_cancelled {
+                                    log::error!("Transfer job {} failed: {}", id_inner, e);
+                                    manager_inner
+                                        .update_job_status(
+                                            &id_inner,
+                                            TransferStatus::Failed(e.to_string()),
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+
+                    // Remove abort handle when done
+                    let mut handles = manager_inner.abort_handles.write().await;
+                    handles.remove(&id_inner);
+                });
+
+                // 4. Store the abort handle so we can cancel it later
+                let mut handles = manager.abort_handles.write().await;
+                handles.insert(next_id, handle.abort_handle());
+            }
+        });
+    }
+
+    async fn update_job_status(&self, id: &str, status: TransferStatus) {
+        {
+            let mut jobs = self.jobs.write().await;
+            if let Some(job) = jobs.get_mut(id) {
+                if matches!(
+                    job.status,
+                    TransferStatus::Cancelled
+                        | TransferStatus::Completed
+                        | TransferStatus::Failed(_)
+                ) && job.status != status
+                {
+                    return;
+                }
+                job.status = status.clone();
+                job.bytes_per_second = 0.0;
+                // If final status, set finished_at
+                match status {
+                    TransferStatus::Completed
+                    | TransferStatus::Failed(_)
+                    | TransferStatus::Cancelled => {
+                        job.finished_at = Some(chrono::Utc::now().timestamp_millis());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.persist_or_log().await;
+        if let Some(job) = self.get_job(id).await {
+            self.emit_update(&job).await;
+        }
+    }
+
+    async fn update_job_total_size(&self, id: &str, size: u64) {
+        {
+            let mut jobs = self.jobs.write().await;
+            if let Some(job) = jobs.get_mut(id) {
+                job.total_bytes = size;
+            }
+        }
+        if let Some(job) = self.get_job(id).await {
+            self.emit_update(&job).await;
+        }
+    }
+
+    pub(super) async fn set_job_phase(&self, id: &str, phase: &str, size: u64, position: u64) {
+        let mut jobs = self.jobs.write().await;
+        if let Some(job) = jobs.get_mut(id) {
+            job.phase = Some(phase.into());
+            job.total_bytes = size;
+            job.processed_bytes = position;
+            job.bytes_per_second = 0.0;
+            {
+                let mut progress = job.progress.lock().unwrap();
+                progress.position = position;
+                progress.attempt += 1;
+            }
+            self.emit_update(job).await;
+        }
+    }
+
+    async fn update_job_progress(&self, id: &str, processed: u64) {
+        {
+            let mut jobs = self.jobs.write().await;
+            if let Some(job) = jobs.get_mut(id) {
+                if job.status != TransferStatus::InProgress {
+                    return;
+                }
+                job.processed_bytes = processed;
+                job.progress.lock().unwrap().position = processed;
+            }
+        }
+        if let Some(job) = self.get_job(id).await {
+            self.emit_update(&job).await;
+        }
+    }
+
+    async fn upload_file(
+        &self,
+        client: &Client,
+        job: &TransferJob,
+        content_type: &str,
+    ) -> crate::error::Result<()> {
+        // Sync uploads use a verified, immutable disk snapshot. Ordinary uploads retain
+        // their existing path and no-overwrite behavior.
+        let snapshot = if let Some(source) = job.sync_source.clone() {
+            Some(
+                tokio::task::spawn_blocking(move || super::sync::snapshot(&source))
+                    .await
+                    .map_err(|e| crate::error::AppError::IoError(e.to_string()))??,
+            )
+        } else {
+            None
+        };
+        let mut prepared_job = job.clone();
+        if let Some(snapshot) = &snapshot {
+            prepared_job.local_path = snapshot.path().to_string_lossy().into_owned();
+        }
+        let job = &prepared_job;
+        let expected_etag = job
+            .sync_source
+            .as_ref()
+            .and_then(|s| s.expected_etag.as_deref());
+        let attributes = if let Some(etag) = expected_etag {
+            Some(super::sync::attributes(client, &job.bucket, &job.key, etag).await?)
+        } else {
+            None
+        };
+        self.upload_prepared(client, job, content_type, attributes.as_ref())
+            .await
+    }
+
+    async fn upload_prepared(
+        &self,
+        client: &Client,
+        job: &TransferJob,
+        content_type: &str,
+        attributes: Option<&super::sync::Attributes>,
+    ) -> crate::error::Result<()> {
+        let expected_etag = job.destination_etag();
+        let offset = job.remote_source.as_ref().map_or(0, |s| s.size);
+        let metadata = tokio::fs::metadata(&job.local_path)
+            .await
+            .map_err(|error| {
+                crate::error::AppError::IoError(format!(
+                    "Cannot read upload file '{}': {error}",
+                    job.local_path
+                ))
+            })?;
+        if !metadata.is_file() {
+            return Err(crate::error::AppError::IoError(format!(
+                "Upload source '{}' is not a regular file",
+                job.local_path
+            )));
+        }
+
+        let file_size = metadata.len();
+        if job.remote_source.is_none() && job.total_bytes != file_size {
+            self.update_job_total_size(&job.id, file_size).await;
+        }
+
+        if file_size < MULTIPART_UPLOAD_THRESHOLD {
+            if let Some(guard) = &job.restore_guard {
+                crate::s3::versions::validate_restore(client, &job.bucket, &job.key, guard).await?;
+                self.ensure_multipart_job_active(&job.id).await?;
+            }
+            let body = ByteStream::from_path(&job.local_path)
+                .await
+                .map_err(|error| crate::error::AppError::IoError(error.to_string()))?;
+            let body = super::speed::track_limited(
+                body,
+                job.progress.clone(),
+                offset,
+                job.bandwidth_limit.unwrap_or(0),
+            );
+            let timeout = upload_timeout_for(file_size, job.bandwidth_limit.unwrap_or(0));
+            let mut request = client
+                .put_object()
+                .bucket(&job.bucket)
+                .key(&job.key)
+                .content_type(content_type)
+                .set_if_none_match(expected_etag.is_none().then(|| "*".into()))
+                .set_if_match(expected_etag.map(str::to_owned))
+                .body(body);
+            if let Some(attributes) = &attributes {
+                request = super::sync::apply_put(request, attributes);
+            }
+            let without_acl = if let Some(attributes) = &attributes {
+                let body = ByteStream::from_path(&job.local_path)
+                    .await
+                    .map_err(|e| crate::error::AppError::IoError(e.to_string()))?;
+                let request = client
+                    .put_object()
+                    .bucket(&job.bucket)
+                    .key(&job.key)
+                    .set_if_match(expected_etag.map(str::to_owned))
+                    .set_if_none_match(expected_etag.is_none().then(|| "*".into()))
+                    .body(super::speed::track_limited(
+                        body,
+                        job.progress.clone(),
+                        offset,
+                        job.bandwidth_limit.unwrap_or(0),
+                    ));
+                Some(
+                    super::sync::apply_put(request, attributes)
+                        .set_grant_full_control(None)
+                        .set_grant_read(None)
+                        .set_grant_read_acp(None)
+                        .set_grant_write_acp(None),
+                )
+            } else {
+                None
+            };
+            let send = async {
+                let result = request.send().await;
+                if result.as_ref().err().is_some_and(|e| {
+                    e.as_service_error().and_then(|s| s.code())
+                        == Some("AccessControlListNotSupported")
+                }) && attributes.as_ref().is_some_and(|a| a.acl.is_some())
+                {
+                    // Explicit bucket-owner-enforced rejection: retry without ACL grants,
+                    // preserving the same If-Match and every other object attribute.
+                    without_acl
+                        .expect("replacement attributes were checked")
+                        .send()
+                        .await
+                } else {
+                    result
+                }
+            };
+            match tokio::time::timeout(timeout, send).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return Err(crate::error::AppError::S3Error(format!(
+                        "Single-part upload failed for s3://{}/{}: {}",
+                        job.bucket,
+                        job.key,
+                        DisplayErrorContext(&error)
+                    )));
+                }
+                Err(_) => {
+                    return Err(crate::error::AppError::S3Error(format!(
+                        "Single-part upload timed out after {}s for s3://{}/{} with no response from S3 \
+                         (check the endpoint, region, network/proxy, and TLS configuration)",
+                        timeout.as_secs(),
+                        job.bucket,
+                        job.key
+                    )));
+                }
+            }
+            self.update_job_progress(&job.id, offset + file_size).await;
+            return Ok(());
+        }
+
+        self.multipart_upload_file(client, job, content_type, file_size, attributes)
+            .await
+    }
+
+    async fn multipart_upload_file(
+        &self,
+        client: &Client,
+        job: &TransferJob,
+        content_type: &str,
+        file_size: u64,
+        attributes: Option<&super::sync::Attributes>,
+    ) -> crate::error::Result<()> {
+        self.ensure_multipart_job_active(&job.id).await?;
+        let plan = plan_multipart_upload(file_size)?;
+        let mut create_request = client
+            .create_multipart_upload()
+            .bucket(&job.bucket)
+            .key(&job.key)
+            .content_type(content_type);
+        if let Some(attributes) = attributes {
+            create_request = super::sync::apply_multipart(create_request, attributes);
+        }
+        let create_send = async {
+            let result = create_request.clone().send().await;
+            if result.as_ref().err().is_some_and(|e| {
+                e.as_service_error().and_then(|s| s.code()) == Some("AccessControlListNotSupported")
+            }) && attributes.is_some_and(|a| a.acl.is_some())
+            {
+                create_request
+                    .set_grant_full_control(None)
+                    .set_grant_read(None)
+                    .set_grant_read_acp(None)
+                    .set_grant_write_acp(None)
+                    .send()
+                    .await
+            } else {
+                result
+            }
+        };
+        let created = match tokio::time::timeout(METADATA_REQUEST_TIMEOUT, create_send).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                return Err(crate::error::AppError::S3Error(format!(
+                    "Could not start multipart upload for s3://{}/{}: {}",
+                    job.bucket,
+                    job.key,
+                    DisplayErrorContext(&error)
+                )));
+            }
+            Err(_) => {
+                return Err(crate::error::AppError::S3Error(format!(
+                    "Starting multipart upload timed out after {}s for s3://{}/{} with no response from S3 \
+                     (check the endpoint, region, network/proxy, and TLS configuration)",
+                    METADATA_REQUEST_TIMEOUT.as_secs(),
+                    job.bucket,
+                    job.key
+                )));
+            }
+        };
+        let upload_id = created.upload_id().ok_or_else(|| {
+            crate::error::AppError::S3Error(format!(
+                "S3 did not return an upload ID for s3://{}/{}",
+                job.bucket, job.key
+            ))
+        })?;
+        let mut guard =
+            MultipartUploadGuard::new(client.clone(), &job.bucket, &job.key, upload_id.to_string());
+
+        let upload_result: crate::error::Result<()> = async {
+            self.ensure_multipart_job_active(&job.id).await?;
+            let mut completed_parts = Vec::with_capacity(plan.parts.len());
+            let mut uploaded_bytes = 0_u64;
+
+            for part in &plan.parts {
+                self.ensure_multipart_job_active(&job.id).await?;
+                let body = ByteStream::read_from()
+                    .path(&job.local_path)
+                    .offset(part.offset)
+                    .length(Length::Exact(part.length))
+                    .buffer_size(if job.bandwidth_limit.unwrap_or(0) == 0 { 1024 * 1024 } else { 16 * 1024 })
+                    .build()
+                    .await
+                    .map_err(|error| {
+                        crate::error::AppError::IoError(format!(
+                            "Could not read part {} from '{}': {error}",
+                            part.number, job.local_path
+                        ))
+                    })?;
+
+                let offset = job.remote_source.as_ref().map_or(0, |s| s.size);
+                let body = super::speed::track_limited(body, job.progress.clone(), offset + part.offset, job.bandwidth_limit.unwrap_or(0));
+                let part_timeout = upload_timeout_for(part.length, job.bandwidth_limit.unwrap_or(0));
+                let part_send = client
+                    .upload_part()
+                    .bucket(&job.bucket)
+                    .key(&job.key)
+                    .upload_id(guard.upload_id())
+                    .part_number(part.number)
+                    .content_length(part.length as i64)
+                    .body(body)
+                    .send();
+                let output = match tokio::time::timeout(part_timeout, part_send).await {
+                    Ok(Ok(output)) => output,
+                    Ok(Err(error)) => {
+                        return Err(crate::error::AppError::S3Error(format!(
+                            "Multipart upload failed at part {} of {} for s3://{}/{}: {}",
+                            part.number,
+                            plan.parts.len(),
+                            job.bucket,
+                            job.key,
+                            DisplayErrorContext(&error)
+                        )));
+                    }
+                    Err(_) => {
+                        return Err(crate::error::AppError::S3Error(format!(
+                            "Multipart upload timed out after {}s at part {} of {} for s3://{}/{} with no \
+                             response from S3 (check the endpoint, region, network/proxy, and TLS configuration)",
+                            part_timeout.as_secs(),
+                            part.number,
+                            plan.parts.len(),
+                            job.bucket,
+                            job.key
+                        )));
+                    }
+                };
+                self.ensure_multipart_job_active(&job.id).await?;
+                let e_tag = output.e_tag().ok_or_else(|| {
+                    crate::error::AppError::S3Error(format!(
+                        "S3 did not return an ETag for multipart part {} of s3://{}/{}",
+                        part.number, job.bucket, job.key
+                    ))
+                })?;
+
+                completed_parts.push(
+                    CompletedPart::builder()
+                        .part_number(part.number)
+                        .e_tag(e_tag)
+                        .build(),
+                );
+                uploaded_bytes += part.length;
+                self.update_job_progress(&job.id, offset + uploaded_bytes).await;
+            }
+
+            self.ensure_multipart_job_active(&job.id).await?;
+            let completed_upload = CompletedMultipartUpload::builder()
+                .set_parts(Some(completed_parts))
+                .build();
+            if let Some(guard) = &job.restore_guard {
+                crate::s3::versions::validate_restore(client, &job.bucket, &job.key, guard).await?;
+                self.ensure_multipart_job_active(&job.id).await?;
+            }
+            let complete_send = client
+                .complete_multipart_upload()
+                .set_if_none_match(job.destination_etag().is_none().then(|| "*".into()))
+                .set_if_match(job.destination_etag().map(str::to_owned))
+                .bucket(&job.bucket)
+                .key(&job.key)
+                .upload_id(guard.upload_id())
+                .multipart_upload(completed_upload)
+                .send();
+            match tokio::time::timeout(METADATA_REQUEST_TIMEOUT, complete_send).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return Err(crate::error::AppError::S3Error(format!(
+                        "Could not complete multipart upload for s3://{}/{}: {}",
+                        job.bucket,
+                        job.key,
+                        DisplayErrorContext(&error)
+                    )));
+                }
+                Err(_) => {
+                    return Err(crate::error::AppError::S3Error(format!(
+                        "Completing multipart upload timed out after {}s for s3://{}/{} with no response from S3 \
+                         (check the endpoint, region, network/proxy, and TLS configuration)",
+                        METADATA_REQUEST_TIMEOUT.as_secs(),
+                        job.bucket,
+                        job.key
+                    )));
+                }
+            }
+
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = upload_result {
+            if let Err(abort_error) = guard.abort().await {
+                log::error!("{}", abort_error);
+            }
+            return Err(error);
+        }
+
+        guard.disarm();
+        Ok(())
+    }
+
+    async fn execute_queued_job(
+        &self,
+        job: &TransferJob,
+        s3_manager: Arc<RwLock<S3ClientManager>>,
+        destination: &Profile,
+        profiles: Arc<RwLock<ProfileManager>>,
+    ) -> crate::error::Result<()> {
+        super::controls::validate_bandwidth(job.bandwidth_limit.unwrap_or(0))?;
+        if let Some(source) = &job.url_import {
+            if source.profile_identity != destination.cache_identity() {
+                return Err(crate::error::AppError::ConfigError(
+                    "Connection settings changed. Import the URLs again.".into(),
+                ));
+            }
+            let client = {
+                let mut s3 = s3_manager.write().await;
+                match &job.bucket_region {
+                    Some(region) => s3.get_client_for_region(destination, region).await?.clone(),
+                    None => s3.get_client(destination).await?.clone(),
+                }
+            };
+            let temporary = super::url_import::stage(source, job, self).await?;
+            self.ensure_multipart_job_active(&job.id).await?;
+            let mut prepared = job.clone();
+            prepared.local_path = temporary.path().to_string_lossy().into_owned();
+            prepared.total_bytes = temporary.as_file().metadata()?.len();
+            let attributes = if let Some(etag) = &source.expected_etag {
+                Some(super::sync::attributes(&client, &job.bucket, &job.key, etag).await?)
+            } else {
+                None
+            };
+            self.upload_prepared(
+                &client,
+                &prepared,
+                &crate::s3::infer_content_type(&job.key),
+                attributes.as_ref(),
+            )
+            .await?;
+            s3_manager
+                .write()
+                .await
+                .remove_bucket_cache(&destination.id, &job.bucket);
+            return Ok(());
+        }
+        let Some(source) = &job.remote_source else {
+            return self.execute_job(job, s3_manager, destination).await;
+        };
+        let source_profile = profiles
+            .read()
+            .await
+            .get_profile(&source.profile_id)
+            .await?;
+        source.validate_profiles(&source_profile, destination)?;
+        let (source_client, destination_client) = {
+            let mut s3 = s3_manager.write().await;
+            let source_client = s3
+                .get_client_for_region(&source_profile, &source.region)
+                .await?
+                .clone();
+            let destination_client = match &job.bucket_region {
+                Some(region) => s3.get_client_for_region(destination, region).await?.clone(),
+                None => s3.get_client(destination).await?.clone(),
+            };
+            (source_client, destination_client)
+        };
+        self.execute_remote_copy(&source_client, &destination_client, job)
+            .await?;
+        s3_manager
+            .write()
+            .await
+            .remove_bucket_cache(&destination.id, &job.bucket);
+        Ok(())
+    }
+
+    async fn execute_remote_copy(
+        &self,
+        source_client: &Client,
+        destination_client: &Client,
+        job: &TransferJob,
+    ) -> crate::error::Result<()> {
+        let source = job
+            .remote_source
+            .as_ref()
+            .ok_or_else(|| crate::error::AppError::ConfigError("Missing remote source.".into()))?;
+        if let Some(guard) = &job.restore_guard {
+            crate::s3::versions::validate_restore(destination_client, &job.bucket, &job.key, guard)
+                .await?;
+        }
+        let (temporary, mut attributes) =
+            super::remote::stage(source_client, source, job, self).await?;
+        self.ensure_multipart_job_active(&job.id).await?;
+        if let Some(guard) = &job.restore_guard {
+            if let Some(etag) = &guard.current_etag {
+                let mut current =
+                    super::sync::attributes(destination_client, &job.bucket, &job.key, etag)
+                        .await?;
+                if current.head.version_id() != Some(guard.current_version.as_str()) {
+                    return Err(crate::error::AppError::S3Error(
+                        "Current version changed. Refresh history and confirm again.".into(),
+                    ));
+                }
+                current.head.content_type = attributes.head.content_type;
+                current.head.cache_control = attributes.head.cache_control;
+                current.head.content_disposition = attributes.head.content_disposition;
+                current.head.content_encoding = attributes.head.content_encoding;
+                current.head.content_language = attributes.head.content_language;
+                current.head.metadata = attributes.head.metadata;
+                attributes = current;
+            }
+        }
+        let mut prepared = job.clone();
+        prepared.local_path = temporary.path().to_string_lossy().into_owned();
+        self.upload_prepared(
+            destination_client,
+            &prepared,
+            "application/octet-stream",
+            Some(&attributes),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn execute_job(
+        &self,
+        job: &TransferJob,
+        s3_manager: Arc<RwLock<S3ClientManager>>,
+        profile: &Profile,
+    ) -> crate::error::Result<()> {
+        if job
+            .sync_source
+            .as_ref()
+            .is_some_and(|s| !s.current_session || s.profile_identity != profile.cache_identity())
+        {
+            return Err(crate::error::AppError::ConfigError(
+                "Sync profile settings changed or the app restarted. Create a fresh preview."
+                    .into(),
+            ));
+        }
+        let resolved_region = {
+            let s3 = s3_manager.read().await;
+            s3.get_bucket_region(profile, &job.bucket)
+        }
+        .or(job.bucket_region.clone());
+
+        let client = {
+            let mut s3 = s3_manager.write().await;
+            let c = if let Some(ref region) = resolved_region {
+                s3.get_client_for_region(profile, region).await?
+            } else {
+                s3.get_client(profile).await?
+            };
+            c.clone()
+        };
+
+        let detect_region = async {
+            let retry_client = {
+                let mut s3 = s3_manager.write().await;
+                s3.get_client(profile).await?.clone()
+            };
+
+            let new_region = crate::s3::get_bucket_region(&retry_client, &job.bucket)
+                .await
+                .ok();
+            if let Some(ref region) = new_region {
+                let mut s3 = s3_manager.write().await;
+                s3.set_bucket_region(profile, &job.bucket, region.clone());
+            }
+            Ok::<Option<String>, crate::error::AppError>(new_region)
+        };
+
+        match job.transfer_type {
+            TransferType::Upload => {
+                let content_type = crate::s3::infer_content_type(&job.key);
+                if let Err(first_error) = self.upload_file(&client, job, &content_type).await {
+                    if !matches!(
+                        self.get_job(&job.id).await.map(|current| current.status),
+                        Some(TransferStatus::InProgress)
+                    ) {
+                        return Err(first_error);
+                    }
+                    log::warn!(
+                        "Upload failed using configured region {:?}; checking the bucket region once before returning the error: {}",
+                        resolved_region,
+                        first_error
+                    );
+
+                    let detected_region = detect_region.await?;
+                    let retry_region = detected_region
+                        .filter(|region| resolved_region.as_deref() != Some(region.as_str()));
+                    if let Some(new_region) = retry_region {
+                        let retry_client = {
+                            let mut s3 = s3_manager.write().await;
+                            s3.get_client_for_region(profile, &new_region)
+                                .await?
+                                .clone()
+                        };
+                        self.update_job_progress(&job.id, 0).await;
+                        self.upload_file(&retry_client, job, &content_type)
+                            .await
+                            .map_err(|error| {
+                                crate::error::AppError::S3Error(format!(
+                                    "Upload retry in detected bucket region '{new_region}' failed: {error}"
+                                ))
+                            })?;
+                    } else {
+                        return Err(first_error);
+                    }
+                }
+
+                {
+                    let mut s3 = s3_manager.write().await;
+                    s3.remove_bucket_cache(&profile.id, &job.bucket);
+                }
+            }
+            TransferType::Download => {
+                let result = tokio::time::timeout(
+                    METADATA_REQUEST_TIMEOUT,
+                    client.get_object().bucket(&job.bucket).key(&job.key).send(),
+                )
+                .await;
+
+                let mut output = match result {
+                    Ok(Ok(output)) => output,
+                    Err(_) => {
+                        return Err(crate::error::AppError::S3Error(format!(
+                            "Download timed out after {}s for s3://{}/{} with no response from S3 \
+                             (check the endpoint, region, network/proxy, and TLS configuration)",
+                            METADATA_REQUEST_TIMEOUT.as_secs(),
+                            job.bucket,
+                            job.key
+                        )));
+                    }
+                    Ok(Err(err)) => {
+                        log::warn!(
+                            "download transfer failed, attempting region discovery: {}",
+                            DisplayErrorContext(&err)
+                        );
+
+                        if let Some(new_region) = detect_region.await? {
+                            let retry_client = {
+                                let mut s3 = s3_manager.write().await;
+                                s3.get_client_for_region(profile, &new_region)
+                                    .await?
+                                    .clone()
+                            };
+
+                            tokio::time::timeout(
+                                METADATA_REQUEST_TIMEOUT,
+                                retry_client
+                                    .get_object()
+                                    .bucket(&job.bucket)
+                                    .key(&job.key)
+                                    .send(),
+                            )
+                            .await
+                            .map_err(|_| {
+                                crate::error::AppError::S3Error(format!(
+                                    "Retry download timed out after {}s for s3://{}/{} with no response \
+                                     from S3 (check the endpoint, region, network/proxy, and TLS configuration)",
+                                    METADATA_REQUEST_TIMEOUT.as_secs(),
+                                    job.bucket,
+                                    job.key
+                                ))
+                            })?
+                            .map_err(|e| {
+                                crate::error::AppError::S3Error(format!(
+                                    "Retry download failed: {}",
+                                    DisplayErrorContext(&e)
+                                ))
+                                })?
+                        } else {
+                            return Err(crate::error::AppError::S3Error(format!(
+                                "{}",
+                                DisplayErrorContext(&err)
+                            )));
+                        }
+                    }
+                };
+
+                let destination = job.download_destination.as_ref().ok_or_else(|| {
+                    crate::error::AppError::IoError(
+                        "Missing download destination. Queue the download again.".to_string(),
+                    )
+                })?;
+                let mut download = destination.begin()?;
+
+                let mut downloaded: u64 = 0;
+                let mut last_update = std::time::Instant::now();
+
+                while let Some(bytes) =
+                    tokio::time::timeout(METADATA_REQUEST_TIMEOUT, output.body.try_next())
+                        .await
+                        .map_err(|_| {
+                            crate::error::AppError::S3Error(
+                                "Download stalled for 60 seconds. Check the connection and retry."
+                                    .into(),
+                            )
+                        })?
+                        .map_err(|e| {
+                            crate::error::AppError::S3Error(format!("{}", DisplayErrorContext(&e)))
+                        })?
+                {
+                    for chunk in bytes.chunks(16 * 1024) {
+                        self.pace_download(job, chunk.len() as u64).await?;
+                        download.write_all(chunk).await?;
+                    }
+
+                    downloaded += bytes.len() as u64;
+
+                    if last_update.elapsed() >= std::time::Duration::from_millis(100) {
+                        self.update_job_progress(&job.id, downloaded).await;
+                        last_update = std::time::Instant::now();
+                    }
+                }
+
+                self.update_job_progress(&job.id, downloaded).await;
+                if job.total_bytes == 0 {
+                    self.update_job_total_size(&job.id, downloaded).await;
+                }
+                download.finish_writing().await?;
+                let mut jobs = self.jobs.write().await;
+                let current = jobs.get_mut(&job.id).ok_or_else(|| {
+                    crate::error::AppError::IoError("Download was removed".to_string())
+                })?;
+                if current.status != TransferStatus::InProgress {
+                    return Err(crate::error::AppError::IoError(
+                        "Download was cancelled".to_string(),
+                    ));
+                }
+                download.commit()?;
+                current.status = TransferStatus::Completed;
+                current.finished_at = Some(chrono::Utc::now().timestamp_millis());
+                drop(jobs);
+                self.persist_or_log().await;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    #[ignore = "requires a disposable MinIO endpoint"]
+    async fn bandwidth_real_endpoint_upload_download_and_multipart_cancellation() {
+        let profile = Profile::new(
+            "controls-test".into(),
+            CredentialType::CustomEndpoint {
+                endpoint_url: std::env::var("SUPAS3_CONTROLS_TEST_ENDPOINT")
+                    .expect("disposable endpoint required"),
+                access_key_id: "versiontest".into(),
+                secret_access_key: "version-test-only".into(),
+            },
+            Some("us-east-1".into()),
+        );
+        let sdk = crate::s3::client::load_sdk_config(&profile, None).await;
+        let client = crate::s3::client::client_from_sdk_config(&sdk, &profile);
+        let bucket = format!("supas3-controls-test-{}", uuid::Uuid::new_v4().simple());
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        for (size, rate) in [
+            (0u64, 65536),
+            (256 * 1024, 65536),
+            (129 * 1024 * 1024, 16 * 1024 * 1024),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("source");
+            std::fs::File::create(&path).unwrap().set_len(size).unwrap();
+            let manager = TransferManager::new();
+            let mut job = TransferJob::new(
+                TransferType::Upload,
+                profile.id.clone(),
+                bucket.clone(),
+                Some("us-east-1".into()),
+                format!("file-{size}"),
+                path,
+                size,
+            );
+            job.status = TransferStatus::InProgress;
+            job.bandwidth_limit = Some(rate);
+            manager.add_job(job.clone()).await;
+            let start = std::time::Instant::now();
+            manager
+                .upload_file(&client, &job, "application/octet-stream")
+                .await
+                .unwrap();
+            assert!(start.elapsed().as_secs_f64() >= size as f64 / rate as f64);
+            let target = root.path().join("download");
+            let mut download = TransferJob::new(
+                TransferType::Download,
+                profile.id.clone(),
+                bucket.clone(),
+                Some("us-east-1".into()),
+                job.key.clone(),
+                target.clone(),
+                size,
+            );
+            download.status = TransferStatus::InProgress;
+            download.bandwidth_limit = Some(rate);
+            download.download_destination = Some(Arc::new(
+                crate::transfer::download::DownloadDestination::from_path(&target, false).unwrap(),
+            ));
+            manager.add_job(download.clone()).await;
+            let start = std::time::Instant::now();
+            manager
+                .execute_job(
+                    &download,
+                    Arc::new(tokio::sync::RwLock::new(crate::s3::S3ClientManager::new())),
+                    &profile,
+                )
+                .await
+                .unwrap();
+            assert!(start.elapsed().as_secs_f64() >= size as f64 / rate as f64);
+            let content = std::fs::read(&target).unwrap();
+            assert_eq!(content.len() as u64, size);
+            assert!(content.iter().all(|byte| *byte == 0));
+            client
+                .delete_object()
+                .bucket(&bucket)
+                .key(&job.key)
+                .send()
+                .await
+                .unwrap();
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("cancel-source");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(129 * 1024 * 1024)
+            .unwrap();
+        let manager = TransferManager::new();
+        let mut job = TransferJob::new(
+            TransferType::Upload,
+            profile.id.clone(),
+            bucket.clone(),
+            None,
+            "cancelled".into(),
+            path,
+            129 * 1024 * 1024,
+        );
+        job.status = TransferStatus::InProgress;
+        job.bandwidth_limit = Some(65536);
+        manager.add_job(job.clone()).await;
+        let upload = manager.upload_file(&client, &job, "application/octet-stream");
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            manager.cancel_job(&job.id).await;
+        };
+        let (result, _) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(upload, cancel)
+        })
+        .await
+        .expect("cancel must not wait for the throttled multipart part");
+        assert!(result.is_err());
+        assert!(client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap()
+            .uploads()
+            .is_empty());
+        assert!(client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap()
+            .contents()
+            .is_empty());
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bandwidth_is_captured_per_job_and_retained_on_retry() {
+        let manager = TransferManager::new();
+        manager.set_bandwidth_limit(65536).unwrap();
+        let job = test_job(TransferStatus::Failed("network".into()));
+        manager.add_job(job.clone()).await;
+        manager.set_bandwidth_limit(0).unwrap();
+        let id = manager.retry_job(&job.id).await.unwrap();
+        let mut retry = manager.get_job(&id).await.unwrap();
+        assert_eq!(retry.bandwidth_limit, Some(65536));
+        retry.status = TransferStatus::InProgress;
+        manager.add_job(retry.clone()).await;
+        let start = tokio::time::Instant::now();
+        manager.pace_download(&retry, 16384).await.unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(250));
+        manager.cancel_job(&id).await;
+        assert!(manager.pace_download(&retry, 16384).await.is_err());
+        assert!(manager.set_bandwidth_limit(1).is_err());
+        assert!(super::upload_timeout_for(128 * 1024 * 1024, 65536) > Duration::from_secs(2048));
+    }
+    #[tokio::test]
+    #[ignore = "requires a disposable versioned S3-compatible endpoint"]
+    async fn version_restore_real_endpoint_preserves_history_and_rejects_stale_guards() {
+        use aws_sdk_s3::{
+            primitives::ByteStream,
+            types::{BucketVersioningStatus, VersioningConfiguration},
+        };
+        let profile = Profile::new(
+            "version-test".into(),
+            CredentialType::CustomEndpoint {
+                endpoint_url: std::env::var("SUPAS3_VERSION_TEST_ENDPOINT")
+                    .expect("disposable endpoint required"),
+                access_key_id: "versiontest".into(),
+                secret_access_key: "version-test-only".into(),
+            },
+            Some("us-east-1".into()),
+        );
+        let sdk = crate::s3::client::load_sdk_config(&profile, None).await;
+        let client = crate::s3::client::client_from_sdk_config(&sdk, &profile);
+        let bucket = format!("supas3-version-test-{}", uuid::Uuid::new_v4().simple());
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        for size in [0u64, 5, 129 * 1024 * 1024] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("old");
+            std::fs::File::create(&path).unwrap().set_len(size).unwrap();
+            let key = format!("nested/{size}");
+            let old = client
+                .put_object()
+                .bucket(&bucket)
+                .key(&key)
+                .content_type("application/x-version-test")
+                .metadata("owner", "old")
+                .body(ByteStream::from_path(&path).await.unwrap())
+                .send()
+                .await
+                .unwrap()
+                .version_id()
+                .unwrap()
+                .to_owned();
+            let mut current = client
+                .put_object()
+                .bucket(&bucket)
+                .key(&key)
+                .tagging("keep=current")
+                .body(ByteStream::from_static(b"current"))
+                .send()
+                .await
+                .unwrap()
+                .version_id()
+                .unwrap()
+                .to_owned();
+            for deleted in [false, true] {
+                if deleted {
+                    current = client
+                        .delete_object()
+                        .bucket(&bucket)
+                        .key(&key)
+                        .send()
+                        .await
+                        .unwrap()
+                        .version_id()
+                        .unwrap()
+                        .to_owned();
+                }
+                let (guard, etag, length) = crate::commands::versions::prepare_restore(
+                    &client, &bucket, &key, &old, &current, true,
+                )
+                .await
+                .unwrap();
+                assert_eq!(guard.deleted, deleted);
+                let manager = TransferManager::new();
+                let mut job = remote_job();
+                job.bucket = bucket.clone();
+                job.key = key.clone();
+                job.total_bytes = length * 2;
+                job.restore_guard = Some(guard);
+                let source = job.remote_source.as_mut().unwrap();
+                source.bucket = bucket.clone();
+                source.key = key.clone();
+                source.etag = etag;
+                source.size = length;
+                source.version_id = Some(old.clone());
+                manager.add_job(job.clone()).await;
+                manager
+                    .execute_remote_copy(&client, &client, &job)
+                    .await
+                    .unwrap();
+                let mut restored = client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_ne!(restored.version_id(), Some(current.as_str()));
+                assert_eq!(restored.content_length(), Some(size as i64));
+                assert_eq!(restored.content_type(), Some("application/x-version-test"));
+                assert_eq!(restored.metadata().unwrap().get("owner").unwrap(), "old");
+                let mut received = 0u64;
+                while let Some(chunk) = restored.body.try_next().await.unwrap() {
+                    received += chunk.len() as u64;
+                    assert!(chunk.iter().all(|b| *b == 0));
+                }
+                assert_eq!(received, size);
+                if !deleted {
+                    let tags = client
+                        .get_object_tagging()
+                        .bucket(&bucket)
+                        .key(&key)
+                        .send()
+                        .await
+                        .unwrap();
+                    assert!(tags
+                        .tag_set()
+                        .iter()
+                        .any(|t| t.key() == "keep" && t.value() == "current"));
+                }
+                assert!(manager
+                    .execute_remote_copy(&client, &client, &job)
+                    .await
+                    .is_err());
+                let history = client
+                    .list_object_versions()
+                    .bucket(&bucket)
+                    .prefix(&key)
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(history
+                    .versions()
+                    .iter()
+                    .any(|v| v.version_id() == Some(old.as_str())));
+                if deleted {
+                    assert!(history
+                        .delete_markers()
+                        .iter()
+                        .any(|v| v.version_id() == Some(current.as_str())));
+                } else {
+                    assert!(history
+                        .versions()
+                        .iter()
+                        .any(|v| v.version_id() == Some(current.as_str())));
+                }
+                assert!(client
+                    .list_multipart_uploads()
+                    .bucket(&bucket)
+                    .send()
+                    .await
+                    .unwrap()
+                    .uploads()
+                    .is_empty());
+            }
+        }
+        let history = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        for (key, id) in history
+            .versions()
+            .iter()
+            .map(|v| (v.key().unwrap(), v.version_id().unwrap()))
+            .chain(
+                history
+                    .delete_markers()
+                    .iter()
+                    .map(|v| (v.key().unwrap(), v.version_id().unwrap())),
+            )
+        {
+            client
+                .delete_object()
+                .bucket(&bucket)
+                .key(key)
+                .version_id(id)
+                .send()
+                .await
+                .unwrap();
+        }
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires two disposable S3-compatible endpoints"]
+    async fn cross_profile_real_endpoints_round_trip_and_conflicts() {
+        use aws_sdk_s3::primitives::ByteStream;
+        let source_endpoint =
+            std::env::var("SUPAS3_COPY_SOURCE_ENDPOINT").expect("source endpoint required");
+        let destination_endpoint = std::env::var("SUPAS3_COPY_DESTINATION_ENDPOINT")
+            .expect("destination endpoint required");
+        let mut clients = Vec::new();
+        for (endpoint, user, secret) in [
+            (source_endpoint, "copysource", "copy-source-test-only"),
+            (
+                destination_endpoint,
+                "copydestination",
+                "copy-destination-test-only",
+            ),
+        ] {
+            let profile = Profile::new(
+                "copy-test".into(),
+                CredentialType::CustomEndpoint {
+                    endpoint_url: endpoint,
+                    access_key_id: user.into(),
+                    secret_access_key: secret.into(),
+                },
+                Some("us-east-1".into()),
+            );
+            let sdk = crate::s3::client::load_sdk_config(&profile, None).await;
+            clients.push(crate::s3::client::client_from_sdk_config(&sdk, &profile));
+        }
+        let source = &clients[0];
+        let destination = &clients[1];
+        let bucket = format!("supas3-copy-test-{}", uuid::Uuid::new_v4().simple());
+        for client in &clients {
+            client.create_bucket().bucket(&bucket).send().await.unwrap();
+        }
+        for size in [0u64, 5, 129 * 1024 * 1024] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("source");
+            std::fs::File::create(&path).unwrap().set_len(size).unwrap();
+            let key = format!("nested/{size}");
+            source
+                .put_object()
+                .bucket(&bucket)
+                .key(&key)
+                .content_type("application/x-copy-test")
+                .metadata("owner", "original")
+                .body(ByteStream::from_path(&path).await.unwrap())
+                .send()
+                .await
+                .unwrap();
+            let head = source
+                .head_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .unwrap();
+            let (etag, length) = crate::transfer::remote::validate_head(&head).unwrap();
+            let manager = TransferManager::new();
+            let mut job = remote_job();
+            job.bucket = bucket.clone();
+            job.key = key.clone();
+            job.total_bytes = length * 2;
+            let remote = job.remote_source.as_mut().unwrap();
+            remote.bucket = bucket.clone();
+            remote.key = key.clone();
+            remote.etag = etag.clone();
+            remote.size = length;
+            manager.add_job(job.clone()).await;
+            let (temporary, attributes) = crate::transfer::remote::stage(
+                source,
+                job.remote_source.as_ref().unwrap(),
+                &job,
+                &manager,
+            )
+            .await
+            .unwrap();
+            job.local_path = temporary.path().to_string_lossy().into_owned();
+            manager
+                .upload_prepared(
+                    destination,
+                    &job,
+                    "application/octet-stream",
+                    Some(&attributes),
+                )
+                .await
+                .unwrap();
+            let copied = destination
+                .head_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(copied.content_length(), Some(size as i64));
+            assert_eq!(copied.content_type(), Some("application/x-copy-test"));
+            assert_eq!(copied.metadata().unwrap().get("owner").unwrap(), "original");
+            // A concurrent/existing destination is never overwritten, including multipart.
+            assert!(manager
+                .upload_prepared(
+                    destination,
+                    &job,
+                    "application/octet-stream",
+                    Some(&attributes)
+                )
+                .await
+                .is_err());
+            assert!(destination
+                .list_multipart_uploads()
+                .bucket(&bucket)
+                .send()
+                .await
+                .unwrap()
+                .uploads()
+                .is_empty());
+            assert_eq!(
+                destination
+                    .head_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .unwrap()
+                    .e_tag(),
+                copied.e_tag()
+            );
+            source
+                .put_object()
+                .bucket(&bucket)
+                .key(&key)
+                .body(ByteStream::from_static(b"changed"))
+                .send()
+                .await
+                .unwrap();
+            assert!(crate::transfer::remote::stage(
+                source,
+                job.remote_source.as_ref().unwrap(),
+                &job,
+                &manager
+            )
+            .await
+            .is_err());
+            for client in &clients {
+                client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .unwrap();
+            }
+        }
+        for client in &clients {
+            client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        }
+    }
+    fn remote_job() -> crate::transfer::TransferJob {
+        let mut job = test_job(crate::transfer::TransferStatus::InProgress);
+        job.total_bytes = 10;
+        job.remote_source = Some(crate::transfer::remote::RemoteSource {
+            profile_id: "source".into(),
+            profile_identity: "source:1".into(),
+            destination_identity: "destination:1".into(),
+            bucket: "source-bucket".into(),
+            region: "us-east-1".into(),
+            key: "file".into(),
+            etag: "\"source-etag\"".into(),
+            version_id: None,
+            size: 5,
+            current_session: true,
+        });
+        job
+    }
+
+    #[tokio::test]
+    async fn cross_profile_staging_and_upload_use_independent_clients_and_portable_metadata() {
+        use crate::commands::test_s3::{response, scripted_client};
+        let (source, source_server) = scripted_client(vec![response(200, "ETag: \"source-etag\"\r\nContent-Type: text/plain\r\nCache-Control: max-age=60\r\nx-amz-meta-owner: test\r\nx-amz-server-side-encryption: AES256\r\n", "hello")]).await;
+        let (destination, destination_server) =
+            scripted_client(vec![response(200, "ETag: \"new\"\r\n", "")]).await;
+        let manager = TransferManager::new();
+        let mut job = remote_job();
+        manager.add_job(job.clone()).await;
+        let (temporary, attributes) = crate::transfer::remote::stage(
+            &source,
+            job.remote_source.as_ref().unwrap(),
+            &job,
+            &manager,
+        )
+        .await
+        .unwrap();
+        let path = temporary.path().to_owned();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        assert_eq!(job.progress.lock().unwrap().position, 5);
+        job.local_path = path.to_string_lossy().into_owned();
+        manager
+            .upload_prepared(
+                &destination,
+                &job,
+                "application/octet-stream",
+                Some(&attributes),
+            )
+            .await
+            .unwrap();
+        assert_eq!(job.progress.lock().unwrap().position, 10);
+        let reads = source_server.await.unwrap();
+        assert!(reads[0].starts_with("GET /source-bucket/file"));
+        assert!(reads[0].contains("if-match: \"source-etag\""));
+        let writes = destination_server.await.unwrap();
+        assert!(writes[0].starts_with("PUT "));
+        for header in [
+            "if-none-match: *",
+            "content-type: text/plain",
+            "cache-control: max-age=60",
+            "x-amz-meta-owner: test",
+        ] {
+            assert!(writes[0].contains(header), "{header}");
+        }
+        assert!(!writes[0].contains("x-amz-server-side-encryption"));
+        assert!(!writes[0].contains("x-amz-acl"));
+        drop(temporary);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn restore_download_requires_the_selected_version_even_with_matching_etag() {
+        use crate::commands::test_s3::{response, scripted_client};
+        for returned in ["old+version", "different-version"] {
+            let (client, server) = scripted_client(vec![response(
+                200,
+                &format!("ETag: \"source-etag\"\r\nx-amz-version-id: {returned}\r\n"),
+                "hello",
+            )])
+            .await;
+            let manager = TransferManager::new();
+            let mut job = remote_job();
+            job.remote_source.as_mut().unwrap().version_id = Some("old+version".into());
+            manager.add_job(job.clone()).await;
+            let result = crate::transfer::remote::stage(
+                &client,
+                job.remote_source.as_ref().unwrap(),
+                &job,
+                &manager,
+            )
+            .await;
+            assert_eq!(result.is_ok(), returned == "old+version");
+            let requests = server.await.unwrap();
+            assert!(requests[0].contains("versionId=old%2Bversion"));
+            assert!(requests[0].contains("if-match: \"source-etag\""));
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_profile_source_changes_and_cancellation_prevent_staging() {
+        use crate::commands::test_s3::{response, scripted_client};
+        for (status, headers, content, cancelled) in [
+            (
+                412,
+                "",
+                "<Error><Code>PreconditionFailed</Code></Error>",
+                false,
+            ),
+            (200, "ETag: \"changed\"\r\n", "hello", false),
+            (200, "ETag: \"source-etag\"\r\n", "short", true),
+            (200, "ETag: \"source-etag\"\r\n", "too long", false),
+        ] {
+            let (source, server) = scripted_client(vec![response(status, headers, content)]).await;
+            let manager = TransferManager::new();
+            let mut job = remote_job();
+            if cancelled {
+                job.status = crate::transfer::TransferStatus::Cancelled;
+            }
+            manager.add_job(job.clone()).await;
+            assert!(crate::transfer::remote::stage(
+                &source,
+                job.remote_source.as_ref().unwrap(),
+                &job,
+                &manager
+            )
+            .await
+            .is_err());
+            assert_eq!(server.await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_profile_retry_retains_source_and_recovered_jobs_require_fresh_copy() {
+        let manager = TransferManager::new();
+        let mut job = remote_job();
+        job.status = crate::transfer::TransferStatus::Failed("network".into());
+        job.remote_source.as_mut().unwrap().version_id = Some("older-version".into());
+        job.restore_guard = Some(crate::s3::versions::RestoreGuard {
+            current_version: "confirmed-current".into(),
+            current_etag: Some("\"current\"".into()),
+            deleted: false,
+        });
+        manager.add_job(job.clone()).await;
+        let id = manager.retry_job(&job.id).await.unwrap();
+        let retry = manager.get_job(&id).await.unwrap();
+        assert_eq!(
+            retry.remote_source.as_ref().unwrap().version_id.as_deref(),
+            Some("older-version")
+        );
+        assert_eq!(
+            retry.restore_guard.as_ref().unwrap().current_version,
+            "confirmed-current"
+        );
+        assert_eq!(retry.destination_etag(), Some("\"current\""));
+        assert_eq!(
+            retry.remote_source.as_ref().unwrap().etag,
+            "\"source-etag\""
+        );
+        assert_eq!(retry.total_bytes, 10);
+        let recovered: crate::transfer::TransferJob =
+            serde_json::from_str(&serde_json::to_string(&job).unwrap()).unwrap();
+        assert!(!recovered.remote_source.as_ref().unwrap().current_session);
+        manager.add_job(recovered.clone()).await;
+        assert!(manager.retry_job(&recovered.id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_retry_retains_snapshot_and_conditional_write_guards() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file"), b"hello").unwrap();
+        let mut job = test_job(crate::transfer::TransferStatus::Failed("network".into()));
+        let mut source = crate::transfer::sync::scan(root.path(), "")
+            .unwrap()
+            .remove(0)
+            .source;
+        source.expected_etag = Some("original".into());
+        job.sync_source = Some(source);
+        let manager = TransferManager::new();
+        manager.add_job(job.clone()).await;
+        let id = manager.retry_job(&job.id).await.unwrap();
+        let retry = manager.get_job(&id).await.unwrap().sync_source.unwrap();
+        assert_eq!(retry.expected_etag.as_deref(), Some("original"));
+        assert_eq!(retry.sha256, job.sync_source.unwrap().sha256);
+    }
+    use super::{Client, RwLock, S3ClientManager, TransferManager};
+
+    #[tokio::test]
+    async fn interrupted_jobs_are_recovered_without_restarting_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("transfers.json");
+        let manager = TransferManager::new();
+        manager.configure_journal(path.clone()).await.unwrap();
+        let job = TransferJob::new(
+            TransferType::Upload,
+            "profile".into(),
+            "bucket".into(),
+            None,
+            "key".into(),
+            "/unused".into(),
+            10,
+        );
+        let id = job.id.clone();
+        manager.add_job(job).await;
+        let restarted = TransferManager::new();
+        restarted.configure_journal(path).await.unwrap();
+        assert!(matches!(
+            restarted.get_job(&id).await.unwrap().status,
+            TransferStatus::Failed(_)
+        ));
+        assert!(restarted.queue.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn corrupt_recovery_journal_is_preserved_without_blocking_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("transfers.json");
+        std::fs::write(&path, "broken").unwrap();
+        let manager = TransferManager::new();
+        manager.configure_journal(path).await.unwrap();
+        assert!(manager.list_jobs().await.is_empty());
+        let backup = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("transfers.invalid-")
+            })
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), "broken");
+    }
+
+    #[tokio::test]
+    async fn failed_journal_commit_never_enqueues_work() {
+        let root = tempfile::tempdir().unwrap();
+        let blocker = root.path().join("not-a-directory");
+        std::fs::write(&blocker, b"file").unwrap();
+        let manager = TransferManager::new();
+        *manager.journal.lock().await = Some(blocker.join("transfers.json"));
+        let job = test_job(TransferStatus::Pending);
+        manager.add_jobs(vec![job.clone()]).await;
+        assert!(manager.queue.lock().await.is_empty());
+        assert!(matches!(
+            manager.get_job(&job.id).await.unwrap().status,
+            TransferStatus::Failed(_)
+        ));
+    }
+    use crate::credentials::{CredentialType, Profile};
+    use crate::transfer::{TransferJob, TransferStatus, TransferType};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn upload_timeouts_cover_small_and_large_payloads_without_overflow() {
+        assert_eq!(super::transfer_timeout_for(0), Duration::from_secs(60));
+        assert_eq!(
+            super::transfer_timeout_for(10 * 1024 * 1024),
+            Duration::from_secs(103)
+        );
+        assert_eq!(
+            super::transfer_timeout_for(u64::MAX),
+            Duration::from_secs(1800)
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_replacement_is_conditional_and_preserves_attributes() {
+        use crate::commands::test_s3::{response, scripted_client};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.txt"), b"hello").unwrap();
+        let mut source = crate::transfer::sync::scan(root.path(), "")
+            .unwrap()
+            .remove(0)
+            .source;
+        source.expected_etag = Some("\"old\"".into());
+        let mut job = TransferJob::new(
+            TransferType::Upload,
+            "p".into(),
+            "bucket".into(),
+            None,
+            "file.txt".into(),
+            root.path().join("file.txt"),
+            5,
+        );
+        job.sync_source = Some(source);
+        let acl = "<AccessControlPolicy><Owner><ID>owner</ID></Owner><AccessControlList><Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\"><ID>owner</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>";
+        let tags =
+            "<Tagging><TagSet><Tag><Key>team</Key><Value>docs</Value></Tag></TagSet></Tagging>";
+        for (status, disabled_acl) in [(200, false), (412, false), (200, true)] {
+            let mut responses = vec![
+                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"old\"\r\nContent-Type: text/plain\r\nCache-Control: max-age=60\r\nx-amz-meta-owner: original\r\nConnection: close\r\n\r\n".into(),
+                response(200,"",acl), response(200,"",tags), response(status,"", if status == 412 { "<Error><Code>PreconditionFailed</Code></Error>" } else { "" })
+            ];
+            if disabled_acl {
+                responses.insert(
+                    3,
+                    response(
+                        400,
+                        "",
+                        "<Error><Code>AccessControlListNotSupported</Code></Error>",
+                    ),
+                );
+            }
+            let (client, server) = scripted_client(responses).await;
+            let manager = TransferManager::new();
+            assert_eq!(
+                manager
+                    .upload_file(&client, &job, "application/octet-stream")
+                    .await
+                    .is_ok(),
+                status == 200
+            );
+            let requests = server.await.unwrap();
+            let put = requests.last().unwrap().to_lowercase();
+            assert!(put.starts_with("put "));
+            assert!(put.contains("if-match: \"old\""));
+            assert!(!put.contains("if-none-match"));
+            for header in [
+                "content-type: text/plain",
+                "cache-control: max-age=60",
+                "x-amz-meta-owner: original",
+                "x-amz-tagging: team=docs",
+            ] {
+                assert!(put.contains(header), "missing {header}");
+            }
+            assert_eq!(
+                put.contains("x-amz-grant-full-control: id=\"owner\""),
+                !disabled_acl
+            );
+            // AWS SDK may wrap the payload with aws-chunked checksum trailers.
+            assert!(put.contains("hello"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_upload_remains_create_only_and_changed_sync_source_never_writes() {
+        use crate::commands::test_s3::{response, scripted_client};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file"), b"hello").unwrap();
+        let mut job = TransferJob::new(
+            TransferType::Upload,
+            "p".into(),
+            "bucket".into(),
+            None,
+            "file".into(),
+            root.path().join("file"),
+            5,
+        );
+        let (client, server) = scripted_client(vec![response(200, "", "")]).await;
+        TransferManager::new()
+            .upload_file(&client, &job, "text/plain")
+            .await
+            .unwrap();
+        assert!(server.await.unwrap()[0]
+            .to_lowercase()
+            .contains("if-none-match: *"));
+        job.sync_source = Some(
+            crate::transfer::sync::scan(root.path(), "")
+                .unwrap()
+                .remove(0)
+                .source,
+        );
+        std::fs::write(root.path().join("file"), b"changed").unwrap();
+        assert!(TransferManager::new()
+            .upload_file(&client, &job, "text/plain")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("changed since preview"));
+    }
+
+    #[tokio::test]
+    async fn multipart_sync_conflict_aborts_without_unconditional_completion() {
+        use crate::commands::test_s3::{response, scripted_client};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file"), b"hello").unwrap();
+        let mut source = crate::transfer::sync::scan(root.path(), "")
+            .unwrap()
+            .remove(0)
+            .source;
+        source.expected_etag = Some("\"old\"".into());
+        let mut job = TransferJob::new(
+            TransferType::Upload,
+            "p".into(),
+            "bucket".into(),
+            None,
+            "file".into(),
+            root.path().join("file"),
+            5,
+        );
+        job.sync_source = Some(source);
+        job.status = TransferStatus::InProgress;
+        let (client,server) = scripted_client(vec![
+            response(200,"","<InitiateMultipartUploadResult><UploadId>id</UploadId></InitiateMultipartUploadResult>"),
+            response(200,"ETag: \"part\"\r\n",""),
+            response(412,"","<Error><Code>PreconditionFailed</Code></Error>"),
+            response(204,"","")
+        ]).await;
+        let manager = TransferManager::new();
+        manager.add_job(job.clone()).await;
+        assert!(manager
+            .multipart_upload_file(&client, &job, "text/plain", 5, None)
+            .await
+            .is_err());
+        let requests = server.await.unwrap();
+        assert!(requests[2].to_lowercase().contains("if-match: \"old\""));
+        assert!(!requests[2].to_lowercase().contains("if-none-match"));
+        assert!(requests[3].starts_with("DELETE ") && requests[3].contains("uploadId=id"));
+    }
+
+    #[tokio::test]
+    async fn multipart_restore_rechecks_versioning_and_aborts_before_completion() {
+        use crate::commands::test_s3::{response, scripted_client};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file"), b"hello").unwrap();
+        let mut job = remote_job();
+        job.local_path = root.path().join("file").to_string_lossy().into_owned();
+        job.restore_guard = Some(crate::s3::versions::RestoreGuard {
+            current_version: "confirmed-current".into(),
+            current_etag: Some("\"current\"".into()),
+            deleted: false,
+        });
+        let (client, server) = scripted_client(vec![
+            response(200, "", "<InitiateMultipartUploadResult><UploadId>id</UploadId></InitiateMultipartUploadResult>"),
+            response(200, "ETag: \"part\"\r\n", ""),
+            response(200, "", "<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>"),
+            response(204, "", ""),
+        ]).await;
+        let manager = TransferManager::new();
+        manager.add_job(job.clone()).await;
+        assert!(manager
+            .multipart_upload_file(&client, &job, "text/plain", 5, None)
+            .await
+            .is_err());
+        let requests = server.await.unwrap();
+        assert!(requests[2].starts_with("GET ") && requests[2].contains("versioning"));
+        assert!(requests[3].starts_with("DELETE ") && requests[3].contains("uploadId=id"));
+    }
+
+    #[tokio::test]
+    async fn stalled_download_releases_its_partial_file() {
+        let (endpoint, received, server) = crate::commands::test_s3::stalled_endpoint(
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndo",
+        )
+        .await;
+        let profile = Profile::new(
+            "test".into(),
+            CredentialType::CustomEndpoint {
+                endpoint_url: endpoint,
+                access_key_id: "TEST".into(),
+                secret_access_key: "test-secret".into(),
+            },
+            Some("us-east-1".into()),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("result.txt");
+        let mut job = test_job(TransferStatus::InProgress);
+        job.profile_id = profile.id.clone();
+        job.local_path = path.to_string_lossy().into_owned();
+        job.download_destination = Some(Arc::new(
+            crate::transfer::download::DownloadDestination::from_path(&path, false).unwrap(),
+        ));
+        let manager = TransferManager::new();
+        manager.add_job(job.clone()).await;
+        let task = tokio::spawn(async move {
+            manager
+                .execute_job(
+                    &job,
+                    Arc::new(RwLock::new(S3ClientManager::new())),
+                    &profile,
+                )
+                .await
+        });
+        received.await.unwrap();
+        tokio::time::pause();
+        let result = task.await.unwrap();
+        tokio::time::resume();
+        server.abort();
+        assert!(result.is_err());
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_upload_retains_the_provider_error() {
+        let (client, server) =
+            crate::commands::test_s3::scripted_client(vec![crate::commands::test_s3::response(
+                403,
+                "",
+                "<Error><Code>AccessDenied</Code><Message>Uploads are disabled</Message></Error>",
+            )])
+            .await;
+        let client = Client::from_conf(
+            client
+                .config()
+                .to_builder()
+                .request_checksum_calculation(
+                    aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+                )
+                .build(),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.txt");
+        std::fs::write(&path, b"test").unwrap();
+        let mut job = test_job(TransferStatus::InProgress);
+        job.local_path = path.to_string_lossy().into_owned();
+        let error = TransferManager::new()
+            .upload_file(&client, &job, "text/plain")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("AccessDenied"));
+        assert!(error.to_string().contains("Uploads are disabled"));
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retried_download_retains_its_destination_and_profile() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("result.txt");
+        let destination = Arc::new(
+            crate::transfer::download::DownloadDestination::from_path(&path, false).unwrap(),
+        );
+        let mut job = TransferJob::new(
+            TransferType::Download,
+            "profile-a".into(),
+            "bucket".into(),
+            Some("region".into()),
+            "folder/result.txt".into(),
+            path.clone(),
+            4,
+        )
+        .with_group("group".into(), "folder".into());
+        job.download_destination = Some(destination);
+        job.status = TransferStatus::Failed("Connection lost".into());
+        job.processed_bytes = 2;
+        let manager = TransferManager::new();
+        manager.add_job(job.clone()).await;
+        let retry_id = manager.retry_job(&job.id).await.unwrap();
+        let retry = manager.get_job(&retry_id).await.unwrap();
+        assert_ne!(retry_id, job.id);
+        assert_eq!(retry.profile_id, "profile-a");
+        assert_eq!(retry.parent_group_id, job.parent_group_id);
+        assert_eq!(retry.group_name, job.group_name);
+        assert_eq!(retry.status, TransferStatus::Pending);
+        assert_eq!(retry.processed_bytes, 0);
+        assert!(matches!(
+            manager.get_job(&job.id).await.unwrap().status,
+            TransferStatus::Failed(_)
+        ));
+        let mut pending = retry
+            .download_destination
+            .expect("A retry must retain the selected download directory")
+            .begin()
+            .unwrap();
+        pending.write_all(b"done").await.unwrap();
+        pending.finish_writing().await.unwrap();
+        pending.commit().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"done");
+    }
+
+    fn test_job(status: TransferStatus) -> TransferJob {
+        let mut job = TransferJob::new(
+            TransferType::Download,
+            "profile-a".into(),
+            "bucket".into(),
+            None,
+            "file.txt".into(),
+            PathBuf::from("file.txt"),
+            10,
+        );
+        job.status = status;
+        job
+    }
+
+    #[tokio::test]
+    async fn terminal_jobs_clear_speed_and_ignore_late_progress() {
+        for status in [
+            TransferStatus::Completed,
+            TransferStatus::Failed("offline".into()),
+            TransferStatus::Cancelled,
+        ] {
+            let manager = TransferManager::new();
+            let mut job = test_job(TransferStatus::InProgress);
+            job.bytes_per_second = 1024.0;
+            manager.add_job(job.clone()).await;
+            if status == TransferStatus::Cancelled {
+                manager.cancel_job(&job.id).await;
+            } else {
+                manager.update_job_status(&job.id, status.clone()).await;
+            }
+            manager.update_job_progress(&job.id, 5).await;
+            let saved = manager.get_job(&job.id).await.unwrap();
+            assert_eq!(saved.status, status);
+            assert_eq!(saved.bytes_per_second, 0.0);
+            assert_eq!(saved.processed_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_pending_work_keeps_history_and_removes_it_from_the_queue() {
+        let manager = TransferManager::new();
+        let job = test_job(TransferStatus::Pending);
+        manager.add_job(job.clone()).await;
+        assert!(manager.cancel_job(&job.id).await);
+        assert_eq!(
+            manager.get_job(&job.id).await.unwrap().status,
+            TransferStatus::Cancelled
+        );
+        assert!(!manager.queue.lock().await.contains(&job.id));
+        assert!(!manager.cancel_job(&job.id).await);
+        assert!(!manager.cancel_job("missing").await);
+    }
+
+    #[tokio::test]
+    async fn cancelling_active_downloads_aborts_the_task_and_releases_capacity() {
+        let manager = TransferManager::new();
+        let job = test_job(TransferStatus::InProgress);
+        manager.add_job(job.clone()).await;
+        let slot = manager.acquire_slot().await;
+        let task = tokio::spawn(async move {
+            let _slot = slot;
+            std::future::pending::<()>().await;
+        });
+        manager
+            .abort_handles
+            .write()
+            .await
+            .insert(job.id.clone(), task.abort_handle());
+        assert!(manager.cancel_job(&job.id).await);
+        assert!(tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled());
+        assert_eq!(
+            manager
+                .active_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_history_retains_pending_and_active_transfers() {
+        let manager = TransferManager::new();
+        let pending = test_job(TransferStatus::Pending);
+        let active = test_job(TransferStatus::InProgress);
+        for job in [
+            pending.clone(),
+            active.clone(),
+            test_job(TransferStatus::Completed),
+            test_job(TransferStatus::Failed("offline".into())),
+            test_job(TransferStatus::Cancelled),
+        ] {
+            manager.add_job(job).await;
+        }
+        assert_eq!(manager.clear_completed().await, 3);
+        let jobs = manager.list_jobs().await;
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().any(|job| job.id == pending.id));
+        assert!(jobs.iter().any(|job| job.id == active.id));
+        assert_eq!(manager.clear_completed().await, 0);
+    }
+
+    #[tokio::test]
+    async fn retry_refuses_active_and_completed_work() {
+        let manager = TransferManager::new();
+        for status in [
+            TransferStatus::Pending,
+            TransferStatus::InProgress,
+            TransferStatus::Completed,
+        ] {
+            let job = test_job(status);
+            manager.add_job(job.clone()).await;
+            assert!(manager.retry_job(&job.id).await.is_none());
+        }
+        assert!(manager.retry_job("missing").await.is_none());
+        assert_eq!(manager.list_jobs().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn removing_pending_work_removes_both_its_queue_entry_and_history() {
+        let manager = TransferManager::new();
+        let job = test_job(TransferStatus::Pending);
+        manager.add_job(job.clone()).await;
+        assert!(manager.remove_job(&job.id).await);
+        assert!(manager.get_job(&job.id).await.is_none());
+        assert!(!manager.queue.lock().await.contains(&job.id));
+        assert!(!manager.remove_job(&job.id).await);
+    }
+
+    #[tokio::test]
+    async fn transfer_slots_follow_concurrency_changes_without_stalling() {
+        let manager = TransferManager::new();
+        manager.set_max_concurrency(1);
+        let first = manager.acquire_slot().await;
+        let second = manager.acquire_slot();
+        tokio::pin!(second);
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        manager.set_max_concurrency(2);
+        let second = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .unwrap();
+        manager.set_max_concurrency(1);
+        let third = manager.acquire_slot();
+        tokio::pin!(third);
+        assert!(futures::poll!(third.as_mut()).is_pending());
+        drop(second);
+        assert!(futures::poll!(third.as_mut()).is_pending());
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), third)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn released_slots_allow_all_waiting_transfers_to_finish() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let manager = Arc::new(TransferManager::new());
+        manager.set_max_concurrency(3);
+        let peak = Arc::new(AtomicUsize::new(0));
+        let tasks = (0..200)
+            .map(|_| {
+                let manager = manager.clone();
+                let peak = peak.clone();
+                tokio::spawn(async move {
+                    let _slot = manager.acquire_slot().await;
+                    peak.fetch_max(
+                        manager.active_count.load(Ordering::Acquire),
+                        Ordering::AcqRel,
+                    );
+                    tokio::task::yield_now().await;
+                })
+            })
+            .collect::<Vec<_>>();
+        let results =
+            tokio::time::timeout(Duration::from_secs(5), futures::future::join_all(tasks))
+                .await
+                .unwrap();
+        assert!(results.into_iter().all(|result| result.is_ok()));
+        assert!(peak.load(Ordering::Acquire) <= 3);
+        assert_eq!(manager.active_count.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn url_import_retry_retains_guards_and_recovery_requires_fresh_source() {
+        let manager = TransferManager::new();
+        let mut job = test_job(TransferStatus::Failed("interrupted".into()));
+        job.url_import = Some(crate::transfer::url_import::UrlSource {
+            url: "https://example.com/file?session=private".into(),
+            headers: std::collections::BTreeMap::from([("Authorization".into(), "secret".into())]),
+            expected_etag: Some("\"approved\"".into()),
+            max_bytes: 100,
+            max_attempts: 4,
+            ..Default::default()
+        });
+        manager.add_job(job.clone()).await;
+        let retry = manager.retry_job(&job.id).await.unwrap();
+        let retried = manager.get_job(&retry).await.unwrap();
+        let source = retried.url_import.as_ref().unwrap();
+        assert_eq!(source.url, job.url_import.as_ref().unwrap().url);
+        assert_eq!(source.headers.get("Authorization").unwrap(), "secret");
+        assert_eq!(source.expected_etag.as_deref(), Some("\"approved\""));
+        assert_eq!(source.max_attempts, 4);
+        assert_eq!(retried.key, job.key);
+        let mut recovered: TransferJob =
+            serde_json::from_str(&serde_json::to_string(&job).unwrap()).unwrap();
+        recovered.id = "recovered-url-test".into();
+        manager.add_job(recovered.clone()).await;
+        assert!(manager.retry_job(&recovered.id).await.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable S3-compatible endpoint and public internet"]
+    async fn url_import_real_http_to_s3_round_trip_and_conflict() {
+        use sha2::{Digest, Sha256};
+        let profile = Profile::new(
+            "url-import-test".into(),
+            CredentialType::CustomEndpoint {
+                endpoint_url: std::env::var("SUPAS3_URL_TEST_ENDPOINT")
+                    .expect("disposable endpoint required"),
+                access_key_id: "minioadmin".into(),
+                secret_access_key: "minioadmin".into(),
+            },
+            Some("us-east-1".into()),
+        );
+        let sdk = crate::s3::client::load_sdk_config(&profile, None).await;
+        let client = crate::s3::client::client_from_sdk_config(&sdk, &profile);
+        let bucket = format!("supas3-url-test-{}", uuid::Uuid::new_v4().simple());
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        let manager = TransferManager::new();
+        let mut job = test_job(TransferStatus::InProgress);
+        job.bucket = bucket.clone();
+        job.key = "imports/example.html".into();
+        job.total_bytes = 0;
+        job.url_import = Some(crate::transfer::url_import::UrlSource {
+            url: "https://example.com/".into(),
+            max_bytes: 1024 * 1024,
+            max_attempts: 2,
+            ..Default::default()
+        });
+        manager.add_job(job.clone()).await;
+        let temp =
+            crate::transfer::url_import::stage(job.url_import.as_ref().unwrap(), &job, &manager)
+                .await
+                .unwrap();
+        let bytes = std::fs::read(temp.path()).unwrap();
+        assert!(!bytes.is_empty());
+        job.local_path = temp.path().to_string_lossy().into_owned();
+        job.total_bytes = bytes.len() as u64;
+        manager
+            .upload_prepared(&client, &job, "text/html", None)
+            .await
+            .unwrap();
+        let downloaded = client
+            .get_object()
+            .bucket(&bucket)
+            .key(&job.key)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(Sha256::digest(&bytes), Sha256::digest(&downloaded));
+        // The same job cannot overwrite an existing destination without approval.
+        assert!(manager
+            .upload_prepared(&client, &job, "text/html", None)
+            .await
+            .is_err());
+        let path = temp.path().to_owned();
+        drop(temp);
+        assert!(!path.exists());
+        // Exercise the actual queued-job dispatcher as well as its staging helpers.
+        let root = tempfile::tempdir().unwrap();
+        let profiles = Arc::new(RwLock::new(
+            crate::credentials::ProfileManager::new(root.path().into(), true).unwrap(),
+        ));
+        let s3 = Arc::new(RwLock::new(S3ClientManager::new()));
+        let mut queued = job.clone();
+        queued.id = uuid::Uuid::new_v4().to_string();
+        queued.key = "imports/queued-example.html".into();
+        queued.local_path.clear();
+        queued.total_bytes = 0;
+        queued.url_import.as_mut().unwrap().profile_identity = profile.cache_identity();
+        queued.url_import.as_mut().unwrap().sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
+        manager.add_job(queued.clone()).await;
+        manager
+            .execute_queued_job(&queued, s3, &profile, profiles)
+            .await
+            .unwrap();
+        let current = manager.get_job(&queued.id).await.unwrap();
+        assert_eq!(current.total_bytes, bytes.len() as u64);
+        assert_eq!(current.phase.as_deref(), Some("Uploading to S3"));
+        let actual = client
+            .get_object()
+            .bucket(&bucket)
+            .key(&queued.key)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(actual.as_ref(), bytes.as_slice());
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(&queued.key)
+            .send()
+            .await
+            .unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(&job.key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    }
+
+    /// Run with SUPAS3_S3_TEST_ENDPOINT=http://127.0.0.1:<port> against MinIO.
+    #[tokio::test]
+    #[ignore = "requires a disposable S3-compatible endpoint"]
+    async fn folder_sync_round_trips_and_rejects_conflicts() {
+        use aws_sdk_s3::primitives::ByteStream;
+        let endpoint = std::env::var("SUPAS3_S3_TEST_ENDPOINT").expect("test endpoint required");
+        let profile = Profile::new(
+            "sync-test".into(),
+            CredentialType::CustomEndpoint {
+                endpoint_url: endpoint,
+                access_key_id: "minioadmin".into(),
+                secret_access_key: "minioadmin".into(),
+            },
+            Some("us-east-1".into()),
+        );
+        let sdk = crate::s3::client::load_sdk_config(&profile, None).await;
+        let client = crate::s3::client::client_from_sdk_config(&sdk, &profile);
+        let bucket = format!("supas3-sync-test-{}", uuid::Uuid::new_v4().simple());
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        for size in [0, 5, 129 * 1024 * 1024] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("file");
+            std::fs::File::create(&path).unwrap().set_len(size).unwrap();
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("file")
+                .body(ByteStream::from_static(b"old"))
+                .content_type("text/plain")
+                .metadata("owner", "original")
+                .tagging("team=docs")
+                .send()
+                .await
+                .unwrap();
+            let old = client
+                .head_object()
+                .bucket(&bucket)
+                .key("file")
+                .send()
+                .await
+                .unwrap();
+            let mut source = crate::transfer::sync::scan(root.path(), "")
+                .unwrap()
+                .remove(0)
+                .source;
+            source.expected_etag = old.e_tag.clone();
+            let mut job = TransferJob::new(
+                TransferType::Upload,
+                profile.id.clone(),
+                bucket.clone(),
+                profile.region.clone(),
+                "file".into(),
+                path,
+                size,
+            );
+            job.sync_source = Some(source);
+            job.status = TransferStatus::InProgress;
+            let manager = TransferManager::new();
+            manager.add_job(job.clone()).await;
+            manager
+                .upload_file(&client, &job, "application/octet-stream")
+                .await
+                .unwrap();
+            let head = client
+                .head_object()
+                .bucket(&bucket)
+                .key("file")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(head.content_length(), Some(size as i64));
+            assert_eq!(head.content_type(), Some("text/plain"));
+            assert_eq!(
+                head.metadata().unwrap().get("owner").map(String::as_str),
+                Some("original")
+            );
+            assert_eq!(
+                client
+                    .get_object_tagging()
+                    .bucket(&bucket)
+                    .key("file")
+                    .send()
+                    .await
+                    .unwrap()
+                    .tag_set()[0]
+                    .value(),
+                "docs"
+            );
+            // Replaying the accepted preview cannot overwrite the now-different object.
+            assert!(manager
+                .upload_file(&client, &job, "text/plain")
+                .await
+                .is_err());
+            let after = client
+                .head_object()
+                .bucket(&bucket)
+                .key("file")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(head.e_tag(), after.e_tag());
+            let pending = client
+                .list_multipart_uploads()
+                .bucket(&bucket)
+                .send()
+                .await
+                .unwrap();
+            assert!(pending.uploads().is_empty());
+        }
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("file")
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    }
+
+    /// Run with SUPAS3_S3_TEST_ENDPOINT=http://127.0.0.1:<port> against MinIO.
+    /// The sparse 129 MiB source crosses the production multipart threshold
+    /// and the default 128 MiB part size.
+    #[tokio::test]
+    #[ignore = "requires an S3-compatible integration-test endpoint"]
+    async fn multipart_upload_round_trips_against_s3_endpoint() {
+        let endpoint = std::env::var("SUPAS3_S3_TEST_ENDPOINT")
+            .expect("SUPAS3_S3_TEST_ENDPOINT must identify the test S3 endpoint");
+        let access_key =
+            std::env::var("SUPAS3_S3_TEST_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
+        let secret_key =
+            std::env::var("SUPAS3_S3_TEST_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
+        let profile = Profile::new(
+            "multipart-integration".to_string(),
+            CredentialType::CustomEndpoint {
+                endpoint_url: endpoint,
+                access_key_id: access_key,
+                secret_access_key: secret_key,
+            },
+            Some("us-east-1".to_string()),
+        );
+        let sdk_config = crate::s3::client::load_sdk_config(&profile, None).await;
+        let client = crate::s3::client::client_from_sdk_config(&sdk_config, &profile);
+        let bucket = format!("supas3-multipart-test-{}", uuid::Uuid::new_v4().simple());
+        client
+            .create_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .expect("test bucket should be created");
+
+        let path: PathBuf = std::env::temp_dir().join(format!(
+            "supas3-multipart-{}.bin",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let file = tokio::fs::File::create(&path)
+            .await
+            .expect("sparse test file should be created");
+        let size = 129 * 1024 * 1024;
+        file.set_len(size)
+            .await
+            .expect("sparse test file should be sized");
+        drop(file);
+
+        let manager = Arc::new(TransferManager::new());
+        let job = TransferJob::new(
+            TransferType::Upload,
+            profile.id.clone(),
+            bucket.clone(),
+            profile.region.clone(),
+            "large/test.bin".to_string(),
+            path.clone(),
+            size,
+        );
+        manager.add_job(job.clone()).await;
+        manager
+            .update_job_status(&job.id, TransferStatus::InProgress)
+            .await;
+        manager
+            .upload_file(&client, &job, "application/octet-stream")
+            .await
+            .expect("multipart upload should complete");
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(&job.key)
+            .send()
+            .await
+            .expect("uploaded object should be readable");
+        assert_eq!(head.content_length(), Some(size as i64));
+        assert_eq!(head.content_type(), Some("application/octet-stream"));
+        assert!(head.e_tag().is_some_and(|e_tag| e_tag.contains('-')));
+
+        let incomplete = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .send()
+            .await
+            .expect("multipart uploads should be listable");
+        assert!(incomplete.uploads().is_empty());
+
+        let cancel_path: PathBuf = std::env::temp_dir().join(format!(
+            "supas3-multipart-cancel-{}.bin",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let cancel_file = tokio::fs::File::create(&cancel_path)
+            .await
+            .expect("sparse cancellation file should be created");
+        let cancel_size = 2 * 1024 * 1024 * 1024;
+        cancel_file
+            .set_len(cancel_size)
+            .await
+            .expect("sparse cancellation file should be sized");
+        drop(cancel_file);
+        let cancel_job = TransferJob::new(
+            TransferType::Upload,
+            profile.id.clone(),
+            bucket.clone(),
+            profile.region.clone(),
+            "large/cancelled.bin".to_string(),
+            cancel_path.clone(),
+            cancel_size,
+        );
+        manager.add_job(cancel_job.clone()).await;
+        manager
+            .update_job_status(&cancel_job.id, TransferStatus::InProgress)
+            .await;
+
+        let upload_task = {
+            let task_manager = manager.clone();
+            let task_client = client.clone();
+            let task_job = cancel_job.clone();
+            tokio::spawn(async move {
+                task_manager
+                    .multipart_upload_file(
+                        &task_client,
+                        &task_job,
+                        "application/octet-stream",
+                        cancel_size,
+                        None,
+                    )
+                    .await
+            })
+        };
+
+        let mut upload_started = false;
+        for _ in 0..100 {
+            let active = client
+                .list_multipart_uploads()
+                .bucket(&bucket)
+                .send()
+                .await
+                .expect("multipart uploads should be listable");
+            if !active.uploads().is_empty() {
+                upload_started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(upload_started, "test multipart upload should start");
+        assert!(manager.cancel_job(&cancel_job.id).await);
+        let cancelled = tokio::time::timeout(Duration::from_secs(30), upload_task)
+            .await
+            .expect("cancelled multipart upload should finish cleanup")
+            .expect("multipart task should not panic");
+        assert!(cancelled.is_err());
+        let incomplete = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .send()
+            .await
+            .expect("multipart uploads should be listable after cancellation");
+        assert!(incomplete.uploads().is_empty());
+        assert!(client
+            .head_object()
+            .bucket(&bucket)
+            .key(&cancel_job.key)
+            .send()
+            .await
+            .is_err());
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(&job.key)
+            .send()
+            .await
+            .expect("test object should be deleted");
+        client
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .expect("test bucket should be deleted");
+        tokio::fs::remove_file(path)
+            .await
+            .expect("sparse test file should be deleted");
+        tokio::fs::remove_file(cancel_path)
+            .await
+            .expect("sparse cancellation file should be deleted");
+    }
+}

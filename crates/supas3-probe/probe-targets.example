@@ -1,0 +1,4 @@
+# Copy to ./probe-targets.local (untracked) or point SUPAS3_PROBE_TARGETS at it.
+# Credentials are read from ~/.env using the variable names in the last two columns.
+# name  endpoint                                region        bucket          access_key_var  secret_key_var
+oss     https://oss-cn-hangzhou.aliyuncs.com    cn-hangzhou   my-test-bucket  OSS_ACCESS_KEY  OSS_SECRET_KEY

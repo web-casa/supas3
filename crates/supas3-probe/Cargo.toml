@@ -1,0 +1,16 @@
+[package]
+name = "supas3-probe"
+version = "0.0.0"
+description = "Headless S3 compatibility probe for supaS3"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
+aws-sdk-s3 = "1"
+aws-credential-types = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+md-5 = "0.10"
+base64 = "0.22"

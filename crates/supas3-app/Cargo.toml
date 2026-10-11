@@ -1,0 +1,27 @@
+[package]
+name = "supas3-app"
+version = "0.1.0"
+description = "supaS3 desktop application"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "supas3"
+path = "src/main.rs"
+
+[dependencies]
+supas3-core = { path = "../supas3-core" }
+
+# GPUI Kit pins the GPUI snapshot it was built against. Upgrade it as a whole
+# together with Cargo.lock; never mix in a newer GPUI on its own.
+gpui-kit = "=0.7.1"
+
+anyhow = "1"
+dirs = "5"
+env_logger = "0.11"
+log = "0.4"
+rust-i18n = "4.2"
+sys-locale = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread"] }

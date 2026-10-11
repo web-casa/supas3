@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/supas3-app", "crates/supas3-core", "crates/supas3-probe"]
+
+[workspace.package]
+edition = "2021"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/web-casa/supas3"
+
+[profile.release]
+strip = true
+lto = "thin"

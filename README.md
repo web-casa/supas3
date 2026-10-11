@@ -15,6 +15,30 @@ A native multi-cloud object storage transfer workbench, built with Rust and GPUI
 - **Languages:** English, 简体中文
 - Dual-pane workspace with independent tabs, a transfer queue, cross-cloud copy, lightweight preview and small-file editing
 
+## Building
+
+Requires the Rust toolchain named in `rust-toolchain.toml`; `rustup` installs it automatically.
+
+```sh
+cargo run -p supas3-app        # start the application
+cargo test --workspace        # run the tests
+```
+
+On Debian or Ubuntu, install the system libraries first:
+
+```sh
+sudo apt-get install gcc g++ clang pkg-config libfontconfig-dev libwayland-dev \
+  libxkbcommon-x11-dev libx11-xcb-dev libvulkan1
+```
+
+## Layout
+
+| Path | Contents |
+|---|---|
+| `crates/supas3-app` | The desktop application (GPUI Kit). The binary is named `supas3`. |
+| `crates/supas3-core` | Storage and transfer backend, with no UI dependency. |
+| `crates/supas3-probe` | A command-line tool that checks how an S3-compatible service answers the calls supaS3 relies on. |
+
 ## Acknowledgements
 
 The storage and transfer backend is derived from [Brows3](https://github.com/rgcsekaraa/brows3), which is MIT licensed. Its license notice is kept in [LICENSES/Brows3-MIT.txt](LICENSES/Brows3-MIT.txt).

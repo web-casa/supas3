@@ -1,0 +1,83 @@
+use serde::{Deserialize, Serialize, Serializer};
+use thiserror::Error;
+
+#[derive(Debug, Error, Deserialize)]
+pub enum AppError {
+    #[error("Profile not found: {0}")]
+    ProfileNotFound(String),
+
+    #[error("Profile already exists: {0}")]
+    ProfileExists(String),
+
+    #[error("Invalid credentials: {0}")]
+    InvalidCredentials(String),
+
+    #[error("Connection failed: {0}")]
+    ConnectionFailed(String),
+
+    #[error("S3 error: {0}")]
+    S3Error(String),
+    #[error("Access Denied: {0}")]
+    AccessDenied(String),
+
+    #[error("Keychain error: {0}")]
+    KeychainError(String),
+
+    #[error("IO error: {0}")]
+    IoError(String),
+
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
+
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
+
+    #[error("Invalid content: {0}")]
+    InvalidContent(String),
+}
+
+// Tauri forwards command errors to JavaScript through Serde. The default enum
+// representation is an object such as `{ "S3Error": "..." }`, which becomes
+// `[object Object]` when a caller displays it. Serialize the Display value so
+// every command exposes the same useful message that is written to the logs.
+impl Serialize for AppError {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl From<std::io::Error> for AppError {
+    fn from(err: std::io::Error) -> Self {
+        AppError::IoError(err.to_string())
+    }
+}
+
+impl From<serde_json::Error> for AppError {
+    fn from(err: serde_json::Error) -> Self {
+        AppError::SerializationError(err.to_string())
+    }
+}
+
+impl From<keyring::Error> for AppError {
+    fn from(err: keyring::Error) -> Self {
+        AppError::KeychainError(err.to_string())
+    }
+}
+
+pub type Result<T> = std::result::Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::AppError;
+
+    #[test]
+    fn command_errors_serialize_as_human_readable_messages() {
+        let value = serde_json::to_value(AppError::S3Error("PutObject failed".to_string()))
+            .expect("AppError should serialize");
+
+        assert_eq!(value, "S3 error: PutObject failed");
+    }
+}
