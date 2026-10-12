@@ -44,10 +44,11 @@ pub struct CoreOptions {
 /// without that still releases its resources but does not wait for transfers
 /// to clean up.
 pub struct Core {
-    // Held for the life of the backend; released when the file is closed.
-    _instance_lock: std::fs::File,
+    // Held until shutdown or drop; released when the file is closed.
+    instance_lock: std::sync::Mutex<Option<std::fs::File>>,
     runtime: Registration,
-    scheduler: JoinHandle<()>,
+    // Taken by `shutdown`, so it can run through a shared reference.
+    scheduler: std::sync::Mutex<Option<JoinHandle<()>>>,
     app: AppHandle,
     data_dir: PathBuf,
     profiles: ProfileState,
@@ -69,9 +70,9 @@ impl Core {
 
         match Self::start(&app, &transfers, options.config_dir).await {
             Ok((data_dir, profiles, s3, jobs, scheduler)) => Ok(Self {
-                _instance_lock: instance_lock,
+                instance_lock: std::sync::Mutex::new(Some(instance_lock)),
                 runtime,
-                scheduler,
+                scheduler: std::sync::Mutex::new(Some(scheduler)),
                 app,
                 data_dir,
                 profiles,
@@ -138,10 +139,18 @@ impl Core {
     /// aborted on the server), then release shared state.
     ///
     /// Cancelled transfers are recorded in the journal as cancelled. Returns
-    /// how many transfers were still running when `grace` ran out.
-    pub async fn shutdown(mut self, grace: Duration) -> usize {
-        self.scheduler.abort();
-        let _ = (&mut self.scheduler).await;
+    /// how many transfers were still running when `grace` ran out. The backend
+    /// must not be used afterwards.
+    pub async fn shutdown(&self, grace: Duration) -> usize {
+        let scheduler = self
+            .scheduler
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(scheduler) = scheduler {
+            scheduler.abort();
+            let _ = scheduler.await;
+        }
 
         for job in self.transfers.list_jobs().await {
             self.transfers.cancel_job(&job.id).await;
@@ -158,8 +167,21 @@ impl Core {
             log::warn!("{unfinished} transfers were still winding down at shutdown");
         }
         self.transfers.clear_app_handle().await;
+        // Shared state can hold handles back to this backend; release it now
+        // so files and locks are free even while other references to the
+        // `Core` are still alive.
+        self.app.clear_managed();
+        // The saved-jobs store holds its own file lock; let go of it too, so
+        // the data can be reopened while this `Core` value is still alive.
+        *self.jobs.lock().await = JobStore::unavailable(
+            self.data_dir.join("saved-jobs.json"),
+            "The backend has been shut down.".into(),
+        );
+        self.instance_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
         unfinished
-        // `Drop` releases the rest.
     }
 
     /// The handle commands use to emit events and reach shared state.
@@ -215,7 +237,13 @@ fn lock_data_dir(default_config_dir: &Path) -> error::Result<std::fs::File> {
 
 impl Drop for Core {
     fn drop(&mut self) {
-        self.scheduler.abort();
+        let scheduler = self
+            .scheduler
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(scheduler) = scheduler.take() {
+            scheduler.abort();
+        }
         // Managed state holds the transfer manager, which holds this handle
         // back; clearing it breaks the cycle so files and locks are released.
         self.app.clear_managed();

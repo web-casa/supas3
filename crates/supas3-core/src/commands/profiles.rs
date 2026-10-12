@@ -83,6 +83,60 @@ pub async fn get_active_profile(state: State<'_, ProfileState>) -> Result<Option
         .map_err(|e| e.to_string())
 }
 
+/// Checks that a profile can read one bucket, for credentials that are not
+/// allowed to list buckets. Lists at most one key under `prefix`.
+pub async fn test_bucket_access(
+    mut profile: Profile,
+    bucket: String,
+    prefix: String,
+    state: State<'_, ProfileState>,
+) -> Result<TestConnectionResult, String> {
+    // Only a secret the caller left out is filled in from the store; one that
+    // was just typed must be the one tested.
+    let secret_missing = matches!(
+        &profile.credential_type,
+        crate::credentials::CredentialType::Manual { secret_access_key, .. }
+            | crate::credentials::CredentialType::CustomEndpoint { secret_access_key, .. }
+            if secret_access_key.is_empty()
+    );
+    if secret_missing && !profile.id.is_empty() {
+        profile = state.read().await.hydrate_profile(profile);
+    }
+    let client = crate::s3::client::build_s3_client(&profile, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    let request = client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix(&prefix)
+        .max_keys(1);
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        crate::s3::listing::send(&client, request),
+    )
+    .await;
+    Ok(match outcome {
+        Ok(Ok(_)) => TestConnectionResult {
+            success: true,
+            message: format!("Bucket '{bucket}' is reachable."),
+            region: profile.region.clone(),
+            bucket_count: None,
+        },
+        Ok(Err(error)) => TestConnectionResult {
+            success: false,
+            message: aws_sdk_s3::error::DisplayErrorContext(&error).to_string(),
+            region: profile.region.clone(),
+            bucket_count: None,
+        },
+        Err(_) => TestConnectionResult {
+            success: false,
+            message: "The storage service did not answer within 20 seconds.".into(),
+            region: profile.region.clone(),
+            bucket_count: None,
+        },
+    })
+}
+
 pub async fn test_connection(
     mut profile: Profile,
     state: State<'_, ProfileState>,

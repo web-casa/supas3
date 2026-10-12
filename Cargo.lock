@@ -7725,6 +7725,8 @@ dependencies = [
  "gpui-kit",
  "log",
  "rust-i18n",
+ "serde",
+ "serde_json",
  "supas3-core",
  "sys-locale",
  "tokio",

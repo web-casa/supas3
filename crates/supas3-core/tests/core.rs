@@ -101,8 +101,16 @@ async fn a_second_backend_cannot_open_data_that_is_in_use() {
         .unwrap()
         .is_empty());
     first.shutdown(Duration::from_secs(1)).await;
+    // `first` is still alive here: shutdown itself must have released both
+    // the instance lock and the saved-jobs lock.
     let (third_options, _events) = options(dir.path());
-    Core::init(third_options).await.unwrap();
+    let third = Core::init(third_options).await.unwrap();
+    assert!(jobs::list_saved_jobs(third.jobs())
+        .await
+        .unwrap()
+        .is_empty());
+    // Shutting down twice is harmless.
+    assert_eq!(first.shutdown(Duration::from_secs(1)).await, 0);
 }
 
 #[tokio::test]

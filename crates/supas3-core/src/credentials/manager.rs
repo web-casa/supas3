@@ -504,7 +504,11 @@ impl ProfileManager {
         let stored = self.data.profiles.get(&profile.id).unwrap_or(&profile);
         if let Some(stored_secret) = self.load_secret(stored).ok().flatten() {
             let (secret, session_token) = unpack_secret(&stored_secret);
-            profile.session_token = session_token;
+            // A token the caller supplied (one just typed into a form) wins
+            // over the stored one; profiles read from the store carry none.
+            if profile.session_token.is_none() {
+                profile.session_token = session_token;
+            }
             match &mut profile.credential_type {
                 CredentialType::Manual {
                     secret_access_key, ..
@@ -644,6 +648,32 @@ mod tests {
             super::unpack_secret(&packed),
             ("key/+=".to_string(), Some("token/+=\"quoted\"".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn filling_in_a_stored_secret_keeps_a_newly_supplied_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = ProfileManager::new(dir.path().to_path_buf(), true).unwrap();
+        let custom = |secret: &str| CredentialType::CustomEndpoint {
+            endpoint_url: "https://storage.example".into(),
+            access_key_id: "AK".into(),
+            secret_access_key: secret.into(),
+        };
+        let mut profile = Profile::new("temporary".into(), custom("stored-key"), None);
+        profile.session_token = Some("stored-token".into());
+        let saved = manager.add_profile(profile).await.unwrap();
+
+        // A form that keeps the secret but supplies a new token.
+        let mut edited = Profile::new("temporary".into(), custom(""), None);
+        edited.id = saved.id.clone();
+        edited.session_token = Some("new-token".into());
+        let hydrated = manager.hydrate_profile(edited);
+
+        assert_eq!(hydrated.session_token.as_deref(), Some("new-token"));
+        assert!(matches!(
+            &hydrated.credential_type,
+            CredentialType::CustomEndpoint { secret_access_key, .. } if secret_access_key == "stored-key"
+        ));
     }
 
     #[tokio::test]

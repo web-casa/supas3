@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Interface language selection. Translations live in `locales/app.yml`.
 
+use crate::settings::Language;
+
 pub const ENGLISH: &str = "en";
 pub const SIMPLIFIED_CHINESE: &str = "zh-CN";
 
@@ -15,10 +17,19 @@ pub fn supported_locale(system_locale: Option<&str>) -> &'static str {
     }
 }
 
-/// Applies the system language to both the application's strings and the
+/// The locale a language preference resolves to.
+pub fn locale_for(language: Language, system_locale: Option<&str>) -> &'static str {
+    match language {
+        Language::System => supported_locale(system_locale),
+        Language::English => ENGLISH,
+        Language::SimplifiedChinese => SIMPLIFIED_CHINESE,
+    }
+}
+
+/// Applies a language preference to the application's strings and to the
 /// component library's built-in strings.
-pub fn follow_system() {
-    let locale = supported_locale(sys_locale::get_locale().as_deref());
+pub fn apply(language: Language) {
+    let locale = locale_for(language, sys_locale::get_locale().as_deref());
     rust_i18n::set_locale(locale);
     gpui_kit::component::set_locale(locale);
 }
@@ -40,5 +51,19 @@ mod tests {
             assert_eq!(supported_locale(Some(tag)), ENGLISH, "{tag}");
         }
         assert_eq!(supported_locale(None), ENGLISH);
+    }
+
+    #[test]
+    fn a_chosen_language_overrides_the_system() {
+        assert_eq!(locale_for(Language::English, Some("zh-CN")), ENGLISH);
+        assert_eq!(
+            locale_for(Language::SimplifiedChinese, Some("en-US")),
+            SIMPLIFIED_CHINESE
+        );
+        assert_eq!(
+            locale_for(Language::System, Some("zh-CN")),
+            SIMPLIFIED_CHINESE
+        );
+        assert_eq!(locale_for(Language::System, None), ENGLISH);
     }
 }

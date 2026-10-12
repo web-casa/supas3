@@ -1220,12 +1220,67 @@ async fn run(t: &Target, env: &HashMap<String, String>, run_id: &str) {
     );
 }
 
+/// Fills `supas3-demo/` with folders and `count` small objects, so the
+/// interface has something to browse and page through. Existing objects with
+/// the same keys are replaced; nothing else in the bucket is touched.
+async fn seed(t: &Target, env: &HashMap<String, String>, count: usize) {
+    let rep = Report(&t.name);
+    let c = client(t, env, false).await;
+    let b = t.bucket.as_str();
+    let mut keys: Vec<String> = [
+        "supas3-demo/读我.txt",
+        "supas3-demo/照片/2026/海边.jpg",
+        "supas3-demo/照片/2026/山 路.jpg",
+        "supas3-demo/docs/report final.pdf",
+        "supas3-demo/docs/notes.md",
+        "supas3-demo/empty-folder/",
+    ]
+    .iter()
+    .map(|key| key.to_string())
+    .collect();
+    keys.extend((0..count).map(|index| format!("supas3-demo/many/item-{index:04}.txt")));
+    let mut failed = 0;
+    for chunk in keys.chunks(16) {
+        let results = futures_join(chunk.iter().map(|key| {
+            let body = if key.ends_with('/') {
+                ByteStream::from_static(b"")
+            } else {
+                ByteStream::from(key.clone().into_bytes())
+            };
+            c.put_object().bucket(b).key(key).body(body).send()
+        }))
+        .await;
+        failed += results.iter().filter(|result| result.is_err()).count();
+    }
+    rep.row(
+        "seed supas3-demo/",
+        format!("{} objects written, {failed} failed", keys.len() - failed),
+    );
+}
+
+/// Awaits a batch of requests concurrently.
+async fn futures_join<F: std::future::Future>(futures: impl Iterator<Item = F>) -> Vec<F::Output> {
+    let handles: Vec<_> = futures.map(Box::pin).collect();
+    let mut results = Vec::with_capacity(handles.len());
+    for handle in handles {
+        results.push(handle.await);
+    }
+    results
+}
+
 #[tokio::main]
 async fn main() {
     let env = load_env();
     let mut only: Vec<String> = std::env::args().skip(1).collect();
     let second = only.iter().any(|a| a == "--round2");
     only.retain(|a| a != "--round2");
+    // `--seed N target...` writes demo data instead of probing.
+    let seed_count = only.iter().position(|a| a == "--seed").map(|index| {
+        only.remove(index);
+        only.remove(index)
+            .parse::<usize>()
+            .expect("--seed needs a count")
+    });
     let run_id = format!(
         "{:x}",
         std::time::SystemTime::now()
@@ -1236,7 +1291,9 @@ async fn main() {
     println!("{:<11}| {:<44}| result", "target", "test");
     for t in &load_targets() {
         if only.is_empty() || only.contains(&t.name) {
-            if second {
+            if let Some(count) = seed_count {
+                seed(t, &env, count).await;
+            } else if second {
                 round2(t, &env, &run_id).await
             } else {
                 run(t, &env, &run_id).await
