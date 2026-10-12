@@ -78,8 +78,9 @@ jobs:
       - name: Build release
         run: cargo build --release --locked -p supas3-app
 
-      # Runs the real binary on a virtual display and waits for its window to
-      # exist, which a process that hangs during startup would never create.
+      # Runs the real binary on a virtual display and waits until its window
+      # exists and has drawn content, which a process that hangs during
+      # startup or fails to render would never do.
       - name: Launch check (Linux)
         if: runner.os == 'Linux'
         env:
@@ -95,10 +96,20 @@ jobs:
                 echo "the app exited before its window appeared" >&2; exit 1
               fi
               if xwininfo -root -tree | grep -q "\"supaS3\""; then
-                sleep 2
-                import -window root launch.png
-                kill "$pid"; wait "$pid" 2>/dev/null || true
-                echo "window appeared after ${attempt}s"; exit 0
+                # A window can exist before anything is drawn in it. Wait for
+                # a frame with content: a blank screen has a single colour.
+                for frame in $(seq 1 30); do
+                  import -window root launch.png
+                  colors=$(identify -format "%k" launch.png)
+                  if [ "$colors" -gt 8 ]; then
+                    kill "$pid"; wait "$pid" 2>/dev/null || true
+                    echo "window appeared after ${attempt}s, rendered after ${frame} more ($colors colours)"
+                    exit 0
+                  fi
+                  sleep 1
+                done
+                echo "the window stayed blank for 30s ($colors colours)" >&2
+                kill "$pid"; exit 1
               fi
               sleep 1
             done
@@ -107,12 +118,12 @@ jobs:
           '
 
       - name: Upload launch screenshot
-        if: runner.os == 'Linux'
+        if: always() && runner.os == 'Linux'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: launch-screenshot-${{ matrix.target }}
           path: launch.png
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
 
       # Hosted macOS and Windows runners have no guaranteed GPU, so a failure
