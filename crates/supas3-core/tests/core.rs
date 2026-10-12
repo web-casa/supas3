@@ -259,6 +259,42 @@ async fn a_pane_can_operate_on_a_connection_that_is_not_the_selected_one() {
     core.shutdown(Duration::from_secs(2)).await;
 }
 
+#[tokio::test]
+async fn deleting_a_folder_refuses_anything_that_is_not_a_folder_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (options, _events) = options(dir.path());
+    let core = Core::init(options).await.unwrap();
+
+    // No connection exists, so getting past the check would fail differently.
+    for prefix in ["", "folder", "folder/file.txt"] {
+        let error = operations::delete_prefix(
+            "bucket".into(),
+            None,
+            prefix.into(),
+            "profile".into(),
+            core.profiles(),
+            core.s3(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("non-empty prefix"), "{prefix:?}: {error}");
+    }
+    let error = operations::delete_prefix(
+        "bucket".into(),
+        None,
+        "folder/".into(),
+        "profile".into(),
+        core.profiles(),
+        core.s3(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(!error.contains("non-empty prefix"), "{error}");
+    core.shutdown(Duration::from_secs(2)).await;
+}
+
 async fn terminal_status(
     events: &mut mpsc::UnboundedReceiver<Event>,
     job_id: &str,

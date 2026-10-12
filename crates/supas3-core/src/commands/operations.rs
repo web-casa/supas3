@@ -1240,6 +1240,59 @@ pub async fn delete_objects(
     delete_objects_with_profile(bucket_name, bucket_region, keys, active_profile, &s3_state).await
 }
 
+/// Deletes every object under a folder prefix, the folder's own placeholder
+/// included. The whole prefix is listed before anything is deleted, so a
+/// listing that fails or exceeds the listing limits deletes nothing. Returns
+/// how many objects were deleted.
+pub async fn delete_prefix(
+    bucket_name: String,
+    bucket_region: Option<String>,
+    prefix: String,
+    expected_profile_id: String,
+    profile_state: State<'_, ProfileState>,
+    s3_state: State<'_, S3State>,
+) -> Result<usize> {
+    // An empty prefix would be the whole bucket; that is never a folder.
+    if prefix.is_empty() || !prefix.ends_with('/') {
+        return Err(crate::error::AppError::ConfigError(
+            "A folder to delete must be a non-empty prefix ending with '/'.".into(),
+        ));
+    }
+    let profile_manager = profile_state.read().await;
+    let active_profile = profile_manager
+        .get_active_profile()
+        .await?
+        .ok_or_else(|| crate::error::AppError::ProfileNotFound("No active profile".into()))?;
+    drop(profile_manager);
+    validate_operation_profile(Some(&expected_profile_id), &active_profile.id)?;
+
+    let region = {
+        let s3_manager = s3_state.read().await;
+        s3_manager.get_bucket_region(&active_profile, &bucket_name)
+    }
+    .or(bucket_region);
+    let client = {
+        let mut s3_manager = s3_state.write().await;
+        match &region {
+            Some(region) => s3_manager
+                .get_client_for_region(&active_profile, region)
+                .await?
+                .clone(),
+            None => s3_manager.get_client(&active_profile).await?.clone(),
+        }
+    };
+    let keys: Vec<String> = crate::s3::listing::list_recursive(&client, &bucket_name, &prefix)
+        .await?
+        .into_iter()
+        .filter_map(|object| object.key)
+        .collect();
+    let count = keys.len();
+    if count > 0 {
+        delete_objects_with_profile(bucket_name, region, keys, active_profile, &s3_state).await?;
+    }
+    Ok(count)
+}
+
 async fn delete_objects_with_profile(
     bucket_name: String,
     bucket_region: Option<String>,

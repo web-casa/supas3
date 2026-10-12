@@ -16,7 +16,7 @@ use supas3_core::credentials::Profile;
 /// What the form asks its owner to do.
 pub enum ConnectionFormEvent {
     /// A connection was stored.
-    Saved(Profile),
+    Saved(Box<Profile>),
     /// The user backed out without saving.
     Cancelled,
 }
@@ -187,7 +187,7 @@ impl ConnectionForm {
             let _ = form.update(cx, |form, cx| {
                 form.saving = false;
                 match result {
-                    Ok(saved) => cx.emit(ConnectionFormEvent::Saved(saved)),
+                    Ok(saved) => cx.emit(ConnectionFormEvent::Saved(Box::new(saved))),
                     Err(message) => form.save_error = Some(message),
                 }
                 cx.notify();

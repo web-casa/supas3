@@ -2,7 +2,7 @@
 //! One side of the workspace: a set of tabs, each showing a location.
 
 use crate::app_state::{AppBackend, Connections};
-use crate::entries_table::EntriesDelegate;
+use crate::entries_table::{DraggedEntries, EntriesDelegate, RowCommand};
 use crate::listing::{Listing, LoadState, Page};
 use crate::location::{collapse, CrumbSlot, History, Location};
 use gpui_kit::component::breadcrumb::{Breadcrumb, BreadcrumbItem};
@@ -20,9 +20,19 @@ use rust_i18n::t;
 /// How many breadcrumb steps a pane shows before collapsing the middle.
 const MAX_CRUMBS: usize = 3;
 
-/// Emitted when the user starts working in this pane.
+/// What a pane asks the workspace to do. Copying needs the other pane, and
+/// deleting needs a confirmation, so neither is carried out here.
 pub enum PaneEvent {
+    /// The user started working in this pane.
     Activated,
+    /// Copy these rows, read from the given location, to the other pane.
+    CopyRequested(DraggedEntries),
+    /// Delete these rows, read from the given location.
+    DeleteRequested(DraggedEntries),
+    /// Files were dragged in from outside the application.
+    FilesDropped(Vec<std::path::PathBuf>),
+    /// Rows were dragged in from a pane.
+    EntriesDropped(DraggedEntries),
 }
 
 struct PaneTab {
@@ -30,6 +40,9 @@ struct PaneTab {
     id: u64,
     history: History,
     listing: Listing,
+    /// Something changed what this location holds while the tab could not
+    /// be reloaded; it is reloaded as soon as that is safe.
+    stale: bool,
     table: Entity<TableState<EntriesDelegate>>,
     _table_events: Subscription,
 }
@@ -86,13 +99,18 @@ impl Pane {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let pane = cx.weak_entity();
-        let delegate = EntriesDelegate::new(window.rem_size(), move |window, cx| {
-            // The table asks while it is rendering; answer after the frame.
-            let pane = pane.clone();
-            window.defer(cx, move |_, cx| {
-                let _ = pane.update(cx, |pane, cx| pane.load_more(id, cx));
-            });
-        });
+        let delegate = EntriesDelegate::new(
+            window.rem_size(),
+            location.clone(),
+            move |command, window, cx| {
+                // Rows ask while the table is rendering or handling its own
+                // event; answer once that has finished.
+                let pane = pane.clone();
+                window.defer(cx, move |_, cx| {
+                    let _ = pane.update(cx, |pane, cx| pane.on_row_command(id, command, cx));
+                });
+            },
+        );
         let table = cx.new(|cx| TableState::new(delegate, window, cx));
         let table_events =
             cx.subscribe_in(&table, window, move |pane, _, event: &TableEvent, _, cx| {
@@ -104,6 +122,7 @@ impl Pane {
             id,
             history: History::new(location),
             listing: Listing::default(),
+            stale: false,
             table,
             _table_events: table_events,
         });
@@ -187,6 +206,71 @@ impl Pane {
         SharedString::from(format!("{}-{name}", self.side)).into()
     }
 
+    fn on_row_command(&mut self, tab_id: u64, command: RowCommand, cx: &mut Context<Self>) {
+        match command {
+            RowCommand::LoadMore => self.load_more(tab_id, cx),
+            RowCommand::MarksChanged => {
+                self.reload_stale(cx);
+                cx.notify();
+            }
+            RowCommand::Copy(rows) => cx.emit(PaneEvent::CopyRequested(rows)),
+            RowCommand::Delete(rows) => cx.emit(PaneEvent::DeleteRequested(rows)),
+        }
+    }
+
+    /// The rows a toolbar or keyboard action applies to, with where they are:
+    /// the marked rows, or the selected row when nothing is marked.
+    fn selection(&self, cx: &App) -> DraggedEntries {
+        let tab = &self.tabs[self.active];
+        let table = tab.table.read(cx);
+        let delegate = table.delegate();
+        DraggedEntries {
+            source: tab.history.current().clone(),
+            entries: if delegate.marked_count() > 0 {
+                delegate.selection(None)
+            } else {
+                delegate.selection(table.selected_row())
+            },
+        }
+    }
+
+    /// Notes that what a location holds has changed, and reloads the tabs
+    /// showing it. `location` of `None` means any location may have changed.
+    /// A tab that is loading or has marked rows is reloaded later, when that
+    /// no longer disturbs the user; `now` reloads it regardless, for when the
+    /// user's own action has made its rows and marks out of date.
+    pub fn location_changed(
+        &mut self,
+        location: Option<&Location>,
+        now: bool,
+        cx: &mut Context<Self>,
+    ) {
+        for tab in &mut self.tabs {
+            if location.is_none_or(|changed| tab.history.current() == changed) {
+                tab.stale = true;
+            }
+        }
+        if now {
+            let tab = &self.tabs[self.active];
+            if tab.stale {
+                let id = tab.id;
+                self.load(id, true, cx);
+                return;
+            }
+        }
+        self.reload_stale(cx);
+    }
+
+    /// Reloads the active tab if it is stale and reloading is safe.
+    fn reload_stale(&mut self, cx: &mut Context<Self>) {
+        let tab = &self.tabs[self.active];
+        let marked = tab.table.read(cx).delegate().marked_count();
+        if tab.stale && !tab.listing.is_busy() && marked == 0 {
+            let id = tab.id;
+            self.load(id, true, cx);
+        }
+    }
+
     fn tab_index(&self, id: u64) -> Option<usize> {
         self.tabs.iter().position(|tab| tab.id == id)
     }
@@ -252,9 +336,11 @@ impl Pane {
             return;
         };
         let generation = self.tabs[index].listing.begin();
+        self.tabs[index].stale = false;
+        let location = self.tabs[index].history.current().clone();
         self.tabs[index].table.update(cx, |table, cx| {
             // The rows and their selection belong to what is being replaced.
-            table.delegate_mut().clear();
+            table.delegate_mut().clear(location);
             table.clear_selection(cx);
         });
         self.sync_state(index, cx);
@@ -315,6 +401,8 @@ impl Pane {
             .table
             .update(cx, |table, _| table.delegate_mut().append(rows));
         self.sync_state(index, cx);
+        // A change that arrived while this was loading is picked up now.
+        self.reload_stale(cx);
         cx.notify();
     }
 
@@ -350,6 +438,22 @@ impl Pane {
                 }
             }
             "backspace" if plain => self.go_up(cx),
+            "space" if plain => {
+                let table = self.tabs[self.active].table.clone();
+                table.update(cx, |table, cx| {
+                    if let Some(row) = table.selected_row() {
+                        table.delegate_mut().toggle_mark(row);
+                        cx.notify();
+                    }
+                });
+                cx.notify();
+            }
+            "delete" if plain => {
+                let rows = self.selection(cx);
+                if !rows.entries.is_empty() {
+                    cx.emit(PaneEvent::DeleteRequested(rows));
+                }
+            }
             "left" if keystroke.modifiers.alt => self.go_back(cx),
             "right" if keystroke.modifiers.alt => self.go_forward(cx),
             "up" if keystroke.modifiers.alt => self.go_up(cx),
@@ -421,6 +525,7 @@ impl Pane {
             .on_click(cx.listener(|pane, index: &usize, _, cx| {
                 pane.active = (*index).min(pane.tabs.len() - 1);
                 pane.editing_path = false;
+                pane.reload_stale(cx);
                 cx.emit(PaneEvent::Activated);
                 cx.notify();
             }))
@@ -619,6 +724,19 @@ impl Pane {
             LoadState::Loaded => (t!("status.items", count = count).into_owned(), false),
         };
         let can_load_more = tab.listing.has_more() && !tab.listing.is_busy();
+        let marked = tab.table.read(cx).delegate().marked_count();
+        let has_selection = !self.selection(cx).entries.is_empty();
+        let text = if marked > 0 {
+            t!("status.marked", marked = marked, count = count).into_owned()
+        } else {
+            text
+        };
+        // The arrow points at the other pane.
+        let copy_icon = if self.side == "left" {
+            IconName::ArrowRight
+        } else {
+            IconName::ArrowLeft
+        };
         h_flex()
             .w_full()
             .h_7()
@@ -643,6 +761,28 @@ impl Pane {
                         .on_click(cx.listener(move |pane, _, _, cx| pane.load_more(id, cx))),
                 )
             })
+            .child(
+                Button::new(self.id("copy"))
+                    .xsmall()
+                    .icon(copy_icon)
+                    .label(t!("action.copy_to_other").into_owned())
+                    .disabled(!has_selection)
+                    .on_click(cx.listener(|pane, _, _, cx| {
+                        let rows = pane.selection(cx);
+                        cx.emit(PaneEvent::CopyRequested(rows));
+                    })),
+            )
+            .child(
+                Button::new(self.id("delete"))
+                    .ghost()
+                    .xsmall()
+                    .label(t!("action.delete_ellipsis").into_owned())
+                    .disabled(!has_selection)
+                    .on_click(cx.listener(|pane, _, _, cx| {
+                        let rows = pane.selection(cx);
+                        cx.emit(PaneEvent::DeleteRequested(rows));
+                    })),
+            )
     }
 }
 
@@ -657,6 +797,17 @@ impl Render for Pane {
                 cx.listener(|_, _, _, cx| cx.emit(PaneEvent::Activated)),
             )
             .on_key_down(cx.listener(Self::on_key_down))
+            // Dropping onto a pane copies into the location it shows.
+            .drag_over::<ExternalPaths>(|style, _, _, cx| style.bg(cx.theme().drop_target))
+            .drag_over::<DraggedEntries>(|style, _, _, cx| style.bg(cx.theme().drop_target))
+            .on_drop(cx.listener(|_, paths: &ExternalPaths, _, cx| {
+                cx.emit(PaneEvent::Activated);
+                cx.emit(PaneEvent::FilesDropped(paths.paths().to_vec()));
+            }))
+            .on_drop(cx.listener(|_, dragged: &DraggedEntries, _, cx| {
+                cx.emit(PaneEvent::Activated);
+                cx.emit(PaneEvent::EntriesDropped(dragged.clone()));
+            }))
             .child(self.render_tabs(cx))
             .child(self.render_navigation(cx))
             .child(div().flex_1().min_h_0().child(self.render_content(cx)))

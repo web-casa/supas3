@@ -14,6 +14,9 @@ mod listing;
 mod location;
 mod pane;
 mod settings;
+mod task_center;
+mod tasks;
+mod transfer_plan;
 mod workspace;
 
 use app_state::AppBackend;
@@ -36,7 +39,10 @@ fn main() {
         .as_ref()
         .map(|dir| Settings::load(dir))
         .unwrap_or_default();
-    let started = config_dir.and_then(backend::Backend::start);
+    // Transfer events wait here until the task center collects them.
+    let events = std::sync::Arc::new(tasks::EventQueue::default());
+    let sink = events.sink();
+    let started = config_dir.and_then(|dir| backend::Backend::start(dir, sink));
 
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
@@ -68,7 +74,7 @@ fn main() {
 
             gpui_kit::open_window(options, cx, move |window, cx| {
                 window.activate_window();
-                cx.new(|cx| Workspace::new(settings, window, cx))
+                cx.new(|cx| Workspace::new(settings, events.clone(), window, cx))
             })
             .expect("failed to open the main window");
         });

@@ -5,9 +5,13 @@ use crate::app_state::{AppBackend, Connections};
 use crate::backend::default_config_dir;
 use crate::connection_form::{ConnectionForm, ConnectionFormEvent};
 use crate::i18n;
+use crate::listing::Entry;
 use crate::location::Location;
 use crate::pane::{Pane, PaneEvent};
 use crate::settings::{Appearance, Language, Settings};
+use crate::task_center::{TaskCenter, TaskCenterEvent};
+use crate::tasks::EventQueue;
+use crate::transfer_plan::{plan, plan_deletion, plan_drop, Deletion, Plan};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::NotificationType;
@@ -32,6 +36,7 @@ pub struct Workspace {
     connections: Entity<Connections>,
     left: Entity<Pane>,
     right: Entity<Pane>,
+    task_center: Entity<TaskCenter>,
     /// The pane that sidebar choices open in.
     active: Side,
     settings: Settings,
@@ -65,16 +70,28 @@ fn start_of(profile: &Profile) -> Location {
 }
 
 impl Workspace {
-    pub fn new(settings: Settings, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        settings: Settings,
+        events: std::sync::Arc<EventQueue>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let connections = cx.new(|_| Connections::default());
         let left = cx.new(|cx| Pane::new("left", home(), connections.clone(), window, cx));
         let right = cx.new(|cx| Pane::new("right", home(), connections.clone(), window, cx));
+        let task_center = cx.new(|cx| TaskCenter::new(events, cx));
         let subscriptions = vec![
-            cx.subscribe(&left, |workspace, _, _: &PaneEvent, cx| {
-                workspace.activate(Side::Left, cx);
+            cx.subscribe_in(&left, window, |workspace, _, event, window, cx| {
+                workspace.on_pane_event(Side::Left, event, window, cx);
             }),
-            cx.subscribe(&right, |workspace, _, _: &PaneEvent, cx| {
-                workspace.activate(Side::Right, cx);
+            cx.subscribe_in(&right, window, |workspace, _, event, window, cx| {
+                workspace.on_pane_event(Side::Right, event, window, cx);
+            }),
+            // A finished transfer may have changed what a pane shows.
+            cx.subscribe(&task_center, |workspace, _, _: &TaskCenterEvent, cx| {
+                for pane in [workspace.left.clone(), workspace.right.clone()] {
+                    pane.update(cx, |pane, cx| pane.location_changed(None, false, cx));
+                }
             }),
             cx.observe(&connections, |_, _, cx| cx.notify()),
             cx.observe_window_appearance(window, |workspace, window, cx| {
@@ -87,6 +104,7 @@ impl Workspace {
             connections,
             left,
             right,
+            task_center,
             active: Side::Right,
             settings,
             form: None,
@@ -153,6 +171,311 @@ impl Workspace {
                         workspace.notice =
                             Some(t!("connection.load_failed", detail = error).into_owned());
                         cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn other(side: Side) -> Side {
+        match side {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
+        }
+    }
+
+    fn on_pane_event(
+        &mut self,
+        side: Side,
+        event: &PaneEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate(side, cx);
+        match event {
+            PaneEvent::Activated => {}
+            // Each request names the location its rows were read from, which
+            // may no longer be what the pane shows.
+            PaneEvent::CopyRequested(taken) => {
+                let target_side = Self::other(side);
+                let target = self.pane(target_side).read(cx).location().clone();
+                self.start_copy(plan(&taken.source, &taken.entries, &target), window, cx);
+            }
+            PaneEvent::EntriesDropped(dragged) => {
+                let target = self.pane(side).read(cx).location().clone();
+                // Dropping rows back where they came from does nothing.
+                if dragged.source != target {
+                    self.start_copy(plan(&dragged.source, &dragged.entries, &target), window, cx);
+                }
+            }
+            PaneEvent::FilesDropped(paths) => {
+                let target = self.pane(side).read(cx).location().clone();
+                let paths = paths
+                    .iter()
+                    .map(|path| (path.clone(), path.is_dir()))
+                    .collect();
+                self.start_copy(plan_drop(paths, &target), window, cx);
+            }
+            PaneEvent::DeleteRequested(taken) => {
+                self.confirm_delete_rows(&taken.source, &taken.entries, window, cx);
+            }
+        }
+    }
+
+    fn notify(
+        kind: NotificationType,
+        message: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.push_notification((kind, message.into()), cx);
+    }
+
+    /// A location as the user would name it, for confirmations.
+    fn describe(&self, location: &Location, cx: &App) -> String {
+        match location {
+            Location::Local(path) => path.to_string_lossy().into_owned(),
+            Location::Buckets { profile_id } => self.connections.read(cx).name_of(profile_id),
+            Location::Objects {
+                profile_id,
+                bucket,
+                prefix,
+            } => format!(
+                "{} / {bucket}/{prefix}",
+                self.connections.read(cx).name_of(profile_id)
+            ),
+        }
+    }
+
+    /// Starts a planned copy, or says why it cannot be done. A copy between two connections is confirmed first,
+    /// because it runs through this computer.
+    fn start_copy(
+        &mut self,
+        planned: Result<Plan, crate::transfer_plan::Refusal>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let planned = match planned {
+            Ok(planned) => planned,
+            Err(refusal) => {
+                let message = t!(refusal.message_key()).into_owned();
+                Self::notify(NotificationType::Info, message, window, cx);
+                return;
+            }
+        };
+        let Plan::CopyAcross {
+            source_profile_id,
+            items,
+            target,
+        } = &planned
+        else {
+            self.run_copy(planned, window, cx);
+            return;
+        };
+        let source = match items.first() {
+            Some(item) => format!(
+                "{} / {}",
+                self.connections.read(cx).name_of(source_profile_id),
+                item.bucket
+            ),
+            None => String::new(),
+        };
+        let target_name = format!(
+            "{} / {}/{}",
+            self.connections.read(cx).name_of(&target.profile_id),
+            target.bucket,
+            target.prefix
+        );
+        let title: SharedString = t!(
+            "copy.across_title",
+            count = items.len(),
+            target = target_name
+        )
+        .into_owned()
+        .into();
+        let body: SharedString = t!("copy.across_body", source = source).into_owned().into();
+        let workspace = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (workspace, planned) = (workspace.clone(), planned.clone());
+            let (enter_workspace, enter_planned) = (workspace.clone(), planned.clone());
+            dialog
+                .title(title.clone())
+                .child(body.clone())
+                // Enter does what the primary button does.
+                .on_ok(move |_, window, cx| {
+                    let planned = enter_planned.clone();
+                    let _ = enter_workspace.update(cx, |workspace, cx| {
+                        workspace.run_copy(planned, window, cx);
+                    });
+                    true
+                })
+                .footer(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("cancel-copy")
+                                .outline()
+                                .label(t!("action.cancel").into_owned())
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("confirm-copy")
+                                .primary()
+                                .label(t!("action.copy").into_owned())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let planned = planned.clone();
+                                    let _ = workspace.update(cx, |workspace, cx| {
+                                        workspace.run_copy(planned, window, cx);
+                                    });
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn run_copy(&mut self, planned: Plan, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(requests) = AppBackend::requests(cx) else {
+            let message = t!("error.backend_stopped").into_owned();
+            Self::notify(NotificationType::Error, message, window, cx);
+            return;
+        };
+        // A copy within one connection is done by the service before the
+        // request returns, object by object. It can fail part-way, so the
+        // target is reloaded whatever the outcome.
+        let direct = matches!(planned, Plan::CopyWithin { .. });
+        cx.spawn_in(window, async move |workspace, cx| {
+            let result = requests.execute(planned).await;
+            let _ = workspace.update_in(cx, |workspace, window, cx| {
+                if direct {
+                    for pane in [workspace.left.clone(), workspace.right.clone()] {
+                        pane.update(cx, |pane, cx| pane.location_changed(None, false, cx));
+                    }
+                }
+                match result {
+                    Ok(outcome) => {
+                        if outcome.copied > 0 {
+                            let message = t!("copy.copied", count = outcome.copied).into_owned();
+                            Self::notify(NotificationType::Success, message, window, cx);
+                        }
+                        if !outcome.failures.is_empty() {
+                            let mut message = t!(
+                                "copy.some_failed",
+                                count = outcome.failures.len(),
+                                detail = outcome.failures.join("; ")
+                            )
+                            .into_owned();
+                            if direct {
+                                message.push(' ');
+                                message.push_str(&t!("copy.maybe_partial"));
+                            }
+                            Self::notify(NotificationType::Error, message, window, cx);
+                        }
+                    }
+                    Err(error) => {
+                        let message = t!("copy.failed", detail = error).into_owned();
+                        Self::notify(NotificationType::Error, message, window, cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_delete_rows(
+        &mut self,
+        location: &Location,
+        rows: &[Entry],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let location = location.clone();
+        let deletion = match plan_deletion(&location, rows) {
+            Ok(deletion) => deletion,
+            Err(refusal) => {
+                let message = t!(refusal.message_key()).into_owned();
+                Self::notify(NotificationType::Info, message, window, cx);
+                return;
+            }
+        };
+        let title: SharedString = match deletion.names.as_slice() {
+            [only] => t!("delete.title_one", name = only).into_owned().into(),
+            many => t!("delete.title_many", count = many.len())
+                .into_owned()
+                .into(),
+        };
+        let body: SharedString = t!("delete.body", location = self.describe(&location, cx))
+            .into_owned()
+            .into();
+        let workspace = cx.weak_entity();
+        let changed = location.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (workspace, deletion) = (workspace.clone(), deletion.clone());
+            let changed = changed.clone();
+            dialog
+                .title(title.clone())
+                .child(body.clone())
+                // Deleting cannot be undone: Enter alone must not do it. The
+                // dialog stays open until Delete or Cancel is chosen.
+                .on_ok(|_, _, _| false)
+                .footer(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("cancel-delete-rows")
+                                .outline()
+                                .label(t!("action.cancel").into_owned())
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("confirm-delete-rows")
+                                .danger()
+                                .label(t!("action.delete").into_owned())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let (deletion, changed) = (deletion.clone(), changed.clone());
+                                    let _ = workspace.update(cx, |workspace, cx| {
+                                        workspace.run_delete(deletion, changed, window, cx);
+                                    });
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn run_delete(
+        &mut self,
+        deletion: Deletion,
+        location: Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(requests) = AppBackend::requests(cx) else {
+            let message = t!("error.backend_stopped").into_owned();
+            Self::notify(NotificationType::Error, message, window, cx);
+            return;
+        };
+        cx.spawn_in(window, async move |workspace, cx| {
+            let result = requests.delete(deletion).await;
+            let _ = workspace.update_in(cx, |workspace, window, cx| {
+                // Reload either way, at once: a failure may have deleted part
+                // of it, and the rows and marks on screen are now out of date.
+                for pane in [workspace.left.clone(), workspace.right.clone()] {
+                    pane.update(cx, |pane, cx| {
+                        pane.location_changed(Some(&location), true, cx)
+                    });
+                }
+                match result {
+                    Ok(count) => {
+                        let message = t!("delete.done", count = count).into_owned();
+                        Self::notify(NotificationType::Success, message, window, cx);
+                    }
+                    Err(error) => {
+                        let message = t!("delete.failed", detail = error).into_owned();
+                        Self::notify(NotificationType::Error, message, window, cx);
                     }
                 }
             });
@@ -556,7 +879,8 @@ impl Render for Workspace {
                                         .child(self.render_pane(Side::Right, cx)),
                                 ),
                         ),
-                    ),
+                    )
+                    .child(self.task_center.clone()),
             )
     }
 }

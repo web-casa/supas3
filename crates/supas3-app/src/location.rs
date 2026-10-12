@@ -402,10 +402,13 @@ mod tests {
             })
         );
 
-        let local = Location::Local(PathBuf::from("/home"));
+        // What counts as an absolute path depends on the platform (`/tmp` is
+        // not one on Windows), so use one the platform itself provides.
+        let absolute = std::env::temp_dir();
+        let local = Location::Local(absolute.clone());
         assert_eq!(
-            local.resolve_path_text("/tmp"),
-            Some(Location::Local(PathBuf::from("/tmp")))
+            local.resolve_path_text(&absolute.to_string_lossy()),
+            Some(Location::Local(absolute))
         );
         assert_eq!(local.resolve_path_text("relative/path"), None);
         assert_eq!(local.resolve_path_text(""), None);

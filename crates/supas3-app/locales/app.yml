@@ -257,3 +257,161 @@ preferences.dark:
 preferences.not_saved:
   en: Couldn’t save this preference. It applies until supaS3 closes.
   zh-CN: 无法保存此偏好设置，仅在本次运行期间生效。
+
+action.copy_to_other:
+  en: Copy to other side
+  zh-CN: 复制到另一侧
+action.delete_ellipsis:
+  en: Delete…
+  zh-CN: 删除…
+action.copy:
+  en: Copy
+  zh-CN: 复制
+
+select.all:
+  en: Select all
+  zh-CN: 全选
+select.item:
+  en: "Select %{name}"
+  zh-CN: "选择 %{name}"
+drag.items:
+  en: "%{count} items"
+  zh-CN: "%{count} 项"
+status.marked:
+  en: "%{marked} of %{count} selected"
+  zh-CN: "已选 %{marked} 项，共 %{count} 项"
+
+copy.nothing_selected:
+  en: Select something to copy first.
+  zh-CN: 请先选择要复制的内容。
+copy.local_to_local:
+  en: Both sides show folders on this computer. Open a storage location on one side to copy.
+  zh-CN: 两侧都是此电脑上的文件夹。请在一侧打开存储位置后再复制。
+copy.target_is_bucket_list:
+  en: Open a bucket on the other side first; items can’t be copied into a list of buckets.
+  zh-CN: 请先在另一侧打开一个存储桶，无法复制到存储桶列表中。
+copy.buckets_selected:
+  en: Buckets can’t be copied. Open one and select what is inside.
+  zh-CN: 无法复制存储桶本身，请打开后选择其中的内容。
+copy.same_place:
+  en: The other side shows the same location, so there is nothing to copy.
+  zh-CN: 另一侧是同一个位置，无需复制。
+copy.into_itself:
+  en: A folder can’t be copied into itself.
+  zh-CN: 无法将文件夹复制到它自身之内。
+copy.unnamed_item:
+  en: An item without a name can’t be copied from here.
+  zh-CN: 无法从这里复制没有名称的项目。
+copy.across_title:
+  en: "Copy %{count} items to “%{target}”?"
+  zh-CN: "将 %{count} 项复制到“%{target}”？"
+copy.across_body:
+  en: "From “%{source}”. These are two connections, so the data is downloaded to a temporary file on this computer and uploaded from there. It uses this computer’s network and disk space, and supaS3 must stay open until it finishes."
+  zh-CN: "来源：“%{source}”。这是两个不同的连接，数据会先下载到此电脑的临时文件，再从这里上传。期间占用此电脑的网络和磁盘空间，完成前请保持 supaS3 运行。"
+copy.queued:
+  en: "%{count} transfers queued"
+  zh-CN: "已加入 %{count} 个传输任务"
+copy.copied:
+  en: "%{count} items copied"
+  zh-CN: "已复制 %{count} 项"
+copy.some_failed:
+  en: "%{count} items couldn’t be copied. %{detail}"
+  zh-CN: "%{count} 项无法复制。%{detail}"
+copy.failed:
+  en: "Couldn’t copy. %{detail}"
+  zh-CN: "复制失败。%{detail}"
+
+delete.nothing_selected:
+  en: Select something to delete first.
+  zh-CN: 请先选择要删除的内容。
+delete.local_files:
+  en: Files on this computer aren’t deleted from supaS3. Use your file manager.
+  zh-CN: supaS3 不删除此电脑上的文件，请使用系统的文件管理器。
+delete.buckets:
+  en: Buckets aren’t deleted from supaS3.
+  zh-CN: supaS3 不删除存储桶。
+delete.title_one:
+  en: "Delete “%{name}”?"
+  zh-CN: "删除“%{name}”？"
+delete.title_many:
+  en: "Delete %{count} items?"
+  zh-CN: "删除 %{count} 项？"
+delete.body:
+  en: "From “%{location}”. Folders are deleted with everything in them. This can’t be undone."
+  zh-CN: "位置：“%{location}”。文件夹会连同其中所有内容一并删除，此操作无法撤销。"
+delete.done:
+  en: "%{count} objects deleted"
+  zh-CN: "已删除 %{count} 个对象"
+delete.failed:
+  en: "Couldn’t delete. %{detail}"
+  zh-CN: "删除失败。%{detail}"
+
+tasks.title:
+  en: Transfers
+  zh-CN: 传输
+tasks.idle:
+  en: No active transfers
+  zh-CN: 没有进行中的传输
+tasks.active:
+  en: "%{count} active"
+  zh-CN: "%{count} 个进行中"
+tasks.failed:
+  en: "%{count} failed"
+  zh-CN: "%{count} 个失败"
+tasks.filter_current:
+  en: Current
+  zh-CN: 当前
+tasks.filter_failed:
+  en: "Failed (%{count})"
+  zh-CN: "失败（%{count}）"
+tasks.filter_finished:
+  en: Finished
+  zh-CN: 已结束
+tasks.clear_finished:
+  en: Clear finished
+  zh-CN: 清除已结束
+tasks.none:
+  en: Nothing to show here
+  zh-CN: 这里没有任务
+tasks.show_more:
+  en: "Show %{count} more (%{hidden} not shown)"
+  zh-CN: "再显示 %{count} 个（还有 %{hidden} 个未显示）"
+tasks.cancel_all:
+  en: Cancel all
+  zh-CN: 全部取消
+tasks.cannot_retry:
+  en: This transfer can’t be retried after a restart. Start it again from the file list.
+  zh-CN: 重启后无法重试该传输，请从文件列表重新发起。
+tasks.remove:
+  en: Remove
+  zh-CN: 移除
+tasks.upload:
+  en: Upload
+  zh-CN: 上传
+tasks.download:
+  en: Download
+  zh-CN: 下载
+tasks.copy:
+  en: Copy via this computer
+  zh-CN: 经此电脑中转复制
+tasks.state_queued:
+  en: Waiting
+  zh-CN: 等待中
+tasks.state_paused:
+  en: Paused
+  zh-CN: 已暂停
+tasks.state_completed:
+  en: Done
+  zh-CN: 已完成
+tasks.state_cancelled:
+  en: Cancelled
+  zh-CN: 已取消
+tasks.state_failed:
+  en: "Failed: %{error}"
+  zh-CN: "失败：%{error}"
+copy.unsafe_local_name:
+  en: An object’s name can’t be used as a file name on this computer, so it isn’t downloaded. Names with slashes, backslashes, colons or a trailing dot or space are refused.
+  zh-CN: 有对象的名称不能用作此电脑上的文件名，因此不会下载。含斜杠、反斜杠、冒号，或以句点、空格结尾的名称会被拒绝。
+copy.maybe_partial:
+  en: Some items may already have been copied.
+  zh-CN: 部分内容可能已经复制。

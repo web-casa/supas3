@@ -4,14 +4,18 @@
 
 use crate::listing::{display_order, Entry, EntryKind, Page};
 use crate::location::Location;
+use crate::transfer_plan::{Deletion, Plan};
 use anyhow::{Context as _, Result};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use supas3_core::commands::{buckets, objects, profiles};
+use supas3_core::commands::cross_copy::{self, CopyItem};
+use supas3_core::commands::{buckets, objects, operations, profiles, transfer};
 use supas3_core::credentials::{with_profile, Profile};
+use supas3_core::host::EventSink;
+use supas3_core::transfer::TransferJob;
 use supas3_core::{Core, CoreOptions};
 
 /// How long quitting waits for transfers to cancel and clean up.
@@ -39,18 +43,15 @@ impl Drop for Backend {
 }
 
 impl Backend {
-    pub fn start(config_dir: PathBuf) -> Result<Self> {
+    /// Starts the backend. `events` receives transfer events; see
+    /// [`EventSink`] for what it may and may not do.
+    pub fn start(config_dir: PathBuf, events: EventSink) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("supas3-backend")
             .build()
             .context("could not start the backend runtime")?;
-        let options = CoreOptions {
-            config_dir,
-            // No view consumes events yet. The sink must not block or queue
-            // without bound, so events are dropped until the task center exists.
-            events: Arc::new(|event| log::trace!("backend event: {}", event.name)),
-        };
+        let options = CoreOptions { config_dir, events };
         let core = runtime
             .block_on(Core::init(options))
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -167,6 +168,314 @@ impl Requests {
         .await
     }
 
+    /// Carries out a copy plan. Uploads, downloads and copies between
+    /// connections are queued as transfers and reported through events;
+    /// copies within one connection are done by the service before this
+    /// returns.
+    pub async fn execute(&self, plan: Plan) -> Result<Outcome, String> {
+        self.run(move |core| async move {
+            let mut outcome = Outcome::default();
+            match plan {
+                Plan::Upload { items, target } => {
+                    for item in items {
+                        let key = target.key_for(&item.name, item.is_folder);
+                        let path = item.path.to_string_lossy().into_owned();
+                        let queued = with_profile(target.profile_id.clone(), async {
+                            if item.is_folder {
+                                // The backend names the uploaded folder
+                                // itself, under the prefix it is given.
+                                transfer::queue_folder_upload(
+                                    target.bucket.clone(),
+                                    None,
+                                    target.prefix.clone(),
+                                    path,
+                                    target.profile_id.clone(),
+                                    core.app(),
+                                    core.profiles(),
+                                    core.s3(),
+                                    core.transfers(),
+                                )
+                                .await
+                                .map(|count| count as usize)
+                            } else {
+                                transfer::queue_upload(
+                                    target.bucket.clone(),
+                                    None,
+                                    key,
+                                    path,
+                                    0,
+                                    target.profile_id.clone(),
+                                    core.app(),
+                                    core.profiles(),
+                                    core.s3(),
+                                    core.transfers(),
+                                )
+                                .await
+                                .map(|_| 1)
+                            }
+                        })
+                        .await;
+                        outcome.record(&item.name, queued.map_err(|e| e.to_string()), true);
+                    }
+                }
+                Plan::Download {
+                    profile_id,
+                    items,
+                    folder,
+                } => {
+                    for item in items {
+                        let path = folder.join(&item.name).to_string_lossy().into_owned();
+                        let queued = with_profile(profile_id.clone(), async {
+                            if item.is_folder {
+                                transfer::queue_folder_download(
+                                    item.bucket.clone(),
+                                    None,
+                                    item.key.clone(),
+                                    path,
+                                    profile_id.clone(),
+                                    core.app(),
+                                    core.profiles(),
+                                    core.s3(),
+                                    core.transfers(),
+                                )
+                                .await
+                                .map(|count| count as usize)
+                            } else {
+                                transfer::queue_download(
+                                    item.bucket.clone(),
+                                    None,
+                                    item.key.clone(),
+                                    path,
+                                    item.size.unwrap_or(0),
+                                    Some(false),
+                                    profile_id.clone(),
+                                    core.app(),
+                                    core.profiles(),
+                                    core.s3(),
+                                    core.transfers(),
+                                )
+                                .await
+                                .map(|_| 1)
+                            }
+                        })
+                        .await;
+                        outcome.record(&item.name, queued.map_err(|e| e.to_string()), true);
+                    }
+                }
+                Plan::CopyWithin { items, target } => {
+                    for item in items {
+                        let copied = with_profile(
+                            target.profile_id.clone(),
+                            operations::copy_object(
+                                item.bucket.clone(),
+                                None,
+                                item.key.clone(),
+                                target.bucket.clone(),
+                                None,
+                                target.key_for(&item.name, item.is_folder),
+                                Some(target.profile_id.clone()),
+                                core.profiles(),
+                                core.s3(),
+                            ),
+                        )
+                        .await;
+                        outcome.record(
+                            &item.name,
+                            copied.map(|()| 1).map_err(|e| e.to_string()),
+                            false,
+                        );
+                    }
+                }
+                Plan::CopyAcross {
+                    source_profile_id,
+                    items,
+                    target,
+                } => {
+                    // The backend wants each side's signing region.
+                    let region_of = |id: &str, profiles: &[Profile]| {
+                        profiles
+                            .iter()
+                            .find(|profile| profile.id == id)
+                            .and_then(|profile| profile.region.clone())
+                            .unwrap_or_else(|| "us-east-1".to_string())
+                    };
+                    let profiles = profiles::list_profiles(core.profiles()).await?;
+                    // Prefer the region each bucket is known to be in: a
+                    // connection's default region is wrong for a bucket that
+                    // lives elsewhere. Custom endpoints answer with their
+                    // configured region.
+                    let bucket_region = |profile_id: String, bucket: String| {
+                        let core = core.clone();
+                        let fallback = region_of(&profile_id, &profiles);
+                        async move {
+                            with_profile(
+                                profile_id,
+                                buckets::get_bucket_region(bucket, core.profiles(), core.s3()),
+                            )
+                            .await
+                            .unwrap_or(fallback)
+                        }
+                    };
+                    let source_bucket = items.first().map(|item| item.bucket.clone());
+                    let source_region = match source_bucket {
+                        Some(bucket) => bucket_region(source_profile_id.clone(), bucket).await,
+                        None => region_of(&source_profile_id, &profiles),
+                    };
+                    let target_region =
+                        bucket_region(target.profile_id.clone(), target.bucket.clone()).await;
+                    let count = items.len();
+                    let copy_items = items
+                        .into_iter()
+                        .map(|item| CopyItem {
+                            profile_id: source_profile_id.clone(),
+                            bucket: item.bucket,
+                            region: source_region.clone(),
+                            key: item.key,
+                            is_folder: item.is_folder,
+                        })
+                        .collect();
+                    let queued = with_profile(
+                        target.profile_id.clone(),
+                        cross_copy::copy_between_profiles(
+                            copy_items,
+                            target.bucket.clone(),
+                            target_region,
+                            target.prefix.clone(),
+                            target.profile_id.clone(),
+                            core.profiles(),
+                            core.s3(),
+                            core.transfers(),
+                            core.app(),
+                        ),
+                    )
+                    .await;
+                    match queued {
+                        Ok(jobs) => outcome.queued += jobs,
+                        Err(error) => outcome.failures.push(format!("{count} items: {error}")),
+                    }
+                }
+            }
+            Ok(outcome)
+        })
+        .await
+    }
+
+    /// Deletes objects and whole folders from storage. Returns how many
+    /// objects were removed.
+    pub async fn delete(&self, deletion: Deletion) -> Result<usize, String> {
+        self.run(move |core| async move {
+            let Deletion {
+                profile_id,
+                bucket,
+                keys,
+                prefixes,
+                ..
+            } = deletion;
+            let mut removed = keys.len();
+            with_profile(profile_id.clone(), async {
+                if !keys.is_empty() {
+                    operations::delete_objects(
+                        bucket.clone(),
+                        None,
+                        keys,
+                        profile_id.clone(),
+                        core.profiles(),
+                        core.s3(),
+                    )
+                    .await?;
+                }
+                for prefix in prefixes {
+                    removed += operations::delete_prefix(
+                        bucket.clone(),
+                        None,
+                        prefix,
+                        profile_id.clone(),
+                        core.profiles(),
+                        core.s3(),
+                    )
+                    .await?;
+                }
+                Ok::<_, supas3_core::error::AppError>(removed)
+            })
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Every transfer the backend knows about, including those journaled in
+    /// an earlier run.
+    pub async fn transfers(&self) -> Result<Vec<TransferJob>, String> {
+        self.run(|core| async move {
+            transfer::list_transfers(core.transfers())
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    pub async fn cancel_transfer(&self, id: String) -> Result<bool, String> {
+        self.run(move |core| async move {
+            transfer::cancel_transfer(id, core.transfers())
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Queues a failed or cancelled transfer again. Returns the new
+    /// transfer's id, or `None` if it could not be retried.
+    pub async fn retry_transfer(&self, id: String) -> Result<Option<String>, String> {
+        self.run(move |core| async move {
+            transfer::retry_transfer(id, core.app(), core.profiles(), core.s3(), core.transfers())
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Cancels every listed transfer that is still waiting or running.
+    /// Returns how many were cancelled.
+    pub async fn cancel_transfers(&self, ids: Vec<String>) -> Result<usize, String> {
+        self.run(move |core| async move {
+            let mut cancelled = 0;
+            for id in ids {
+                let done = transfer::cancel_transfer(id, core.transfers())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                cancelled += usize::from(done);
+            }
+            Ok(cancelled)
+        })
+        .await
+    }
+
+    /// Removes the listed transfers from the backend's list. Used to clear
+    /// completed and cancelled transfers while keeping failed ones, which the
+    /// backend's own "clear completed" would remove too.
+    pub async fn remove_transfers(&self, ids: Vec<String>) -> Result<usize, String> {
+        self.run(move |core| async move {
+            let mut removed = 0;
+            for id in ids {
+                let done = transfer::remove_transfer(id, core.transfers())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                removed += usize::from(done);
+            }
+            Ok(removed)
+        })
+        .await
+    }
+
+    pub async fn remove_transfer(&self, id: String) -> Result<bool, String> {
+        self.run(move |core| async move {
+            transfer::remove_transfer(id, core.transfers())
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
     /// Loads one page of a location. `token` continues an earlier page;
     /// `fresh` bypasses the backend's listing cache.
     pub async fn list(
@@ -236,6 +545,27 @@ impl Requests {
                 })
                 .await
             }
+        }
+    }
+}
+
+/// What carrying out a copy plan did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Outcome {
+    /// Transfers queued; their progress arrives through events.
+    pub queued: usize,
+    /// Items the service copied before the request returned.
+    pub copied: usize,
+    /// Items that could not be started, each with the reason.
+    pub failures: Vec<String>,
+}
+
+impl Outcome {
+    fn record(&mut self, name: &str, result: Result<usize, String>, queued: bool) {
+        match result {
+            Ok(count) if queued => self.queued += count,
+            Ok(count) => self.copied += count,
+            Err(error) => self.failures.push(format!("{name}: {error}")),
         }
     }
 }
@@ -355,7 +685,7 @@ mod tests {
     #[test]
     fn a_backend_starts_answers_requests_shuts_down_and_can_be_reopened() {
         let dir = test_dir("backend");
-        let mut backend = Backend::start(dir.clone()).unwrap();
+        let mut backend = Backend::start(dir.clone(), ignore_events()).unwrap();
         let requests = backend.requests().unwrap();
 
         let profiles = futures_lite(requests.profiles());
@@ -375,7 +705,7 @@ mod tests {
 
         // The same directory can be opened again in this process, with its
         // stored data usable.
-        let reopened = Backend::start(dir.clone()).unwrap();
+        let reopened = Backend::start(dir.clone(), ignore_events()).unwrap();
         let again = reopened.requests().unwrap();
         assert_eq!(
             futures_lite(again.profiles()).map(|profiles| profiles.len()),
@@ -385,9 +715,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn ignore_events() -> supas3_core::host::EventSink {
+        std::sync::Arc::new(|_| {})
+    }
+
     /// Waits for a request from a plain thread, as the interface thread does.
     fn futures_lite<T>(future: impl std::future::Future<Output = T>) -> T {
         tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap()
             .block_on(future)
@@ -424,7 +759,7 @@ mod tests {
         let dir = test_dir("request");
         let data = test_dir("request-data");
         std::fs::write(data.join("file.txt"), b"x").unwrap();
-        let backend = Backend::start(dir.clone()).unwrap();
+        let backend = Backend::start(dir.clone(), ignore_events()).unwrap();
         let requests = backend.requests().unwrap();
 
         let page = futures_lite(requests.list(Location::Local(data.clone()), None, false)).unwrap();
@@ -467,7 +802,7 @@ mod tests {
             }
         };
         let dir = test_dir("pair");
-        let backend = Backend::start(dir.clone()).unwrap();
+        let backend = Backend::start(dir.clone(), ignore_events()).unwrap();
         let requests = backend.requests().unwrap();
 
         let outcome = futures_lite(async {
@@ -535,6 +870,221 @@ mod tests {
                 "pane {pane} rows are complete and in order"
             );
         }
+    }
+
+    /// Runs every kind of copy plan and a deletion against real storage, the
+    /// way the panes do: upload a file and a folder, download them back, copy
+    /// within one connection, copy across two, then delete everything.
+    ///
+    /// Uses the same SUPAS3_PANE{1,2}_* variables as the paging test.
+    #[test]
+    #[ignore]
+    fn copy_plans_and_deletion_work_end_to_end_on_real_storage() {
+        use crate::connection::{Draft, Service};
+        use crate::listing::{Entry, EntryKind};
+        use crate::tasks::{EventQueue, Tasks};
+        use crate::transfer_plan::{plan, plan_deletion};
+        let var =
+            |name: String| std::env::var(&name).unwrap_or_else(|_| panic!("{name} is required"));
+        let draft = |pane: u8| {
+            let key = |field: &str| var(format!("SUPAS3_PANE{pane}_{field}"));
+            let service = match key("SERVICE").as_str() {
+                "oss" => Service::Oss,
+                "cos" => Service::Cos,
+                "obs" => Service::Obs,
+                _ => Service::Generic,
+            };
+            Draft {
+                name: format!("pane {pane}"),
+                region: key("REGION"),
+                endpoint: key("ENDPOINT"),
+                access_key: key("ACCESS_KEY"),
+                secret_key: key("SECRET_KEY"),
+                bucket: key("BUCKET"),
+                ..Draft::new(service)
+            }
+        };
+        let config = test_dir("plans");
+        let work = test_dir("plans-data");
+        std::fs::create_dir_all(work.join("in/sub")).unwrap();
+        std::fs::write(work.join("in/a.txt"), b"alpha").unwrap();
+        std::fs::write(work.join("in/sub/b.txt"), b"beta").unwrap();
+        std::fs::create_dir_all(work.join("out")).unwrap();
+
+        let queue = std::sync::Arc::new(EventQueue::default());
+        let backend = Backend::start(config.clone(), queue.sink()).unwrap();
+        let requests = backend.requests().unwrap();
+        let run = format!("supas3-ui-test/{}/", std::process::id());
+
+        let report = futures_lite(async {
+            let mut steps: Vec<(&str, Result<(), String>)> = Vec::new();
+            let (first, second) = (draft(1), draft(2));
+            let one = requests
+                .save_profile(first.to_profile(None), false)
+                .await
+                .unwrap();
+            let two = requests
+                .save_profile(second.to_profile(None), false)
+                .await
+                .unwrap();
+            let here = Location::objects(&one.id, &first.bucket, &run);
+            let there = Location::objects(&two.id, &second.bucket, &run);
+            let local_in = Location::Local(work.join("in"));
+            let local_out = Location::Local(work.join("out"));
+
+            // Waits until no transfer is waiting or running, then reports failures.
+            let settle = || async {
+                let mut tasks = Tasks::default();
+                for _ in 0..600 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    tasks.merge_snapshot(&requests.transfers().await?);
+                    if tasks.counts().active == 0 {
+                        let failed: Vec<String> = tasks
+                            .list(crate::tasks::TaskFilter::Failed)
+                            .iter()
+                            .map(|task| format!("{}: {:?}", task.name, task.state))
+                            .collect();
+                        return if failed.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(failed.join("; "))
+                        };
+                    }
+                }
+                Err("transfers did not finish within two minutes".to_string())
+            };
+            let names = |location: Location| async {
+                let page = requests.list(location, None, true).await?;
+                let mut names: Vec<String> =
+                    page.entries.into_iter().map(|entry| entry.name).collect();
+                names.sort();
+                Ok::<_, String>(names)
+            };
+            let expect = |found: Result<Vec<String>, String>, wanted: &[&str]| match found {
+                Ok(found) if found == wanted => Ok(()),
+                Ok(found) => Err(format!("found {found:?}, wanted {wanted:?}")),
+                Err(error) => Err(error),
+            };
+            let local_rows = |location: Location| async {
+                requests
+                    .list(location, None, true)
+                    .await
+                    .map(|page| page.entries)
+            };
+
+            // 1. Upload a file and a folder.
+            let selection = local_rows(local_in.clone()).await.unwrap();
+            let uploaded = requests
+                .execute(plan(&local_in, &selection, &here).unwrap())
+                .await;
+            steps.push(("queue upload", uploaded.clone().map(|_| ())));
+            steps.push(("upload finishes", settle().await));
+            steps.push((
+                "uploaded listing",
+                expect(names(here.clone()).await, &["a.txt", "sub"]),
+            ));
+            steps.push((
+                "uploaded folder listing",
+                expect(names(here.child("sub")).await, &["b.txt"]),
+            ));
+
+            // 2. Download both back.
+            let remote_rows = requests
+                .list(here.clone(), None, true)
+                .await
+                .unwrap()
+                .entries;
+            let downloaded = requests
+                .execute(plan(&here, &remote_rows, &local_out).unwrap())
+                .await;
+            steps.push(("queue download", downloaded.map(|_| ())));
+            steps.push(("download finishes", settle().await));
+            let read = |path: &str| std::fs::read(work.join(path)).map_err(|e| e.to_string());
+            steps.push((
+                "downloaded contents",
+                match (read("out/a.txt"), read("out/sub/b.txt")) {
+                    (Ok(a), Ok(b)) if a == b"alpha" && b == b"beta" => Ok(()),
+                    other => Err(format!("{other:?}")),
+                },
+            ));
+
+            // 3. Copy within the connection, into a new folder.
+            let file_only: Vec<Entry> = remote_rows
+                .iter()
+                .filter(|entry| entry.kind == EntryKind::File)
+                .cloned()
+                .collect();
+            let copied = requests
+                .execute(plan(&here, &file_only, &here.child("copy")).unwrap())
+                .await;
+            steps.push((
+                "copy within",
+                match copied {
+                    Ok(outcome) if outcome.copied == 1 && outcome.failures.is_empty() => Ok(()),
+                    other => Err(format!("{other:?}")),
+                },
+            ));
+            steps.push((
+                "copied listing",
+                expect(names(here.child("copy")).await, &["a.txt"]),
+            ));
+
+            // 4. Copy across connections, through this computer.
+            let across = requests
+                .execute(plan(&here, &file_only, &there).unwrap())
+                .await;
+            steps.push((
+                "queue copy across",
+                match across {
+                    Ok(outcome) if outcome.queued == 1 && outcome.failures.is_empty() => Ok(()),
+                    other => Err(format!("{other:?}")),
+                },
+            ));
+            steps.push(("copy across finishes", settle().await));
+            steps.push((
+                "copied-across listing",
+                expect(names(there.clone()).await, &["a.txt"]),
+            ));
+
+            // 5. Delete everything this run created, as folders from their parents.
+            for (label, location) in [("delete on first", &here), ("delete on second", &there)] {
+                let parent = location.parent().unwrap();
+                let rows = requests
+                    .list(parent.clone(), None, true)
+                    .await
+                    .unwrap_or_default()
+                    .entries;
+                let own: Vec<Entry> = rows
+                    .into_iter()
+                    .filter(|entry| entry.prefix.as_deref() == Some(run.as_str()))
+                    .collect();
+                let deleted = match plan_deletion(&parent, &own) {
+                    Ok(deletion) => requests.delete(deletion).await.map(|_| ()),
+                    Err(refusal) => Err(format!("{refusal:?}")),
+                };
+                steps.push((label, deleted));
+                steps.push((
+                    "deleted listing is empty",
+                    expect(names(location.clone()).await, &[]),
+                ));
+            }
+            for id in [one.id, two.id] {
+                let _ = requests.delete_profile(id).await;
+            }
+            steps
+        });
+        drop(backend);
+        let _ = std::fs::remove_dir_all(config);
+        let _ = std::fs::remove_dir_all(work);
+
+        for (step, result) in &report {
+            println!("{step}: {}", if result.is_ok() { "ok" } else { "FAILED" });
+        }
+        let failed: Vec<_> = report
+            .iter()
+            .filter(|(_, result)| result.is_err())
+            .collect();
+        assert!(failed.is_empty(), "{failed:#?}");
     }
 
     #[test]
