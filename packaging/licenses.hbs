@@ -1,0 +1,26 @@
+supaS3 third-party licenses
+===========================
+
+supaS3 itself is licensed under AGPL-3.0-or-later; see LICENSE.
+Its storage backend is derived from Brows3 (MIT); see LICENSES/Brows3-MIT.txt.
+The interface icons are Lucide icons (ISC, some MIT); see LICENSES/Lucide-ISC.txt.
+
+The binary also contains the libraries below, each under its own license.
+
+Overview
+--------
+{{#each overview}}
+{{{name}}} ({{count}})
+{{/each}}
+
+{{#each licenses}}
+================================================================================
+{{{name}}}
+Used by:
+{{#each used_by}}
+  {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}} — {{{crate.repository}}}{{/if}}
+{{/each}}
+--------------------------------------------------------------------------------
+{{{text}}}
+
+{{/each}}

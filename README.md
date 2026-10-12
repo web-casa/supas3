@@ -1,21 +1,59 @@
 # supaS3
 
-A native multi-cloud object storage transfer workbench, built with Rust and GPUI.
+A native desktop application for browsing object storage and moving files between this computer and storage, or from one storage service to another. Built with Rust and [GPUI Kit](https://github.com/longbridge/gpui-kit).
 
-面向多云对象存储的原生文件传输工作台，使用 Rust 与 GPUI 构建。
+[简体中文](README.zh-CN.md)
 
-> **Status:** early development. There is no usable release yet.
->
-> **状态：** 早期开发阶段，尚无可用版本。
+> **Status:** first public version, 0.1.0. It has been tested against real buckets on the services listed below, but it is new software: keep a copy of anything you cannot afford to lose.
 
-## Goals
+## What it does
 
-- **Platforms:** macOS (Apple Silicon), Windows (x64, ARM64), Linux (x64, ARM64)
-- **Storage:** Amazon S3 and S3-compatible services, Alibaba Cloud OSS, Tencent Cloud COS, Huawei Cloud OBS
-- **Languages:** English, 简体中文
-- Dual-pane workspace with independent tabs, a transfer queue, cross-cloud copy, lightweight preview and small-file editing
+- Two panes side by side, each with its own tabs. Either pane shows a folder on this computer or a location in any connection.
+- Upload, download, copy within a connection, and copy between two connections. A copy between connections passes through this computer and says so before it starts.
+- A transfer list with progress, cancel and retry.
+- Delete files and folders, after a confirmation.
+- Open text files to read or edit them, and view PNG, JPEG and simple WebP images.
+- Make a signed link to an object that expires after an hour, a day or a week.
+- Show an object's version history and restore an older version, on buckets with versioning turned on.
+- Sync a folder on this computer to storage: compare first, see what would be uploaded, then start. Nothing in storage is deleted.
+- English and 简体中文, light and dark appearance.
 
-## Building
+An upload or a copy refuses to replace an object that already exists. Saving an edited file and syncing a changed file are the two places that replace an object on purpose, and both first check that it has not changed since it was read. On some services and operations these checks are a separate request made just before the write, so a change made by someone else in between is not noticed; the editor says so when that applies to the connection.
+
+## Storage services
+
+| Service | State |
+|---|---|
+| Alibaba Cloud OSS | Tested against a real bucket |
+| Tencent Cloud COS | Tested against a real bucket |
+| Cloudflare R2 (as a generic S3-compatible service) | Tested against a real bucket |
+| IDrive e2 (as a generic S3-compatible service) | Browsing, upload, download and delete tested. Copying, saving an edited file and replacing a file during sync fail on buckets that report object owners without an ID |
+| Huawei Cloud OBS | Implemented from Huawei's documentation, not tested |
+| Amazon S3 | Not tested against a real bucket in this version |
+
+The domestic cloud services are used through their S3-compatible interface. Version history has been tested only on buckets without versioning; restoring a version follows the services' documentation and is untested.
+
+## Install
+
+Download the file for your computer from the [releases page](https://github.com/web-casa/supas3/releases). `SHA256SUMS.txt` lists the checksum of each file.
+
+| Computer | File |
+|---|---|
+| macOS, Apple Silicon | `supas3-<version>-macos-arm64.dmg` |
+| Windows, x64 | `supas3-<version>-windows-x64-setup.exe`, or the `.zip` to run without installing |
+| Windows, ARM64 | `supas3-<version>-windows-arm64-setup.exe`, or the `.zip` |
+| Linux, x64 | `supas3_<version>_amd64.deb`, or the `.tar.gz` |
+| Linux, ARM64 | `supas3_<version>_arm64.deb`, or the `.tar.gz` |
+
+The packages are not signed with a developer certificate.
+
+- **macOS:** open the disk image and drag supaS3 to Applications. The first time, macOS refuses to open it; open *System Settings → Privacy & Security* and choose *Open Anyway*, or run `xattr -dr com.apple.quarantine /Applications/supaS3.app`.
+- **Windows:** SmartScreen may warn about an unrecognized app; choose *More info → Run anyway*. The installer installs for the current user and needs no administrator rights.
+- **Linux:** `sudo apt install ./supas3_<version>_<arch>.deb`. The application needs a working Vulkan driver; on machines without a GPU, `mesa-vulkan-drivers` provides one.
+
+Access keys are kept in the system's credential store (Keychain, Credential Manager, or the Secret Service on Linux). Where none is available, a key is kept only until the application closes.
+
+## Build from source
 
 Requires the Rust toolchain named in `rust-toolchain.toml`; `rustup` installs it automatically.
 
@@ -28,21 +66,24 @@ On Debian or Ubuntu, install the system libraries first:
 
 ```sh
 sudo apt-get install gcc g++ clang pkg-config libfontconfig-dev libwayland-dev \
-  libxkbcommon-x11-dev libx11-xcb-dev libvulkan1
+  libxkbcommon-x11-dev libx11-xcb-dev libdbus-1-dev libvulkan1
 ```
+
+The scripts under `packaging/` turn a release binary into the packages above; `.github/workflows/ci.yml` shows how they are called.
 
 ## Layout
 
 | Path | Contents |
 |---|---|
-| `crates/supas3-app` | The desktop application (GPUI Kit). The binary is named `supas3`. |
+| `crates/supas3-app` | The desktop application. The binary is named `supas3`. |
 | `crates/supas3-core` | Storage and transfer backend, with no UI dependency. |
 | `crates/supas3-probe` | A command-line tool that checks how an S3-compatible service answers the calls supaS3 relies on. |
+| `packaging/` | Icons and the scripts that build the packages for each platform. |
 
 ## Acknowledgements
 
-The storage and transfer backend is derived from [Brows3](https://github.com/rgcsekaraa/brows3), which is MIT licensed. Its license notice is kept in [LICENSES/Brows3-MIT.txt](LICENSES/Brows3-MIT.txt).
+The storage and transfer backend is derived from [Brows3](https://github.com/rgcsekaraa/brows3), which is MIT licensed. Its license notice is kept in [LICENSES/Brows3-MIT.txt](LICENSES/Brows3-MIT.txt), and [UPSTREAM.md](UPSTREAM.md) records what was taken and changed. The interface icons are [Lucide](https://lucide.dev) icons. Other libraries are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md); every package carries the full text of their licenses in `THIRD_PARTY_LICENSES.txt`.
 
 ## License
 
-supaS3 is licensed under [AGPL-3.0-or-later](LICENSE).
+supaS3 is free software, licensed under [AGPL-3.0-or-later](LICENSE).

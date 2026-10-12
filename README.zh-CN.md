@@ -1,0 +1,89 @@
+# supaS3
+
+一款原生桌面应用，用来浏览对象存储，并在本机与存储之间、或两个存储服务之间传输文件。使用 Rust 与 [GPUI Kit](https://github.com/longbridge/gpui-kit) 构建。
+
+[English](README.md)
+
+> **状态：** 首个公开版本 0.1.0。已在下表所列服务的真实存储桶上测试，但它仍是新软件：不能丢失的数据请另留副本。
+
+## 功能
+
+- 左右两个面板，各有独立的标签页。任一面板都可以显示本机文件夹或任一连接中的位置。
+- 上传、下载、在同一连接内复制、在两个连接之间复制。跨连接复制会经本机中转，开始前会说明。
+- 传输列表，显示进度，可取消与重试。
+- 删除文件与文件夹，执行前需确认。
+- 打开文本文件查看或编辑；查看 PNG、JPEG 与简单格式的 WebP 图片。
+- 为对象生成签名链接，有效期 1 小时、1 天或 7 天。
+- 查看对象的版本历史；在已开启版本控制的存储桶上可恢复旧版本。
+- 把本机文件夹同步到存储：先比较，列出将上传的内容，再开始。不会删除存储中的任何对象。
+- 简体中文与英文界面，浅色与深色外观。
+
+上传与复制会拒绝替换已存在的对象。只有保存编辑过的文件、同步有变化的文件这两处会有意替换对象，二者都会先确认对象自读取以来没有被改动。在部分服务和操作上，这些检查是写入前单独发出的一次请求，其间他人所做的改动无法察觉；连接属于这种情况时，编辑器会给出提示。
+
+## 存储服务
+
+| 服务 | 状态 |
+|---|---|
+| 阿里云 OSS | 已在真实存储桶上测试 |
+| 腾讯云 COS | 已在真实存储桶上测试 |
+| Cloudflare R2（作为通用 S3 兼容服务） | 已在真实存储桶上测试 |
+| IDrive e2（作为通用 S3 兼容服务） | 浏览、上传、下载、删除已测试。若存储桶返回的对象所有者没有 ID，则复制、保存编辑、同步时替换文件会失败 |
+| 华为云 OBS | 按华为云文档实现，未经测试 |
+| Amazon S3 | 本版本未在真实存储桶上测试 |
+
+国内云服务均通过其 S3 兼容接口访问。版本历史只在未开启版本控制的存储桶上测试过；恢复版本按各服务的文档实现，未经测试。
+
+## 安装
+
+在[发布页面](https://github.com/web-casa/supas3/releases)下载与你的电脑对应的文件。`SHA256SUMS.txt` 列出了每个文件的校验和。
+
+| 电脑 | 文件 |
+|---|---|
+| macOS，Apple 芯片 | `supas3-<版本>-macos-arm64.dmg` |
+| Windows，x64 | `supas3-<版本>-windows-x64-setup.exe`，或免安装的 `.zip` |
+| Windows，ARM64 | `supas3-<版本>-windows-arm64-setup.exe`，或 `.zip` |
+| Linux，x64 | `supas3_<版本>_amd64.deb`，或 `.tar.gz` |
+| Linux，ARM64 | `supas3_<版本>_arm64.deb`，或 `.tar.gz` |
+
+安装包没有使用开发者证书签名。
+
+- **macOS：** 打开磁盘映像，把 supaS3 拖到“应用程序”。首次打开会被系统阻止；请在“系统设置 → 隐私与安全性”中选择“仍要打开”，或运行 `xattr -dr com.apple.quarantine /Applications/supaS3.app`。
+- **Windows：** SmartScreen 可能提示无法识别的应用；选择“更多信息 → 仍要运行”。安装程序只为当前用户安装，不需要管理员权限。
+- **Linux：** `sudo apt install ./supas3_<版本>_<架构>.deb`。应用需要可用的 Vulkan 驱动；没有显卡的机器可以安装 `mesa-vulkan-drivers`。
+
+访问密钥保存在系统的凭据存储中（钥匙串、凭据管理器，或 Linux 上的 Secret Service）。没有可用的凭据存储时，密钥只保留到应用关闭。
+
+## 从源码构建
+
+需要 `rust-toolchain.toml` 指定的 Rust 工具链，`rustup` 会自动安装。
+
+```sh
+cargo run -p supas3-app        # 启动应用
+cargo test --workspace        # 运行测试
+```
+
+在 Debian 或 Ubuntu 上，先安装系统库：
+
+```sh
+sudo apt-get install gcc g++ clang pkg-config libfontconfig-dev libwayland-dev \
+  libxkbcommon-x11-dev libx11-xcb-dev libdbus-1-dev libvulkan1
+```
+
+`packaging/` 下的脚本把发布版二进制制作成上述安装包，调用方式见 `.github/workflows/ci.yml`。
+
+## 目录
+
+| 路径 | 内容 |
+|---|---|
+| `crates/supas3-app` | 桌面应用，二进制名为 `supas3`。 |
+| `crates/supas3-core` | 存储与传输后端，不依赖界面。 |
+| `crates/supas3-probe` | 命令行工具，检查某个 S3 兼容服务对 supaS3 所依赖调用的响应。 |
+| `packaging/` | 图标与各平台的打包脚本。 |
+
+## 致谢
+
+存储与传输后端源自 [Brows3](https://github.com/rgcsekaraa/brows3)（MIT 许可证）。其许可声明保留在 [LICENSES/Brows3-MIT.txt](LICENSES/Brows3-MIT.txt)，[UPSTREAM.md](UPSTREAM.md) 记录了取用与改动的内容。界面图标来自 [Lucide](https://lucide.dev)。其他程序库见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)；每个安装包都在 `THIRD_PARTY_LICENSES.txt` 中附有它们的许可证全文。
+
+## 许可
+
+supaS3 是自由软件，以 [AGPL-3.0-or-later](LICENSE) 许可发布。

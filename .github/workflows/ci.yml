@@ -3,6 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
+    # A version tag builds the same packages and drafts a release from them.
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -18,8 +20,42 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Collects the license of every library linked into the binaries. It fails
+  # when a dependency carries a license that about.toml does not accept.
+  licenses:
+    name: Third-party licenses
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: licenses
+          cache-bin: true
+
+      - name: Install cargo-about
+        run: command -v cargo-about || cargo install --locked cargo-about@0.9.0
+
+      - name: Generate the license list
+        run: |
+          cargo about generate --locked -m crates/supas3-app/Cargo.toml \
+            packaging/licenses.hbs > THIRD_PARTY_LICENSES.txt
+          test "$(wc -c < THIRD_PARTY_LICENSES.txt)" -gt 100000
+          head -30 THIRD_PARTY_LICENSES.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: third-party-licenses
+          path: THIRD_PARTY_LICENSES.txt
+          if-no-files-found: error
+          retention-days: 14
+
   build:
     name: ${{ matrix.name }}
+    needs: licenses
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
@@ -149,9 +185,90 @@ jobs:
           if ($process.HasExited) { throw "the app exited within 15s with code $($process.ExitCode)" }
           Stop-Process -Id $process.Id -Force
 
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: third-party-licenses
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          packaging/linux/package.sh target/release/supas3 THIRD_PARTY_LICENSES.txt dist
+          # The package must install with its declared dependencies and put
+          # the program on the path.
+          sudo apt-get install -y --no-install-recommends ./dist/*.deb
+          test -x /usr/bin/supas3
+          test -f /usr/share/doc/supas3/THIRD_PARTY_LICENSES.txt
+          grep -q 'Lucide Icons and Contributors' /usr/share/doc/supas3/LICENSES/Lucide-ISC.txt
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: packaging/macos/package.sh target/release/supas3 THIRD_PARTY_LICENSES.txt dist
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $known = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Get-Command ISCC.exe -ErrorAction SilentlyContinue) -and -not (Test-Path $known)) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw "could not install Inno Setup" }
+          }
+          $arch = if ('${{ matrix.target }}' -like 'aarch64-*') { 'arm64' } else { 'x64' }
+          packaging/windows/package.ps1 -Binary target/release/supas3.exe `
+            -Licenses THIRD_PARTY_LICENSES.txt -Arch $arch -Out dist
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: supas3-${{ matrix.target }}
-          path: target/release/${{ matrix.binary }}
+          path: dist/*
           if-no-files-found: error
           retention-days: 14
+
+  # On a version tag: gathers the packages of all five platforms into a draft
+  # release. A person reviews the draft and publishes it.
+  release:
+    name: Draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: supas3-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check the tag against the version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/supas3-app/Cargo.toml | head -1)
+          test "$TAG" = "v$version" || { echo "tag $TAG does not match version $version" >&2; exit 1; }
+
+      - name: Write checksums and notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          test "$(ls dist | wc -l)" -eq 9
+          (cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          # The section of CHANGELOG.md for this version.
+          awk -v heading="## ${TAG#v}" '
+            $0 == heading { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --draft --verify-tag --title "supaS3 ${TAG#v}" --notes-file notes.md dist/*

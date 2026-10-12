@@ -21,6 +21,7 @@ use crate::tasks::EventQueue;
 use crate::transfer_plan::{plan, plan_deletion, plan_drop, Deletion, Plan};
 use crate::versions_view::VersionsView;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::link::Link;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
@@ -640,6 +641,69 @@ impl Workspace {
         });
     }
 
+    /// Says what this application is, which version, and under what terms.
+    fn show_about(window: &mut Window, cx: &mut App) {
+        const SOURCE: &str = env!("CARGO_PKG_REPOSITORY");
+        const UPSTREAM: &str = "https://github.com/rgcsekaraa/brows3";
+        const LICENSE_TEXT: &str = "https://www.gnu.org/licenses/agpl-3.0.html";
+        let width = rems(30.).to_pixels(window.rem_size());
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            dialog
+                .title(t!("about.title").into_owned())
+                .width(width)
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .text_sm()
+                        .child(
+                            t!("about.version", version = env!("CARGO_PKG_VERSION")).into_owned(),
+                        )
+                        .child(
+                            div()
+                                .text_color(muted)
+                                .child(t!("app.tagline").into_owned()),
+                        )
+                        .child(t!("about.copyright").into_owned())
+                        .child(t!("about.license").into_owned())
+                        .child(
+                            h_flex()
+                                .gap_4()
+                                .child(
+                                    Link::new("about-license")
+                                        .href(LICENSE_TEXT)
+                                        .child(t!("about.license_text").into_owned()),
+                                )
+                                .child(
+                                    Link::new("about-source")
+                                        .href(SOURCE)
+                                        .child(t!("about.source").into_owned()),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(t!("about.upstream").into_owned())
+                                .child(Link::new("about-upstream").href(UPSTREAM).child(UPSTREAM)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(t!("about.notices").into_owned()),
+                        ),
+                )
+                .footer(
+                    h_flex().justify_end().child(
+                        Button::new("close-about")
+                            .outline()
+                            .label(t!("action.close").into_owned())
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+                )
+        });
+    }
+
     fn open_in_active(&mut self, location: Location, cx: &mut Context<Self>) {
         self.pane(self.active)
             .clone()
@@ -975,6 +1039,11 @@ impl Workspace {
                                             .on_click(pick(&workspace, |s| {
                                                 s.appearance = Appearance::Dark
                                             })),
+                                    )
+                                    .separator()
+                                    .item(
+                                        PopupMenuItem::new(t!("about.menu").into_owned())
+                                            .on_click(|_, window, cx| Self::show_about(window, cx)),
                                     )
                             }),
                     ),

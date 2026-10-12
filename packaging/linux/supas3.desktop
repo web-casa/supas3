@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=supaS3
+GenericName=Object Storage Transfer
+GenericName[zh_CN]=对象存储传输
+Comment=Browse and transfer files across S3-compatible object storage
+Comment[zh_CN]=浏览多云对象存储并在其间传输文件
+Exec=supas3
+Icon=supas3
+Terminal=false
+Categories=Network;FileTransfer;Utility;
+Keywords=s3;oss;cos;obs;storage;bucket;
+StartupWMClass=supas3

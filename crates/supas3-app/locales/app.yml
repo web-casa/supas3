@@ -658,3 +658,30 @@ view.image_form_unsupported:
 sync.nothing_with_options:
   en: Nothing to upload with this option. Files already in storage were not compared and may differ.
   zh-CN: 按当前选项没有需要上传的文件。存储中已存在的文件未做比较，内容可能不同。
+about.menu:
+  en: About supaS3
+  zh-CN: 关于 supaS3
+about.title:
+  en: About supaS3
+  zh-CN: 关于 supaS3
+about.version:
+  en: "Version %{version}"
+  zh-CN: "版本 %{version}"
+about.copyright:
+  en: Copyright © 2026 supaS3 contributors.
+  zh-CN: 版权所有 © 2026 supaS3 贡献者。
+about.license:
+  en: supaS3 is free software. You may redistribute it and change it under the terms of the GNU Affero General Public License, version 3 or (at your option) any later version. It comes with ABSOLUTELY NO WARRANTY, to the extent permitted by law.
+  zh-CN: supaS3 是自由软件。你可以依据 GNU Affero 通用公共许可证第 3 版或（由你选择）任何更高版本的条款再分发和修改它。在法律允许的范围内，本软件不提供任何担保。
+about.license_text:
+  en: Read the license
+  zh-CN: 阅读许可证全文
+about.source:
+  en: Source code
+  zh-CN: 源代码
+about.upstream:
+  en: The storage and transfer backend is derived from Brows3 (MIT License)
+  zh-CN: 存储与传输后端源自 Brows3（MIT 许可证）
+about.notices:
+  en: The LICENSE, LICENSES and THIRD_PARTY_LICENSES.txt files that come with this application hold the full text of this license and of the licenses of the libraries and icons included.
+  zh-CN: 随本应用提供的 LICENSE、LICENSES 与 THIRD_PARTY_LICENSES.txt 文件包含本许可证以及所含程序库与图标的许可证全文。

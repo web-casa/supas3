@@ -70,6 +70,9 @@ fn main() {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1200.), px(760.)), cx)),
                 window_min_size: Some(size(px(860.), px(520.))),
+                // Matches the installed desktop entry, so the running window
+                // is shown under the application's own icon and launcher.
+                app_id: Some("supas3".into()),
                 titlebar: Some(TitlebarOptions {
                     title: Some("supaS3".into()),
                     ..Default::default()

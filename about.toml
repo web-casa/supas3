@@ -1,0 +1,35 @@
+# Licenses accepted for anything linked into a supaS3 binary. `cargo about`
+# fails when a dependency carries a license that is not listed, so a new
+# dependency with different terms is noticed before a release is built.
+accepted = [
+    # supaS3's own crates.
+    "AGPL-3.0-or-later",
+    # Permissive.
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "bzip2-1.0.6",
+    "CC0-1.0",
+    "Unicode-3.0",
+    # Data: the root certificates bundled by webpki-roots.
+    "CDLA-Permissive-2.0",
+    # File-level copyleft. The crates are used unmodified and their source is
+    # published on crates.io, which is what the license asks for.
+    "MPL-2.0",
+]
+# The five platforms releases are built for; dependencies of other platforms
+# are not part of any binary.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
