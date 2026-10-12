@@ -135,9 +135,9 @@ pub async fn queue_upload(
     // Basic validation
     let path = PathBuf::from(&local_path);
     validate_path(&path)?;
-    let profile_id = require_active_profile(profile_state.inner(), &expected_profile_id)
-        .await?
-        .id;
+    let profile = require_active_profile(profile_state.inner(), &expected_profile_id).await?;
+    let profile_identity = profile.cache_identity();
+    let profile_id = profile.id;
 
     // Fallback for 0 bytes: try to get size from filesystem
     let mut actual_size = total_bytes;
@@ -155,7 +155,8 @@ pub async fn queue_upload(
         key,
         path,
         actual_size,
-    );
+    )
+    .pinned_to(profile_identity.clone());
 
     let job_id = job.id.clone();
 
@@ -191,9 +192,9 @@ pub async fn queue_download(
 ) -> Result<String> {
     let path = PathBuf::from(&local_path);
     validate_path(&path)?;
-    let profile_id = require_active_profile(profile_state.inner(), &expected_profile_id)
-        .await?
-        .id;
+    let profile = require_active_profile(profile_state.inner(), &expected_profile_id).await?;
+    let profile_identity = profile.cache_identity();
+    let profile_id = profile.id;
 
     let destination = DownloadDestination::from_path(&path, overwrite.unwrap_or(false))?;
     let mut job = TransferJob::new(
@@ -204,7 +205,8 @@ pub async fn queue_download(
         key,
         path,
         total_bytes,
-    );
+    )
+    .pinned_to(profile_identity.clone());
 
     job.download_destination = Some(Arc::new(destination));
     let job_id = job.id.clone();
@@ -303,9 +305,9 @@ pub async fn queue_folder_upload(
 ) -> Result<u32> {
     let root = PathBuf::from(&local_path);
     validate_path(&root)?;
-    let profile_id = require_active_profile(profile_state.inner(), &expected_profile_id)
-        .await?
-        .id;
+    let profile = require_active_profile(profile_state.inner(), &expected_profile_id).await?;
+    let profile_identity = profile.cache_identity();
+    let profile_id = profile.id;
     let upload_prefix = prefix.clone();
     let jobs_data = crate::host::async_runtime::spawn_blocking(move || {
         collect_upload_files(&root, &upload_prefix)
@@ -331,6 +333,7 @@ pub async fn queue_folder_upload(
             path,
             size,
         )
+        .pinned_to(profile_identity.clone())
         .with_group(group_id.clone(), group_name.clone());
 
         queued.push(job);
@@ -366,6 +369,7 @@ pub async fn queue_folder_download(
 
     // 1. List all objects in the prefix
     let profile = require_active_profile(profile_state.inner(), &expected_profile_id).await?;
+    let profile_identity = profile.cache_identity();
 
     let objects = {
         let resolved_region = {
@@ -475,6 +479,7 @@ pub async fn queue_folder_download(
             file_path,
             size,
         )
+        .pinned_to(profile_identity.clone())
         .with_group(group_id.clone(), group_name.clone());
         job.download_destination = Some(Arc::new(destination));
 

@@ -179,6 +179,16 @@ pub async fn get_bucket_region(
         .await
         .map_err(|e| e.to_string())?
         .clone();
+    // An endpoint set through the environment or shared configuration is a
+    // custom endpoint too: its configured region is the answer.
+    if crate::s3::guard::Protection::of(&client) != crate::s3::guard::Protection::Native {
+        let region = active_profile
+            .region
+            .clone()
+            .unwrap_or_else(|| "us-east-1".to_string());
+        s3_manager.set_bucket_region(&active_profile, &bucket_name, region.clone());
+        return Ok(region);
+    }
     drop(s3_manager);
 
     // Get region

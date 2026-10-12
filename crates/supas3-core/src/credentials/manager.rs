@@ -33,12 +33,20 @@ pub enum CredentialType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
+    /// Compatibility settings for custom endpoints; ignored for AWS profiles.
+    #[serde(default)]
+    pub compat: super::Compatibility,
     #[serde(default)]
     pub public_urls: crate::transfer::public_url::PublicUrls,
     #[serde(default)]
     pub id: String,
     #[serde(default)]
     pub secret_ref: Option<String>,
+    /// Session token of temporary credentials. Like the secret key it is kept
+    /// in the secret store, never in the profile file, and is not refreshed:
+    /// when it expires the user enters new credentials.
+    #[serde(default, skip_serializing)]
+    pub session_token: Option<String>,
     pub name: String,
     pub credential_type: CredentialType,
     pub region: Option<String>,
@@ -63,10 +71,12 @@ impl Profile {
     pub fn new(name: String, credential_type: CredentialType, region: Option<String>) -> Self {
         let now = chrono::Utc::now();
         Self {
+            compat: Default::default(),
             public_urls: Default::default(),
             id: Uuid::new_v4().to_string(),
             name,
             secret_ref: None,
+            session_token: None,
             credential_type,
             region,
             is_default: false,
@@ -74,6 +84,42 @@ impl Profile {
             updated_at: Some(now),
         }
     }
+}
+
+const PACKED_SECRET_MARKER: &str = "supas3_credentials";
+
+/// Stores the secret key together with a session token as one keychain value.
+/// A secret without a token is stored as it always was, so existing entries
+/// keep working.
+fn pack_secret(secret_access_key: &str, session_token: Option<&str>) -> String {
+    match session_token.filter(|token| !token.is_empty()) {
+        None => secret_access_key.to_string(),
+        Some(token) => serde_json::json!({
+            PACKED_SECRET_MARKER: 1,
+            "secret_access_key": secret_access_key,
+            "session_token": token,
+        })
+        .to_string(),
+    }
+}
+
+/// Reads a stored value back. Only the exact shape [`pack_secret`] writes is
+/// treated as packed; anything else, including a secret that merely looks like
+/// JSON, is the secret itself.
+fn unpack_secret(stored: &str) -> (String, Option<String>) {
+    let packed = serde_json::from_str::<serde_json::Value>(stored)
+        .ok()
+        .and_then(|value| {
+            let fields = value.as_object()?;
+            let secret = fields.get("secret_access_key")?.as_str()?;
+            let token = fields.get("session_token")?.as_str()?;
+            let well_formed = fields.len() == 3
+                && fields.get(PACKED_SECRET_MARKER)?.as_u64() == Some(1)
+                && !secret.is_empty()
+                && !token.is_empty();
+            well_formed.then(|| (secret.to_string(), Some(token.to_string())))
+        });
+    packed.unwrap_or_else(|| (stored.to_string(), None))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -324,6 +370,18 @@ impl ProfileManager {
         profile.is_default = self.data.active_profile_id.as_deref() == Some(id);
         profile.updated_at = Some(chrono::Utc::now());
 
+        // An edit that omits the secret keeps the stored credentials whole,
+        // session token included.
+        let secret_omitted = matches!(
+            &profile.credential_type,
+            CredentialType::Manual { secret_access_key, .. }
+                | CredentialType::CustomEndpoint { secret_access_key, .. }
+                if secret_access_key.is_empty()
+        );
+        if secret_omitted && profile.session_token.is_none() {
+            profile.session_token = hydrated_existing_profile.session_token.clone();
+        }
+
         // Keep previous secret if the edit payload omitted it.
         match (
             &hydrated_existing_profile.credential_type,
@@ -425,7 +483,13 @@ impl ProfileManager {
         Ok(())
     }
 
+    /// The profile operations run against: the one named by an enclosing
+    /// [`super::with_profile`], otherwise the globally selected one.
     pub async fn get_active_profile(&self) -> Result<Option<Profile>> {
+        if let Some(id) = super::scope::current() {
+            let profile = self.data.profiles.get(&id).cloned();
+            return Ok(profile.map(|p| self.hydrate_profile(p)));
+        }
         match &self.data.active_profile_id {
             Some(id) => {
                 let profile = self.data.profiles.get(id).cloned();
@@ -438,7 +502,9 @@ impl ProfileManager {
     /// Get a profile and populate its secret from the keychain if applicable
     pub fn hydrate_profile(&self, mut profile: Profile) -> Profile {
         let stored = self.data.profiles.get(&profile.id).unwrap_or(&profile);
-        if let Some(secret) = self.load_secret(stored).ok().flatten() {
+        if let Some(stored_secret) = self.load_secret(stored).ok().flatten() {
+            let (secret, session_token) = unpack_secret(&stored_secret);
+            profile.session_token = session_token;
             match &mut profile.credential_type {
                 CredentialType::Manual {
                     secret_access_key, ..
@@ -471,7 +537,7 @@ impl ProfileManager {
                 }
                 self.keychain.store(
                     profile.secret_ref.as_deref().unwrap_or(&profile.id),
-                    secret_access_key,
+                    &pack_secret(secret_access_key, profile.session_token.as_deref()),
                 )?;
             }
             _ => {}
@@ -524,6 +590,17 @@ impl ProfileManager {
         }
     }
 
+    /// Whether the profile's secret is saved, held for this run only, or has
+    /// to be entered again (after a restart without a usable keychain).
+    pub fn secret_state(&self, profile: &Profile) -> super::SecretState {
+        match profile.credential_type {
+            CredentialType::Manual { .. } | CredentialType::CustomEndpoint { .. } => self
+                .keychain
+                .state(profile.secret_ref.as_deref().unwrap_or(&profile.id)),
+            _ => super::SecretState::NotNeeded,
+        }
+    }
+
     pub fn load_secret(&self, profile: &Profile) -> Result<Option<String>> {
         match &profile.credential_type {
             CredentialType::Manual { .. } | CredentialType::CustomEndpoint { .. } => Ok(self
@@ -539,6 +616,121 @@ impl ProfileManager {
 mod tests {
     use super::{CredentialType, Profile, ProfileManager};
     use std::collections::HashMap;
+
+    #[test]
+    fn secrets_pack_a_session_token_and_plain_secrets_stay_plain() {
+        assert_eq!(super::pack_secret("plain", None), "plain");
+        assert_eq!(super::pack_secret("plain", Some("")), "plain");
+        assert_eq!(super::unpack_secret("plain"), ("plain".to_string(), None));
+        // A secret that happens to be JSON is still only a secret.
+        assert_eq!(
+            super::unpack_secret("{\"a\":1}"),
+            ("{\"a\":1}".to_string(), None)
+        );
+
+        // Values that only resemble the packed form stay untouched.
+        for lookalike in [
+            "{\"supas3_credentials\":0}",
+            "{\"supas3_credentials\":1,\"secret_access_key\":\"\",\"session_token\":\"t\"}",
+            "{\"supas3_credentials\":1,\"secret_access_key\":\"k\"}",
+            "{\"supas3_credentials\":2,\"secret_access_key\":\"k\",\"session_token\":\"t\"}",
+            "{\"supas3_credentials\":1,\"secret_access_key\":\"k\",\"session_token\":\"t\",\"x\":1}",
+        ] {
+            assert_eq!(super::unpack_secret(lookalike), (lookalike.to_string(), None));
+        }
+
+        let packed = super::pack_secret("key/+=", Some("token/+=\"quoted\""));
+        assert_eq!(
+            super::unpack_secret(&packed),
+            ("key/+=".to_string(), Some("token/+=\"quoted\"".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn temporary_credentials_survive_reopening_and_stay_out_of_the_profile_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = |secret: &str| CredentialType::CustomEndpoint {
+            endpoint_url: "https://storage.example".into(),
+            access_key_id: "AK".into(),
+            secret_access_key: secret.into(),
+        };
+        let saved = {
+            let mut manager = ProfileManager::new(dir.path().to_path_buf(), true).unwrap();
+            let mut profile = Profile::new("temporary".into(), custom("secret-key"), None);
+            profile.session_token = Some("session-token".into());
+            manager.add_profile(profile).await.unwrap()
+        };
+
+        let mut manager = ProfileManager::new(dir.path().to_path_buf(), true).unwrap();
+        let loaded = manager.get_profile(&saved.id).await.unwrap();
+        assert_eq!(loaded.session_token.as_deref(), Some("session-token"));
+        assert!(matches!(
+            &loaded.credential_type,
+            CredentialType::CustomEndpoint { secret_access_key, .. } if secret_access_key == "secret-key"
+        ));
+        assert_eq!(
+            manager.secret_state(&loaded),
+            crate::credentials::SecretState::SessionOnly
+        );
+        let file = std::fs::read_to_string(dir.path().join("profiles.json")).unwrap();
+        assert!(!file.contains("session-token") && !file.contains("secret-key"));
+
+        // Renaming without re-entering the secret keeps the token too.
+        let mut renamed = Profile::new("renamed".into(), custom(""), None);
+        renamed.session_token = None;
+        manager.update_profile(&saved.id, renamed).await.unwrap();
+        let kept = manager.get_profile(&saved.id).await.unwrap();
+        assert_eq!(kept.session_token.as_deref(), Some("session-token"));
+
+        // Entering new long-lived credentials drops the old token.
+        let replaced = Profile::new("renamed".into(), custom("new-key"), None);
+        manager.update_profile(&saved.id, replaced).await.unwrap();
+        assert_eq!(
+            manager.get_profile(&saved.id).await.unwrap().session_token,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn operations_use_the_scoped_profile_without_changing_the_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = ProfileManager::new(dir.path().to_path_buf(), true).unwrap();
+        let first = manager
+            .add_profile(Profile::new(
+                "first".into(),
+                CredentialType::Environment,
+                None,
+            ))
+            .await
+            .unwrap();
+        let second = manager
+            .add_profile(Profile::new(
+                "second".into(),
+                CredentialType::Environment,
+                None,
+            ))
+            .await
+            .unwrap();
+        manager.set_active_profile(&first.id).await.unwrap();
+
+        let scoped = crate::credentials::with_profile(second.id.clone(), async {
+            manager.get_active_profile().await.unwrap().unwrap().id
+        })
+        .await;
+        assert_eq!(scoped, second.id);
+        assert_eq!(
+            manager.get_active_profile().await.unwrap().unwrap().id,
+            first.id
+        );
+
+        // A profile that no longer exists is reported as absent, not replaced
+        // by the selected one.
+        let missing = crate::credentials::with_profile("deleted", async {
+            manager.get_active_profile().await.unwrap()
+        })
+        .await;
+        assert!(missing.is_none());
+    }
 
     #[tokio::test]
     async fn failed_metadata_commit_preserves_selection_profile_and_secret() {
@@ -756,8 +948,10 @@ mod tests {
         profiles.insert(
             "legacy-key".to_string(),
             Profile {
+                compat: Default::default(),
                 public_urls: Default::default(),
                 secret_ref: None,
+                session_token: None,
                 id: String::new(),
                 name: "Legacy".to_string(),
                 credential_type: CredentialType::Environment,

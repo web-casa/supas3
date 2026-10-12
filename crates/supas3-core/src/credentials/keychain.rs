@@ -2,13 +2,33 @@ use crate::error::{AppError, Result};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 const SERVICE_NAME: &str = "supas3-credentials";
-const FALLBACK_SECRETS_FILE: &str = "secrets.json";
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// Secrets held for this run only, one set per configuration directory.
+///
+/// Upstream wrote secrets to a plaintext `secrets.json` whenever the system
+/// keychain was unavailable. supaS3 keeps them in memory instead: they work
+/// until the application exits and are never written to disk.
+static SESSION_SECRETS: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, SecretsData>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Where a stored secret lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretState {
+    /// The connection type has no secret of its own.
+    NotNeeded,
+    /// Saved in the system keychain; available after a restart.
+    Saved,
+    /// Held in memory because the keychain is unavailable; gone after exit.
+    SessionOnly,
+    /// No secret is available: it must be entered again.
+    Missing,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct SecretsData {
     #[serde(default)]
     secrets: HashMap<String, String>,
@@ -17,7 +37,8 @@ struct SecretsData {
 /// Secure credential storage using OS keychain
 pub struct KeychainStorage {
     app_name: String,
-    fallback_path: PathBuf,
+    /// Identifies this storage's in-memory secrets; nothing is written here.
+    session_key: PathBuf,
     force_fallback: bool,
 }
 
@@ -25,7 +46,7 @@ impl KeychainStorage {
     pub fn new(app_name: &str, config_dir: &Path, force_fallback: bool) -> Self {
         Self {
             app_name: app_name.to_string(),
-            fallback_path: config_dir.join(FALLBACK_SECRETS_FILE),
+            session_key: config_dir.to_path_buf(),
             force_fallback,
         }
     }
@@ -48,23 +69,41 @@ impl KeychainStorage {
     }
 
     fn read_fallback_secrets(&self) -> Result<SecretsData> {
-        if !self.fallback_path.exists() {
-            return Ok(SecretsData::default());
-        }
-
-        let content = fs::read_to_string(&self.fallback_path)?;
-        if content.trim().is_empty() {
-            return Ok(SecretsData::default());
-        }
-
-        serde_json::from_str(&content).map_err(|e| {
-            AppError::SerializationError(format!("Failed to parse fallback secrets store: {}", e))
-        })
+        Ok(SESSION_SECRETS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&self.session_key)
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn write_fallback_secrets(&self, data: &SecretsData) -> Result<()> {
-        let content = serde_json::to_string_pretty(data)?;
-        super::write_private_file(&self.fallback_path, content.as_bytes())
+        SESSION_SECRETS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(self.session_key.clone(), data.clone());
+        Ok(())
+    }
+
+    /// Whether a secret is saved for good, held for this run, or absent.
+    pub fn state(&self, key: &str) -> SecretState {
+        if self
+            .read_fallback_secrets()
+            .is_ok_and(|data| data.secrets.contains_key(key))
+        {
+            return SecretState::SessionOnly;
+        }
+        if self.force_fallback {
+            return SecretState::Missing;
+        }
+        match self.get_entry(key).and_then(|entry| {
+            entry
+                .get_password()
+                .map_err(|e| AppError::KeychainError(e.to_string()))
+        }) {
+            Ok(_) => SecretState::Saved,
+            Err(_) => SecretState::Missing,
+        }
     }
 
     fn store_fallback(&self, key: &str, secret: &str) -> Result<()> {
@@ -75,9 +114,10 @@ impl KeychainStorage {
 
     fn get_fallback(&self, key: &str) -> Result<String> {
         let data = self.read_fallback_secrets()?;
-        data.secrets.get(key).cloned().ok_or_else(|| {
-            AppError::KeychainError("Secret not found in fallback storage".to_string())
-        })
+        data.secrets
+            .get(key)
+            .cloned()
+            .ok_or_else(|| AppError::KeychainError("Secret not found for this session".to_string()))
     }
 
     fn delete_fallback(&self, key: &str) -> Result<()> {
@@ -100,7 +140,7 @@ impl KeychainStorage {
             }
             Err(err) => {
                 log::warn!(
-                    "Native keychain store failed for '{}', falling back to local secrets file: {}",
+                    "Native keychain store failed for '{}', keeping it for this session only: {}",
                     key,
                     err
                 );
@@ -134,7 +174,7 @@ impl KeychainStorage {
                     if let Ok(secret) = legacy_entry.get_password() {
                         if let Err(migration_err) = entry.set_password(&secret) {
                             log::warn!(
-                                "Secret Service migration failed for '{}', using local fallback: {}",
+                                "Secret Service migration failed for '{}', keeping it for this session only: {}",
                                 key,
                                 migration_err
                             );
@@ -147,7 +187,7 @@ impl KeychainStorage {
                     }
                 }
 
-                log::warn!("Trying local secrets file for '{}'", key);
+                log::warn!("Trying this session's secrets for '{}'", key);
                 self.get_fallback(key)
             }
         }
@@ -165,7 +205,7 @@ impl KeychainStorage {
                 return Err(AppError::KeychainError(err.to_string()));
             }
             log::warn!(
-                "Native keychain delete failed for '{}', clearing local fallback if present: {}",
+                "Native keychain delete failed for '{}', clearing the session copy if present: {}",
                 key,
                 err
             );
@@ -197,30 +237,41 @@ mod tests {
     }
 
     #[test]
-    fn fallback_replacement_keeps_other_secrets_and_reports_corrupt_storage() {
+    fn session_secrets_are_kept_apart_and_never_written_to_disk() {
         let directory = tempfile::tempdir().unwrap();
         let storage = KeychainStorage::new("test", directory.path(), true);
         storage.store("first", "first-secret").unwrap();
         storage.store("second", "second-secret").unwrap();
-        assert_eq!(storage.get("first").unwrap(), "first-secret");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&storage.fallback_path)
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
-        std::fs::write(&storage.fallback_path, "{invalid").unwrap();
-        assert!(storage.delete("first").is_err());
+        storage.delete("first").unwrap();
+
+        assert!(storage.get("first").is_err());
+        assert_eq!(storage.get("second").unwrap(), "second-secret");
         assert_eq!(
-            std::fs::read_to_string(&storage.fallback_path).unwrap(),
-            "{invalid"
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            0,
+            "no secret file may be created"
         );
+
+        // Another configuration directory sees none of them.
+        let other = tempfile::tempdir().unwrap();
+        assert!(KeychainStorage::new("test", other.path(), true)
+            .get("second")
+            .is_err());
+    }
+
+    #[test]
+    fn session_secrets_last_for_the_process_and_report_their_state() {
+        use super::SecretState;
+        let directory = tempfile::tempdir().unwrap();
+        KeychainStorage::new("test", directory.path(), true)
+            .store("profile", "secret")
+            .unwrap();
+
+        // A new storage for the same directory, as after reopening the backend.
+        let reopened = KeychainStorage::new("test", directory.path(), true);
+        assert_eq!(reopened.get("profile").unwrap(), "secret");
+        assert_eq!(reopened.state("profile"), SecretState::SessionOnly);
+        assert_eq!(reopened.state("unknown"), SecretState::Missing);
     }
 
     #[test]

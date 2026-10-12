@@ -28,6 +28,17 @@ pub async fn get_profile(id: String, state: State<'_, ProfileState>) -> Result<P
     manager.get_profile(&id).await.map_err(|e| e.to_string())
 }
 
+/// Where a profile's secret lives, so the interface can ask for credentials
+/// again when they were only kept for an earlier session.
+pub async fn get_secret_state(
+    id: String,
+    state: State<'_, ProfileState>,
+) -> Result<crate::credentials::SecretState, String> {
+    let manager = state.read().await;
+    let profile = manager.get_profile(&id).await.map_err(|e| e.to_string())?;
+    Ok(manager.secret_state(&profile))
+}
+
 pub async fn add_profile(
     profile: Profile,
     state: State<'_, ProfileState>,

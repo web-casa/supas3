@@ -39,6 +39,13 @@ pub struct TransferJob {
     pub phase: Option<String>,
     pub id: String,
     pub profile_id: String,
+    /// The connection settings this transfer was queued against, as
+    /// `Profile::cache_identity`. A transfer whose connection has been edited
+    /// since is refused rather than sent to different settings. `None` for
+    /// transfers that are not pinned, including those journaled before this
+    /// field existed.
+    #[serde(default)]
+    pub profile_identity: Option<String>,
     pub bucket: String,
     pub bucket_region: Option<String>,
     pub key: String,
@@ -107,6 +114,7 @@ impl TransferJob {
             phase: None,
             id: Uuid::new_v4().to_string(),
             profile_id,
+            profile_identity: None,
             bucket,
             bucket_region,
             key,
@@ -128,6 +136,12 @@ impl TransferJob {
             group_name: None,
             is_group_root: false,
         }
+    }
+
+    /// Ties the transfer to the connection settings it was queued against.
+    pub fn pinned_to(mut self, profile_identity: String) -> Self {
+        self.profile_identity = Some(profile_identity);
+        self
     }
 
     pub fn with_group(mut self, group_id: String, name: String) -> Self {

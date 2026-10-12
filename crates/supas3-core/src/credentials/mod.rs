@@ -1,8 +1,12 @@
+pub mod compat;
 pub mod keychain;
 pub mod manager;
+pub mod scope;
 
-pub use keychain::KeychainStorage;
+pub use compat::{Addressing, Compatibility, ListVersion, Provider, WriteGuard};
+pub use keychain::{KeychainStorage, SecretState};
 pub use manager::{CredentialType, Profile, ProfileManager};
+pub use scope::with_profile;
 
 use crate::error::Result;
 use crate::host::AppHandle;
@@ -41,6 +45,12 @@ fn portable_data_dir() -> Option<PathBuf> {
     }
 }
 
+/// Where application data is stored: next to the executable in portable
+/// mode, otherwise the given per-user directory.
+pub fn data_dir(default_config_dir: PathBuf) -> PathBuf {
+    portable_data_dir().unwrap_or(default_config_dir)
+}
+
 /// Initialize the credentials manager and register it as app state.
 /// This must happen before any profile command runs. `default_config_dir` is
 /// used unless portable mode redirects storage next to the executable.
@@ -51,12 +61,8 @@ pub fn init(app: &AppHandle, default_config_dir: PathBuf) -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
     keyring::set_default_credential_builder(keyring::secret_service::default_credential_builder());
 
-    let portable_config_dir = portable_data_dir();
-    let force_secret_fallback = portable_config_dir.is_some();
-    let config_dir = match portable_config_dir {
-        Some(path) => path,
-        None => default_config_dir,
-    };
+    let force_secret_fallback = portable_data_dir().is_some();
+    let config_dir = data_dir(default_config_dir);
 
     // Ensure config directory exists
     std::fs::create_dir_all(&config_dir)?;

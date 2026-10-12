@@ -1,4 +1,4 @@
-use crate::credentials::{CredentialType, Profile};
+use crate::credentials::{Addressing, CredentialType, Profile};
 use crate::error::{AppError, Result};
 use aws_config::Region;
 use aws_sdk_s3::config::{RequestChecksumCalculation, ResponseChecksumValidation};
@@ -24,6 +24,23 @@ pub(crate) fn normalize_endpoint_url(url: &str) -> String {
     }
 }
 
+/// Whether the environment or shared configuration points S3 at a custom
+/// endpoint, through the global setting or the S3-specific one
+/// (`AWS_ENDPOINT_URL_S3`, or `endpoint_url` in a profile's `s3` service
+/// section). Mirrors how the SDK resolves the endpoint it will use.
+fn has_configured_endpoint(sdk_config: &aws_config::SdkConfig) -> bool {
+    let service_endpoint = sdk_config.service_config().and_then(|config| {
+        let key = aws_types::service_config::ServiceConfigKey::builder()
+            .service_id("S3")
+            .env("AWS_ENDPOINT_URL")
+            .profile("endpoint_url")
+            .build()
+            .ok()?;
+        config.load_config(key)
+    });
+    sdk_config.endpoint_url().is_some() || service_endpoint.is_some()
+}
+
 fn build_s3_config(sdk_config: &aws_config::SdkConfig, profile: &Profile) -> aws_sdk_s3::Config {
     let mut builder = aws_sdk_s3::config::Builder::from(sdk_config);
 
@@ -34,15 +51,24 @@ fn build_s3_config(sdk_config: &aws_config::SdkConfig, profile: &Profile) -> aws
     // A global endpoint_url loaded from an environment variable or shared
     // profile is a custom S3 endpoint just as much as one entered in the UI.
     // Path-style addressing is required by common providers such as MinIO
-    // unless they have explicitly configured wildcard bucket DNS.
+    // unless they have explicitly configured wildcard bucket DNS; providers
+    // that refuse it (OSS, COS, OBS) select virtual-hosted addressing.
     if matches!(
         profile.credential_type,
         CredentialType::CustomEndpoint { .. }
-    ) || sdk_config.endpoint_url().is_some()
+    ) || has_configured_endpoint(sdk_config)
     {
         builder = builder
-            .force_path_style(true)
-            .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
+            .force_path_style(profile.compat.addressing == Addressing::Path)
+            .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
+            // Marks the client as a custom endpoint and adapts conditional
+            // write headers to what the service accepts.
+            .interceptor(super::guard::WriteGuardInterceptor::new(
+                profile.compat.write_guard,
+            ));
+        if profile.compat.list_version == crate::credentials::ListVersion::V1 {
+            builder = builder.interceptor(super::listing::ListVersionMarker);
+        }
     }
 
     builder = builder.request_checksum_calculation(RequestChecksumCalculation::WhenRequired);
@@ -82,7 +108,7 @@ pub(crate) async fn load_sdk_config(
             let creds = aws_credential_types::Credentials::new(
                 access_key_id,
                 secret_access_key,
-                None,
+                profile.session_token.clone(),
                 None,
                 "manual",
             );
@@ -100,7 +126,7 @@ pub(crate) async fn load_sdk_config(
             let creds = aws_credential_types::Credentials::new(
                 access_key_id,
                 secret_access_key,
-                None,
+                profile.session_token.clone(),
                 None,
                 "custom_endpoint",
             );
@@ -375,6 +401,15 @@ pub async fn list_buckets(client: &Client) -> Result<Vec<BucketInfo>> {
 /// (e.g., Linode Object Storage, DigitalOcean Spaces). Callers should handle
 /// errors gracefully and fall back to the profile's configured region.
 pub async fn get_bucket_region(client: &Client, bucket_name: &str) -> Result<String> {
+    // A custom endpoint is one service in one place: the configured region is
+    // authoritative. Its GetBucketLocation answer is not an AWS region (OSS
+    // returns "oss-cn-hongkong", R2 returns "APAC"), and retrying a failed
+    // request "in the detected region" only repeats it against the same host.
+    if super::guard::Protection::of(client) != super::guard::Protection::Native {
+        return Err(AppError::S3Error(format!(
+            "Region detection is not used for custom endpoints ('{bucket_name}')"
+        )));
+    }
     // Use a timeout to prevent hanging on providers that don't support this API
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),

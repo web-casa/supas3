@@ -275,6 +275,73 @@ async fn round2(t: &Target, env: &HashMap<String, String>, run_id: &str) {
         rep.row(&format!("CopyObject {h} on existing"), outcome(&r));
     }
 
+    // Vendor no-overwrite headers on CompleteMultipartUpload.
+    for h in ["x-oss-forbid-overwrite", "x-cos-forbid-overwrite"] {
+        for (label, target) in [("existing", k("keep")), ("new key", k(&format!("mpu-{h}")))] {
+            let Ok(created) = c
+                .create_multipart_upload()
+                .bucket(b)
+                .key(&target)
+                .send()
+                .await
+            else {
+                rep.row(
+                    &format!("CompleteMultipartUpload {h} on {label}"),
+                    "could not create upload",
+                );
+                continue;
+            };
+            let upload_id = created.upload_id().unwrap_or_default().to_string();
+            let part = c
+                .upload_part()
+                .bucket(b)
+                .key(&target)
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from_static(b"multipart"))
+                .send()
+                .await;
+            let parts = vec![CompletedPart::builder()
+                .part_number(1)
+                .set_e_tag(part.ok().and_then(|p| p.e_tag().map(str::to_string)))
+                .build()];
+            let r = c
+                .complete_multipart_upload()
+                .bucket(b)
+                .key(&target)
+                .upload_id(&upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(parts))
+                        .build(),
+                )
+                .customize()
+                .mutate_request(move |req| {
+                    req.headers_mut().insert(h, "true");
+                })
+                .send()
+                .await;
+            rep.row(
+                &format!("CompleteMultipartUpload {h} on {label}"),
+                outcome(&r),
+            );
+            let _ = c
+                .abort_multipart_upload()
+                .bucket(b)
+                .key(&target)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+        }
+        let _ = c
+            .put_object()
+            .bucket(b)
+            .key(k("keep"))
+            .body(ByteStream::from_static(b"v1"))
+            .send()
+            .await;
+    }
+
     // If-Match round trip with the server's own ETag, repeated to rule out flukes.
     let put = c
         .put_object()

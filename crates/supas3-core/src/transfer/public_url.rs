@@ -21,6 +21,34 @@ pub fn base_url(value: &str) -> Result<url::Url> {
     Ok(parsed)
 }
 
+/// `https://endpoint` becomes `https://bucket.endpoint`. Returns `None` when
+/// the endpoint is an IP address, which has no subdomains.
+fn virtual_host(endpoint: &str, bucket: &str) -> Result<Option<String>> {
+    let mut url = base_url(endpoint)?;
+    let host = match url.host() {
+        Some(url::Host::Domain(domain)) => domain.to_string(),
+        Some(_) => return Ok(None),
+        None => {
+            return Err(AppError::ConfigError(
+                "The endpoint has no host name.".into(),
+            ))
+        }
+    };
+    // A dotted bucket name breaks the endpoint's wildcard TLS certificate.
+    if url.scheme() == "https" && bucket.contains('.') {
+        return Err(AppError::ConfigError(format!(
+            "Bucket '{bucket}' contains a dot, so an HTTPS link on the bucket's host name would fail certificate checks. Configure a public base URL for it."
+        )));
+    }
+    url.set_host(Some(&format!("{bucket}.{host}")))
+        .map_err(|_| {
+            AppError::ConfigError(format!(
+                "Bucket '{bucket}' cannot be used in a host name. Configure a public base URL."
+            ))
+        })?;
+    Ok(Some(url.to_string()))
+}
+
 impl PublicUrls {
     pub fn validate(&self) -> Result<()> {
         if !self.base_url.is_empty() {
@@ -61,10 +89,17 @@ pub fn build(profile: &Profile, bucket: &str, region: Option<&str>, key: &str) -
     } else if !settings.base_url.is_empty() {
         (settings.base_url.clone(), settings.include_bucket)
     } else if let CredentialType::CustomEndpoint { endpoint_url, .. } = &profile.credential_type {
-        (
-            crate::s3::client::normalize_endpoint_url(endpoint_url),
-            true,
-        )
+        let endpoint = crate::s3::client::normalize_endpoint_url(endpoint_url);
+        // The link has to use the addressing style the service accepts.
+        match profile.compat.addressing {
+            crate::credentials::Addressing::Path => (endpoint, true),
+            crate::credentials::Addressing::Virtual => match virtual_host(&endpoint, bucket)? {
+                Some(url) => (url, false),
+                // An address cannot take a bucket subdomain; like the SDK,
+                // fall back to path style.
+                None => (endpoint, true),
+            },
+        }
     } else {
         let region = region.or(profile.region.as_deref()).unwrap_or("us-east-1");
         if !region
@@ -104,6 +139,60 @@ pub fn build(profile: &Profile, bucket: &str, region: Option<&str>, key: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn custom_endpoints_follow_their_addressing_style() {
+        let mut p = Profile::new(
+            "test".into(),
+            CredentialType::CustomEndpoint {
+                endpoint_url: "oss-cn-hongkong.aliyuncs.com".into(),
+                access_key_id: "AK".into(),
+                secret_access_key: String::new(),
+            },
+            None,
+        );
+        assert_eq!(
+            build(&p, "bucket", None, "dir/a b.txt").unwrap(),
+            "https://oss-cn-hongkong.aliyuncs.com/bucket/dir/a%20b.txt"
+        );
+        p.compat.addressing = crate::credentials::Addressing::Virtual;
+        assert_eq!(
+            build(&p, "bucket", None, "dir/a b.txt").unwrap(),
+            "https://bucket.oss-cn-hongkong.aliyuncs.com/dir/a%20b.txt"
+        );
+        assert!(build(&p, "not a host", None, "a.txt").is_err());
+        assert!(build(&p, "dotted.bucket", None, "a.txt").is_err());
+
+        let with = |endpoint: &str| {
+            let mut p = p.clone();
+            p.credential_type = CredentialType::CustomEndpoint {
+                endpoint_url: endpoint.into(),
+                access_key_id: "AK".into(),
+                secret_access_key: String::new(),
+            };
+            p
+        };
+        // Ports are kept; plain HTTP tolerates a dotted bucket.
+        assert_eq!(
+            build(
+                &with("http://storage.internal:9000"),
+                "dotted.bucket",
+                None,
+                "a.txt"
+            )
+            .unwrap(),
+            "http://dotted.bucket.storage.internal:9000/a.txt"
+        );
+        // Addresses have no subdomains, so the link is path-style.
+        assert_eq!(
+            build(&with("http://127.0.0.1:9000"), "bucket", None, "a.txt").unwrap(),
+            "http://127.0.0.1:9000/bucket/a.txt"
+        );
+        assert_eq!(
+            build(&with("http://[::1]:9000"), "bucket", None, "a.txt").unwrap(),
+            "http://[::1]:9000/bucket/a.txt"
+        );
+    }
+
     #[test]
     fn encodes_literal_keys_and_honors_bucket_roots() {
         let mut p = Profile::new("test".into(), CredentialType::Environment, None);

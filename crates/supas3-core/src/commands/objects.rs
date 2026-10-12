@@ -173,8 +173,7 @@ async fn list_complete_folder_content(
             request = request.continuation_token(token);
         }
 
-        let output = request
-            .send()
+        let output = crate::s3::listing::send(client, request)
             .await
             .map_err(|err| crate::error::AppError::S3Error(err.to_string()))?;
         request_count += 1;
@@ -447,7 +446,7 @@ pub async fn list_objects(
         request = request.max_keys(max);
     }
 
-    let result = request.send().await;
+    let result = crate::s3::listing::send(&client, request).await;
 
     // Handle the result, implementing retry logic on error
     let output = match result {
@@ -520,8 +519,7 @@ pub async fn list_objects(
                     s3_manager.set_bucket_region(&active_profile, &bucket_name, new_region);
                 }
 
-                retry_req
-                    .send()
+                crate::s3::listing::send(&new_client, retry_req)
                     .await
                     .map_err(|e| crate::error::AppError::S3Error(format!("Retry failed: {}", e)))?
             } else {
@@ -664,7 +662,7 @@ pub async fn search_objects(
             req = req.continuation_token(token);
         }
 
-        let result = req.send().await;
+        let result = crate::s3::listing::send(&client, req).await;
 
         // implement region detection and retry on error
         let output = match result {
@@ -714,9 +712,11 @@ pub async fn search_objects(
                         retry_req = retry_req.continuation_token(token);
                     }
 
-                    retry_req.send().await.map_err(|e| {
-                        crate::error::AppError::S3Error(format!("Search retry failed: {}", e))
-                    })?
+                    crate::s3::listing::send(&new_client, retry_req)
+                        .await
+                        .map_err(|e| {
+                            crate::error::AppError::S3Error(format!("Search retry failed: {}", e))
+                        })?
                 } else {
                     return Err(crate::error::AppError::S3Error(err.to_string()));
                 }

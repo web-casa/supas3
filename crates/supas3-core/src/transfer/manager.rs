@@ -394,6 +394,9 @@ impl TransferManager {
                         job.total_bytes,
                     );
 
+                    // A retry stays tied to the connection settings the
+                    // transfer was first queued against.
+                    new_job.profile_identity = job.profile_identity.clone();
                     new_job.download_destination = job.download_destination.clone();
                     new_job.sync_source = job.sync_source.clone();
                     new_job.remote_source = job.remote_source.clone();
@@ -742,6 +745,14 @@ impl TransferManager {
     ) -> crate::error::Result<()> {
         let expected_etag = job.destination_etag();
         let offset = job.remote_source.as_ref().map_or(0, |s| s.size);
+        crate::s3::guard::before_write(
+            client,
+            &job.bucket,
+            &job.key,
+            expected_etag,
+            crate::s3::guard::Operation::Put,
+        )
+        .await?;
         let metadata = tokio::fs::metadata(&job.local_path)
             .await
             .map_err(|error| {
@@ -1006,6 +1017,14 @@ impl TransferManager {
                 crate::s3::versions::validate_restore(client, &job.bucket, &job.key, guard).await?;
                 self.ensure_multipart_job_active(&job.id).await?;
             }
+            crate::s3::guard::before_write(
+                client,
+                &job.bucket,
+                &job.key,
+                job.destination_etag(),
+                crate::s3::guard::Operation::CompleteMultipart,
+            )
+            .await?;
             let complete_send = client
                 .complete_multipart_upload()
                 .set_if_none_match(job.destination_etag().is_none().then(|| "*".into()))
@@ -1072,6 +1091,15 @@ impl TransferManager {
                     None => s3.get_client(destination).await?.clone(),
                 }
             };
+            // Refuse a destination conflict before downloading the source.
+            crate::s3::guard::before_write(
+                &client,
+                &job.bucket,
+                &job.key,
+                job.destination_etag(),
+                crate::s3::guard::Operation::Put,
+            )
+            .await?;
             let temporary = super::url_import::stage(source, job, self).await?;
             self.ensure_multipart_job_active(&job.id).await?;
             let mut prepared = job.clone();
@@ -1139,6 +1167,15 @@ impl TransferManager {
             crate::s3::versions::validate_restore(destination_client, &job.bucket, &job.key, guard)
                 .await?;
         }
+        // Refuse a destination conflict before downloading the source.
+        crate::s3::guard::before_write(
+            destination_client,
+            &job.bucket,
+            &job.key,
+            job.destination_etag(),
+            crate::s3::guard::Operation::Put,
+        )
+        .await?;
         let (temporary, mut attributes) =
             super::remote::stage(source_client, source, job, self).await?;
         self.ensure_multipart_job_active(&job.id).await?;
@@ -1179,6 +1216,16 @@ impl TransferManager {
         s3_manager: Arc<RwLock<S3ClientManager>>,
         profile: &Profile,
     ) -> crate::error::Result<()> {
+        if job
+            .profile_identity
+            .as_ref()
+            .is_some_and(|queued| *queued != profile.cache_identity())
+        {
+            return Err(crate::error::AppError::ConfigError(
+                "The connection was edited after this transfer was queued. Queue it again to use the new settings."
+                    .into(),
+            ));
+        }
         if job
             .sync_source
             .as_ref()
@@ -2465,6 +2512,47 @@ mod tests {
         );
         job.status = status;
         job
+    }
+
+    #[tokio::test]
+    async fn a_retry_keeps_the_connection_revision_of_the_original_transfer() {
+        let manager = TransferManager::new();
+        let job = test_job(TransferStatus::Failed("offline".into())).pinned_to("revision-1".into());
+        manager
+            .jobs
+            .write()
+            .await
+            .insert(job.id.clone(), job.clone());
+
+        let retried = manager
+            .retry_job(&job.id)
+            .await
+            .expect("a failed job can be retried");
+
+        let retried = manager.get_job(&retried).await.unwrap();
+        assert_eq!(retried.profile_identity.as_deref(), Some("revision-1"));
+    }
+
+    #[tokio::test]
+    async fn a_transfer_is_refused_when_its_connection_was_edited_after_queueing() {
+        let manager = TransferManager::new();
+        let s3 = Arc::new(RwLock::new(crate::s3::S3ClientManager::new()));
+        let mut profile = crate::credentials::Profile::new(
+            "a".into(),
+            crate::credentials::CredentialType::Environment,
+            Some("us-east-1".into()),
+        );
+        let job = test_job(TransferStatus::InProgress).pinned_to(profile.cache_identity());
+
+        // An edit changes the profile's revision.
+        profile.updated_at = Some(chrono::Utc::now() + chrono::Duration::seconds(1));
+        let refused = manager.execute_job(&job, s3, &profile).await;
+
+        let message = refused.unwrap_err().to_string();
+        assert!(
+            message.contains("edited after this transfer was queued"),
+            "{message}"
+        );
     }
 
     #[tokio::test]

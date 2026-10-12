@@ -44,6 +44,8 @@ pub struct CoreOptions {
 /// without that still releases its resources but does not wait for transfers
 /// to clean up.
 pub struct Core {
+    // Held for the life of the backend; released when the file is closed.
+    _instance_lock: std::fs::File,
     runtime: Registration,
     scheduler: JoinHandle<()>,
     app: AppHandle,
@@ -60,17 +62,48 @@ impl Core {
     /// tasks should run on; that runtime is remembered for work started later
     /// from other threads.
     pub async fn init(options: CoreOptions) -> error::Result<Self> {
+        let instance_lock = lock_data_dir(&options.config_dir)?;
         let runtime = host::async_runtime::register(tokio::runtime::Handle::current());
-
         let app = AppHandle::new(options.events);
-        let s3: S3State = Arc::new(RwLock::new(S3ClientManager::new()));
         let transfers: TransferState = Arc::new(TransferManager::new());
+
+        match Self::start(&app, &transfers, options.config_dir).await {
+            Ok((data_dir, profiles, s3, jobs, scheduler)) => Ok(Self {
+                _instance_lock: instance_lock,
+                runtime,
+                scheduler,
+                app,
+                data_dir,
+                profiles,
+                s3,
+                transfers,
+                sync_plans: SyncPlans::default(),
+                jobs,
+            }),
+            Err(error) => {
+                // No `Core` exists to clean up in `Drop`, so undo the
+                // registrations made so far.
+                transfers.clear_app_handle().await;
+                app.clear_managed();
+                host::async_runtime::unregister(runtime);
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn start(
+        app: &AppHandle,
+        transfers: &TransferState,
+        config_dir: PathBuf,
+    ) -> error::Result<(PathBuf, ProfileState, S3State, JobState, JoinHandle<()>)> {
+        let s3: S3State = Arc::new(RwLock::new(S3ClientManager::new()));
         app.manage(s3.clone());
         app.manage(transfers.clone());
         transfers.set_app_handle(app.clone()).await;
 
         // Credentials must be ready before any profile command can run.
-        let data_dir = credentials::init(&app, options.config_dir)?;
+        let data_dir = credentials::init(app, config_dir)?;
         let profiles = app.state::<ProfileState>().inner().clone();
 
         if let Err(error) = transfers
@@ -96,18 +129,7 @@ impl Core {
             std::env::consts::OS,
             std::env::consts::ARCH
         );
-
-        Ok(Self {
-            runtime,
-            scheduler,
-            app,
-            data_dir,
-            profiles,
-            s3,
-            transfers,
-            sync_plans: SyncPlans::default(),
-            jobs,
-        })
+        Ok((data_dir, profiles, s3, jobs, scheduler))
     }
 
     /// Stops the backend in order: no new scheduled runs, cancel transfers
@@ -169,6 +191,26 @@ impl Core {
     pub fn jobs(&self) -> State<'_, JobState> {
         State::new(&self.jobs)
     }
+}
+
+/// Takes the exclusive lock that keeps a second backend out of the same data.
+/// Profiles and the transfer journal are whole-file JSON: two writers would
+/// silently overwrite each other.
+fn lock_data_dir(default_config_dir: &Path) -> error::Result<std::fs::File> {
+    let data_dir = credentials::data_dir(default_config_dir.to_path_buf());
+    std::fs::create_dir_all(&data_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(data_dir.join("instance.lock"))?;
+    file.try_lock().map_err(|_| {
+        error::AppError::ConfigError(format!(
+            "supaS3 is already running with the data in {}. Close the other window first.",
+            data_dir.display()
+        ))
+    })?;
+    Ok(file)
 }
 
 impl Drop for Core {

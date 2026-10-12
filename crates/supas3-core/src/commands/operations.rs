@@ -427,6 +427,16 @@ async fn multipart_copy_object(
             );
         }
 
+        if source_bucket != bucket_name || source_key != key {
+            crate::s3::guard::before_write(
+                client,
+                bucket_name,
+                key,
+                None,
+                crate::s3::guard::Operation::CompleteMultipart,
+            )
+            .await?;
+        }
         client
             .complete_multipart_upload()
             .set_if_none_match((source_bucket != bucket_name || source_key != key).then(|| "*".to_string()))
@@ -539,6 +549,14 @@ async fn put_object_with_profile(
         }
     };
 
+    crate::s3::guard::before_write(
+        &client,
+        &bucket_name,
+        &key,
+        None,
+        crate::s3::guard::Operation::Put,
+    )
+    .await?;
     let content_type = local_path
         .as_ref()
         .map(|_| crate::s3::infer_content_type(&key));
@@ -1085,6 +1103,14 @@ async fn copy_object_from_head(
         )
         .await
     } else {
+        crate::s3::guard::before_write(
+            destination.0,
+            destination.1,
+            destination.2,
+            None,
+            crate::s3::guard::Operation::Copy,
+        )
+        .await?;
         let build = |acl: Option<&CopyAclHeaders>| {
             let mut request = destination
                 .0
@@ -1497,6 +1523,20 @@ async fn move_object_with_profile(
 }
 
 async fn delete_copied_source(client: &Client, bucket: &str, key: &str, etag: &str) -> Result<()> {
+    crate::s3::guard::before_write(
+        client,
+        bucket,
+        key,
+        Some(etag),
+        crate::s3::guard::Operation::Delete,
+    )
+    .await
+    .map_err(|refusal| {
+        crate::error::AppError::S3Error(format!(
+            "Copied {key}, but the source was not removed and the destination copy remains: {}",
+            crate::error::AppError::from(refusal)
+        ))
+    })?;
     client.delete_object().bucket(bucket).key(key).if_match(etag).send().await
         .map_err(|error| crate::error::AppError::S3Error(format!(
             "Copied {key}, but could not conditionally remove the source. It may have changed, or the provider may not support conditional deletion. The destination copy remains: {error}"
@@ -1580,6 +1620,19 @@ pub(super) async fn save_object_text(
             )))
         }
     };
+    match crate::s3::guard::before_write(
+        client,
+        bucket,
+        key,
+        Some(expected_etag),
+        crate::s3::guard::Operation::Put,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(crate::s3::guard::Refusal::Conflict(_)) => return Err(conflict()),
+        Err(refusal) => return Err(refusal.into()),
+    }
     let bytes = content.into_bytes();
     let build_request = |acl: Option<&CopyAclHeaders>| {
         let mut request = client
@@ -2486,7 +2539,10 @@ mod move_profile_tests {
         let other_id = other.id.clone();
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for index in 0..4 {
+            // A generic custom endpoint cannot be trusted to enforce the copy
+            // and delete conditions, so the destination and the source are
+            // each checked with a HEAD before the write.
+            for _ in 0..6 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 let mut byte = [0];
@@ -2494,22 +2550,28 @@ mod move_profile_tests {
                     socket.read_exact(&mut byte).await.unwrap();
                     request.push(byte[0]);
                 }
-                requests.push(String::from_utf8(request).unwrap());
-                let body = if index == 2 {
+                let request = String::from_utf8(request).unwrap();
+                let (status, body) = if request.starts_with("PUT ") {
                     server_profiles
                         .write()
                         .await
                         .set_active_profile(&other_id)
                         .await
                         .unwrap();
-                    "<CopyObjectResult><ETag>&quot;test&quot;</ETag><LastModified>2026-01-01T00:00:00Z</LastModified></CopyObjectResult>"
-                } else if index == 1 {
-                    "<AccessControlPolicy><AccessControlList/></AccessControlPolicy>"
+                    ("200 OK", "<CopyObjectResult><ETag>&quot;test&quot;</ETag><LastModified>2026-01-01T00:00:00Z</LastModified></CopyObjectResult>")
+                } else if request.starts_with("GET ") {
+                    (
+                        "200 OK",
+                        "<AccessControlPolicy><AccessControlList/></AccessControlPolicy>",
+                    )
+                } else if request.starts_with("HEAD /bucket/dest.txt") {
+                    ("404 Not Found", "")
                 } else {
-                    ""
+                    ("200 OK", "")
                 };
+                requests.push(request);
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nETag: \"test\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status}\r\nETag: \"test\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
@@ -2536,9 +2598,11 @@ mod move_profile_tests {
         .unwrap();
         let requests = server.await.unwrap();
         assert!(requests[0].starts_with("HEAD /bucket/source.txt"));
-        assert!(requests[2].starts_with("PUT /bucket/dest.txt"));
-        assert!(requests[3].starts_with("DELETE /bucket/source.txt"));
-        assert!(requests[3].contains("if-match: \"test\""));
+        assert!(requests[2].starts_with("HEAD /bucket/dest.txt"));
+        assert!(requests[3].starts_with("PUT /bucket/dest.txt"));
+        assert!(requests[4].starts_with("HEAD /bucket/source.txt"));
+        assert!(requests[5].starts_with("DELETE /bucket/source.txt"));
+        assert!(requests[5].contains("if-match: \"test\""));
         assert!(requests
             .iter()
             .all(|request| request.contains("Credential=TEST-A/")));
