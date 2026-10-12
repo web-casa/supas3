@@ -37,7 +37,7 @@ jobs:
           cache-bin: true
 
       - name: Install cargo-about
-        run: command -v cargo-about || cargo install --locked cargo-about@0.9.0
+        run: command -v cargo-about || cargo install --locked --features cli cargo-about@0.9.0
 
       - name: Generate the license list
         run: |
