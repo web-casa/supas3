@@ -397,8 +397,12 @@ mod tests {
         let mut plans = HashMap::from([("plan".into(), plan)]);
         assert!(take_plan(&mut plans, "plan", "b", true).is_err());
         assert!(take_plan(&mut plans, "plan", "a", false).is_err());
-        plans.get_mut("plan").unwrap().created = Instant::now() - Duration::from_secs(901);
-        assert!(take_plan(&mut plans, "plan", "a", true).is_err());
+        // `Instant` cannot go back past system start on Windows, so a machine
+        // that booted under 15 minutes ago cannot build a stale plan.
+        if let Some(stale) = Instant::now().checked_sub(Duration::from_secs(901)) {
+            plans.get_mut("plan").unwrap().created = stale;
+            assert!(take_plan(&mut plans, "plan", "a", true).is_err());
+        }
         plans.get_mut("plan").unwrap().created = Instant::now();
         assert!(take_plan(&mut plans, "plan", "a", true).is_ok());
         assert!(take_plan(&mut plans, "plan", "a", true).is_err());
