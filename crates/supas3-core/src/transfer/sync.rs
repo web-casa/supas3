@@ -310,6 +310,36 @@ pub async fn attributes(
     .map_err(|_| io_error("Checking destination attributes timed out"))?
 }
 
+/// Whether a write was refused because the service does not take ACL grant
+/// headers. AWS says so with its own code when a bucket disables ACLs. OSS
+/// answers `NotImplemented` and names the `x-amz-grant-*` header it refused
+/// in the response body; a `NotImplemented` about anything else is not this.
+/// The write is then repeated without the grants, under the same `If-Match`.
+pub(crate) fn rejects_acl_grants<E>(
+    error: &aws_sdk_s3::error::SdkError<E, aws_sdk_s3::config::http::HttpResponse>,
+) -> bool
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata,
+{
+    let code = error.as_service_error().and_then(|service| service.code());
+    let body = error
+        .raw_response()
+        .and_then(|response| response.body().bytes());
+    grants_refused(code, body)
+}
+
+fn grants_refused(code: Option<&str>, body: Option<&[u8]>) -> bool {
+    match code {
+        Some("AccessControlListNotSupported") => true,
+        Some("NotImplemented") => body.is_some_and(|body| {
+            String::from_utf8_lossy(body)
+                .to_ascii_lowercase()
+                .contains("x-amz-grant-")
+        }),
+        _ => false,
+    }
+}
+
 // Keep ordinary uploads untouched. Only sync replacements inherit destination attributes.
 macro_rules! apply_attributes {
     ($request:expr, $a:expr) => {{
@@ -361,6 +391,18 @@ pub fn apply_multipart(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn grant_headers_are_dropped_only_when_they_are_what_was_refused() {
+        let oss =
+            b"<Error><Code>NotImplemented</Code><Header>X-AMZ-GRANT-FULL-CONTROL</Header></Error>";
+        let other = b"<Error><Code>NotImplemented</Code><Header>x-amz-tagging</Header></Error>";
+        assert!(grants_refused(Some("AccessControlListNotSupported"), None));
+        assert!(grants_refused(Some("NotImplemented"), Some(oss)));
+        assert!(!grants_refused(Some("NotImplemented"), Some(other)));
+        assert!(!grants_refused(Some("NotImplemented"), None));
+        assert!(!grants_refused(Some("AccessDenied"), Some(oss)));
+        assert!(!grants_refused(None, Some(oss)));
+    }
     #[test]
     fn snapshot_write_failure_and_scan_deadline_are_errors() {
         struct FullDisk;

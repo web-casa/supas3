@@ -2,7 +2,8 @@
 //! One side of the workspace: a set of tabs, each showing a location.
 
 use crate::app_state::{AppBackend, Connections};
-use crate::entries_table::{DraggedEntries, EntriesDelegate, RowCommand};
+use crate::entries_table::{DraggedEntries, EntriesDelegate, RowAction, RowCommand};
+use crate::listing::Entry;
 use crate::listing::{Listing, LoadState, Page};
 use crate::location::{collapse, CrumbSlot, History, Location};
 use gpui_kit::component::breadcrumb::{Breadcrumb, BreadcrumbItem};
@@ -33,6 +34,10 @@ pub enum PaneEvent {
     FilesDropped(Vec<std::path::PathBuf>),
     /// Rows were dragged in from a pane.
     EntriesDropped(DraggedEntries),
+    /// Do something with this one row of the given location.
+    RowActionRequested(RowAction, Location, Entry),
+    /// Sync the local folder this pane shows to the other pane.
+    SyncRequested(Location),
 }
 
 struct PaneTab {
@@ -215,6 +220,9 @@ impl Pane {
             }
             RowCommand::Copy(rows) => cx.emit(PaneEvent::CopyRequested(rows)),
             RowCommand::Delete(rows) => cx.emit(PaneEvent::DeleteRequested(rows)),
+            RowCommand::One(action, location, entry) => {
+                cx.emit(PaneEvent::RowActionRequested(action, location, entry));
+            }
         }
     }
 
@@ -308,26 +316,27 @@ impl Pane {
         };
         let tab = &self.tabs[index];
         let current = tab.history.current();
-        let target = tab
-            .table
-            .read(cx)
-            .delegate()
-            .entry(row)
-            .filter(|entry| entry.opens_a_location())
-            .map(|entry| match (&entry.prefix, current) {
-                // A remote folder opens at the exact prefix the service gave.
-                (
-                    Some(prefix),
-                    Location::Objects {
-                        profile_id, bucket, ..
-                    },
-                ) => Location::objects(profile_id, bucket, prefix),
-                _ => current.child(&entry.name),
-            });
-        if let Some(target) = target {
-            self.active = index;
-            self.open(target, cx);
+        let Some(entry) = tab.table.read(cx).delegate().entry(row).cloned() else {
+            return;
+        };
+        if !entry.opens_a_location() {
+            // A file: show it.
+            let event = PaneEvent::RowActionRequested(RowAction::Open, current.clone(), entry);
+            cx.emit(event);
+            return;
         }
+        let target = match (&entry.prefix, current) {
+            // A remote folder opens at the exact prefix the service gave.
+            (
+                Some(prefix),
+                Location::Objects {
+                    profile_id, bucket, ..
+                },
+            ) => Location::objects(profile_id, bucket, prefix),
+            _ => current.child(&entry.name),
+        };
+        self.active = index;
+        self.open(target, cx);
     }
 
     /// Loads a tab's current location from the start.
@@ -731,6 +740,7 @@ impl Pane {
         } else {
             text
         };
+        let is_local = matches!(tab.history.current(), Location::Local(_));
         // The arrow points at the other pane.
         let copy_icon = if self.side == "left" {
             IconName::ArrowRight
@@ -759,6 +769,19 @@ impl Pane {
                         .xsmall()
                         .label(t!("action.load_more").into_owned())
                         .on_click(cx.listener(move |pane, _, _, cx| pane.load_more(id, cx))),
+                )
+            })
+            .when(is_local, |this| {
+                this.child(
+                    Button::new(self.id("sync"))
+                        .ghost()
+                        .xsmall()
+                        .label(t!("action.sync_ellipsis").into_owned())
+                        .tooltip(t!("sync.button_hint").into_owned())
+                        .on_click(cx.listener(|pane, _, _, cx| {
+                            let location = pane.location().clone();
+                            cx.emit(PaneEvent::SyncRequested(location));
+                        })),
                 )
             })
             .child(

@@ -4,7 +4,7 @@ use crate::host::{AppHandle, Emitter};
 use crate::s3::{
     plan_multipart_upload, MultipartUploadGuard, S3ClientManager, MULTIPART_UPLOAD_THRESHOLD,
 };
-use aws_sdk_s3::error::{DisplayErrorContext, ProvideErrorMetadata};
+use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
@@ -827,10 +827,11 @@ impl TransferManager {
             };
             let send = async {
                 let result = request.send().await;
-                if result.as_ref().err().is_some_and(|e| {
-                    e.as_service_error().and_then(|s| s.code())
-                        == Some("AccessControlListNotSupported")
-                }) && attributes.as_ref().is_some_and(|a| a.acl.is_some())
+                if result
+                    .as_ref()
+                    .err()
+                    .is_some_and(super::sync::rejects_acl_grants)
+                    && attributes.as_ref().is_some_and(|a| a.acl.is_some())
                 {
                     // Explicit bucket-owner-enforced rejection: retry without ACL grants,
                     // preserving the same If-Match and every other object attribute.
@@ -890,9 +891,11 @@ impl TransferManager {
         }
         let create_send = async {
             let result = create_request.clone().send().await;
-            if result.as_ref().err().is_some_and(|e| {
-                e.as_service_error().and_then(|s| s.code()) == Some("AccessControlListNotSupported")
-            }) && attributes.is_some_and(|a| a.acl.is_some())
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(super::sync::rejects_acl_grants)
+                && attributes.is_some_and(|a| a.acl.is_some())
             {
                 create_request
                     .set_grant_full_control(None)

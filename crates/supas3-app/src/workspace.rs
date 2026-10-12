@@ -4,14 +4,22 @@
 use crate::app_state::{AppBackend, Connections};
 use crate::backend::default_config_dir;
 use crate::connection_form::{ConnectionForm, ConnectionFormEvent};
+use crate::entries_table::RowAction;
 use crate::i18n;
 use crate::listing::Entry;
 use crate::location::Location;
+use crate::object_actions::{
+    file_of, link_may_expire_early, plain_address_is_known, sync_pair, FileRef,
+};
+use crate::object_view::{ObjectView, ObjectViewEvent};
 use crate::pane::{Pane, PaneEvent};
 use crate::settings::{Appearance, Language, Settings};
+use crate::share_view::ShareView;
+use crate::sync_view::SyncView;
 use crate::task_center::{TaskCenter, TaskCenterEvent};
 use crate::tasks::EventQueue;
 use crate::transfer_plan::{plan, plan_deletion, plan_drop, Deletion, Plan};
+use crate::versions_view::VersionsView;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::NotificationType;
@@ -220,6 +228,13 @@ impl Workspace {
             PaneEvent::DeleteRequested(taken) => {
                 self.confirm_delete_rows(&taken.source, &taken.entries, window, cx);
             }
+            PaneEvent::RowActionRequested(RowAction::Sync, source, entry) => {
+                self.show_sync(side, source, Some(&entry.name), window, cx);
+            }
+            PaneEvent::RowActionRequested(action, source, entry) => {
+                self.show_file(*action, source, entry, window, cx);
+            }
+            PaneEvent::SyncRequested(source) => self.show_sync(side, source, None, window, cx),
         }
     }
 
@@ -481,6 +496,148 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// Opens the dialog for one file: its content, its links or its history.
+    fn show_file(
+        &mut self,
+        action: RowAction,
+        source: &Location,
+        entry: &Entry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(file) = file_of(source, entry) else {
+            return;
+        };
+        let name: SharedString = entry.name.clone().into();
+        let Some(object) = file.remote().cloned() else {
+            // A local file: nothing to ask the backend first.
+            if action == RowAction::Open {
+                self.open_object_view(file, entry, source, true, window, cx);
+            }
+            return;
+        };
+        if action == RowAction::Versions {
+            let view = cx.new(|cx| VersionsView::new(object, cx));
+            let title: SharedString = t!("versions.title", name = name).into_owned().into();
+            let width = rems(46.).to_pixels(window.rem_size());
+            window.open_dialog(cx, move |dialog, _, _| {
+                dialog.title(title.clone()).width(width).child(view.clone())
+            });
+            return;
+        }
+        let Some(requests) = AppBackend::requests(cx) else {
+            let message = t!("error.backend_stopped").into_owned();
+            Self::notify(NotificationType::Error, message, window, cx);
+            return;
+        };
+        let profile = self.connections.read(cx).get(&object.profile_id).cloned();
+        let (entry, source) = (entry.clone(), source.clone());
+        // What is said about saving and addresses depends on the client the
+        // backend actually builds, which may have taken an endpoint from the
+        // environment. Without an answer, assume the less convenient case.
+        cx.spawn_in(window, async move |workspace, cx| {
+            let traits = requests.write_traits(object.profile_id.clone()).await.ok();
+            let _ = workspace.update_in(cx, |workspace, window, cx| match action {
+                RowAction::Open => {
+                    let guarded = traits.is_some_and(|traits| traits.refuses_changed_saves);
+                    workspace.open_object_view(file, &entry, &source, guarded, window, cx);
+                }
+                RowAction::Share => {
+                    let early = profile.as_ref().is_none_or(link_may_expire_early);
+                    let plain = match (&profile, traits) {
+                        (Some(profile), Some(traits)) => {
+                            plain_address_is_known(profile, traits.custom_endpoint)
+                        }
+                        _ => false,
+                    };
+                    let view = cx.new(|cx| ShareView::new(object, early, plain, cx));
+                    let title: SharedString = t!("share.title", name = name).into_owned().into();
+                    let width = rems(36.).to_pixels(window.rem_size());
+                    window.open_dialog(cx, move |dialog, _, _| {
+                        dialog.title(title.clone()).width(width).child(view.clone())
+                    });
+                }
+                _ => {}
+            });
+        })
+        .detach();
+    }
+
+    fn open_object_view(
+        &mut self,
+        file: FileRef,
+        entry: &Entry,
+        source: &Location,
+        guarded: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name: SharedString = entry.name.clone().into();
+        let width = rems(46.).to_pixels(window.rem_size());
+        let view = cx.new(|cx| ObjectView::new(file, &entry.name, entry.size, guarded, window, cx));
+        let changed = source.clone();
+        cx.subscribe(&view, move |workspace, _, event, cx| match event {
+            ObjectViewEvent::Saved => {
+                for pane in [workspace.left.clone(), workspace.right.clone()] {
+                    pane.update(cx, |pane, cx| {
+                        pane.location_changed(Some(&changed), false, cx)
+                    });
+                }
+            }
+        })
+        .detach();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            // Unsaved edits and a save in flight are not lost to a stray
+            // Escape, Enter or click; the view's own Close button asks first.
+            let held = view.read(cx).holds_work(cx);
+            dialog
+                .title(name.clone())
+                .width(width)
+                .keyboard(!held)
+                .overlay_closable(!held)
+                .close_button(!held)
+                .on_ok(|_, _, _| false)
+                .child(view.clone())
+        });
+    }
+
+    /// Opens the dialog that syncs a local folder to what the other pane
+    /// shows, or says why that cannot be done.
+    fn show_sync(
+        &mut self,
+        side: Side,
+        source: &Location,
+        folder: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.pane(Self::other(side)).read(cx).location().clone();
+        let pair = match sync_pair(source, folder, &target) {
+            Ok(pair) => pair,
+            Err(refusal) => {
+                let message = t!(refusal.message_key()).into_owned();
+                Self::notify(NotificationType::Info, message, window, cx);
+                return;
+            }
+        };
+        let view = cx.new(|cx| SyncView::new(pair, cx));
+        let title: SharedString = t!("sync.title").into_owned().into();
+        let width = rems(40.).to_pixels(window.rem_size());
+        window.open_dialog(cx, move |dialog, _, _| {
+            let enter = view.clone();
+            dialog
+                .title(title.clone())
+                .width(width)
+                // Enter starts the sync when it may start, and never closes
+                // the comparison by itself.
+                .on_ok(move |_, window, cx| {
+                    enter.update(cx, |view, cx| view.start(window, cx));
+                    false
+                })
+                .child(view.clone())
+        });
     }
 
     fn open_in_active(&mut self, location: Location, cx: &mut Context<Self>) {

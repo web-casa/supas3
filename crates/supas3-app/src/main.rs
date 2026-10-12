@@ -12,11 +12,16 @@ mod entries_table;
 mod i18n;
 mod listing;
 mod location;
+mod object_actions;
+mod object_view;
 mod pane;
 mod settings;
+mod share_view;
+mod sync_view;
 mod task_center;
 mod tasks;
 mod transfer_plan;
+mod versions_view;
 mod workspace;
 
 use app_state::AppBackend;

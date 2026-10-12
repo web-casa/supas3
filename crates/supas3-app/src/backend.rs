@@ -4,6 +4,7 @@
 
 use crate::listing::{display_order, Entry, EntryKind, Page};
 use crate::location::Location;
+use crate::object_actions::{FileRef, ObjectRef, SyncPair, IMAGE_LIMIT, TEXT_LIMIT};
 use crate::transfer_plan::{Deletion, Plan};
 use anyhow::{Context as _, Result};
 use std::future::Future;
@@ -12,9 +13,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use supas3_core::commands::cross_copy::{self, CopyItem};
-use supas3_core::commands::{buckets, objects, operations, profiles, transfer};
+use supas3_core::commands::sync::Preview as SyncPreview;
+use supas3_core::commands::{
+    buckets, objects, operations, preview, profiles, sync, transfer, urls, versions,
+};
 use supas3_core::credentials::{with_profile, Profile};
 use supas3_core::host::EventSink;
+use supas3_core::s3::versions::{Cursor, History};
+use supas3_core::s3::WriteTraits;
+use supas3_core::transfer::controls::SyncOptions;
 use supas3_core::transfer::TransferJob;
 use supas3_core::{Core, CoreOptions};
 
@@ -92,6 +99,53 @@ pub fn default_config_dir() -> Result<PathBuf> {
     Ok(dirs::config_dir()
         .context("this system does not report a configuration directory")?
         .join("supas3"))
+}
+
+/// Text read for viewing or editing.
+#[derive(Debug, Clone)]
+pub struct TextContent {
+    pub content: String,
+    /// What the object must still have for an edit to be saved. `None` for
+    /// local files and for services that report no ETag.
+    pub etag: Option<String>,
+}
+
+/// Reads a local file of at most `limit` bytes.
+fn read_local(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    // One byte over the limit is enough to know the file is too large,
+    // however large it has become since it was listed.
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > limit {
+        return Err(format!("The file is larger than {limit} bytes."));
+    }
+    Ok(bytes)
+}
+
+/// The region a bucket is in, falling back to the connection's own region.
+async fn bucket_region(core: &Arc<Core>, profile_id: &str, bucket: &str) -> String {
+    let known = with_profile(
+        profile_id.to_string(),
+        buckets::get_bucket_region(bucket.to_string(), core.profiles(), core.s3()),
+    )
+    .await;
+    if let Ok(region) = known {
+        return region;
+    }
+    profiles::list_profiles(core.profiles())
+        .await
+        .ok()
+        .and_then(|profiles| {
+            profiles
+                .into_iter()
+                .find(|profile| profile.id == profile_id)
+                .and_then(|profile| profile.region)
+        })
+        .unwrap_or_else(|| "us-east-1".to_string())
 }
 
 /// Sends requests to the backend. Cheap to clone; every request runs on the
@@ -472,6 +526,332 @@ impl Requests {
             transfer::remove_transfer(id, core.transfers())
                 .await
                 .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// How a connection's client writes: whether it uses a custom endpoint
+    /// and whether the service refuses a save over a changed object.
+    pub async fn write_traits(&self, profile_id: String) -> Result<WriteTraits, String> {
+        self.run(move |core| async move {
+            with_profile(
+                profile_id.clone(),
+                preview::connection_write_traits(profile_id, core.profiles(), core.s3()),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Reads a text file or object, refusing one over `TEXT_LIMIT` or one
+    /// that is not UTF-8 text.
+    pub async fn read_text(&self, file: FileRef) -> Result<TextContent, String> {
+        match file {
+            FileRef::Local(_) if self.closing.load(Ordering::Acquire) => Err(CLOSING.to_string()),
+            FileRef::Local(path) => self
+                .runtime
+                .spawn_blocking(move || {
+                    let bytes = read_local(&path, TEXT_LIMIT)?;
+                    let content = String::from_utf8(bytes)
+                        .map_err(|_| "This file is not readable as UTF-8 text.".to_string())?;
+                    Ok(TextContent {
+                        content,
+                        etag: None,
+                    })
+                })
+                .await
+                .map_err(|error| format!("The request was interrupted: {error}"))?,
+            FileRef::Remote(object) => {
+                self.run(move |core| async move {
+                    let ObjectRef {
+                        profile_id,
+                        bucket,
+                        key,
+                    } = object;
+                    let text = with_profile(
+                        profile_id.clone(),
+                        objects::get_object_content(
+                            bucket,
+                            None,
+                            key,
+                            Some(TEXT_LIMIT),
+                            profile_id,
+                            core.profiles(),
+                            core.s3(),
+                        ),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    Ok(TextContent {
+                        content: text.content,
+                        etag: text.e_tag,
+                    })
+                })
+                .await
+            }
+        }
+    }
+
+    /// Saves edited text over an object, only if the object still has the
+    /// ETag it was read with. Returns the new ETag.
+    pub async fn save_text(
+        &self,
+        object: ObjectRef,
+        content: String,
+        etag: String,
+    ) -> Result<Option<String>, String> {
+        self.run(move |core| async move {
+            let ObjectRef {
+                profile_id,
+                bucket,
+                key,
+            } = object;
+            with_profile(
+                profile_id.clone(),
+                objects::put_object_content(
+                    bucket,
+                    None,
+                    key,
+                    content,
+                    etag,
+                    profile_id,
+                    core.profiles(),
+                    core.s3(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Reads the bytes of an image no larger than `IMAGE_LIMIT`.
+    pub async fn read_image(&self, file: FileRef) -> Result<Vec<u8>, String> {
+        match file {
+            FileRef::Local(_) if self.closing.load(Ordering::Acquire) => Err(CLOSING.to_string()),
+            FileRef::Local(path) => self
+                .runtime
+                .spawn_blocking(move || read_local(&path, IMAGE_LIMIT))
+                .await
+                .map_err(|error| format!("The request was interrupted: {error}"))?,
+            FileRef::Remote(object) => {
+                self.run(move |core| async move {
+                    let ObjectRef {
+                        profile_id,
+                        bucket,
+                        key,
+                    } = object;
+                    with_profile(
+                        profile_id.clone(),
+                        preview::get_object_bytes(
+                            bucket,
+                            None,
+                            key,
+                            IMAGE_LIMIT,
+                            profile_id,
+                            core.profiles(),
+                            core.s3(),
+                        ),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                })
+                .await
+            }
+        }
+    }
+
+    /// A link that lets anyone holding it download the object until it
+    /// expires. Never log the result: it carries a signature.
+    pub async fn signed_link(&self, object: ObjectRef, seconds: u64) -> Result<String, String> {
+        self.run(move |core| async move {
+            let ObjectRef {
+                profile_id,
+                bucket,
+                key,
+            } = object;
+            with_profile(
+                profile_id.clone(),
+                objects::get_presigned_url(
+                    bucket,
+                    None,
+                    key,
+                    seconds,
+                    profile_id,
+                    core.profiles(),
+                    core.s3(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// The object's plain address, which works only if the object can be
+    /// read without credentials.
+    pub async fn plain_link(&self, object: ObjectRef) -> Result<String, String> {
+        self.run(move |core| async move {
+            let ObjectRef {
+                profile_id,
+                bucket,
+                key,
+            } = object;
+            let region = bucket_region(&core, &profile_id, &bucket).await;
+            let links = with_profile(
+                profile_id.clone(),
+                urls::get_public_urls(
+                    bucket,
+                    Some(region),
+                    vec![key],
+                    None,
+                    profile_id,
+                    core.profiles(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            links
+                .into_iter()
+                .next()
+                .ok_or_else(|| "The service returned no link.".to_string())
+        })
+        .await
+    }
+
+    /// One page of an object's version history.
+    pub async fn versions(
+        &self,
+        object: ObjectRef,
+        cursor: Option<Cursor>,
+    ) -> Result<History, String> {
+        self.run(move |core| async move {
+            let ObjectRef {
+                profile_id,
+                bucket,
+                key,
+            } = object;
+            let region = bucket_region(&core, &profile_id, &bucket).await;
+            with_profile(
+                profile_id.clone(),
+                versions::list_object_versions(
+                    bucket,
+                    region,
+                    key,
+                    cursor,
+                    profile_id,
+                    core.profiles(),
+                    core.s3(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Queues a transfer that makes an older version the current one, as
+    /// long as `current_version` is still the latest. Returns the job's id.
+    pub async fn restore_version(
+        &self,
+        object: ObjectRef,
+        version_id: String,
+        current_version: String,
+    ) -> Result<String, String> {
+        self.run(move |core| async move {
+            let ObjectRef {
+                profile_id,
+                bucket,
+                key,
+            } = object;
+            let region = bucket_region(&core, &profile_id, &bucket).await;
+            with_profile(
+                profile_id.clone(),
+                versions::restore_object_version(
+                    bucket,
+                    region,
+                    key,
+                    version_id,
+                    current_version,
+                    true,
+                    profile_id,
+                    core.profiles(),
+                    core.s3(),
+                    core.transfers(),
+                    core.app(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Compares a local folder with a prefix and keeps the result as a plan
+    /// that `start_sync` can carry out for a limited time.
+    pub async fn compare_for_sync(
+        &self,
+        pair: SyncPair,
+        skip_existing: bool,
+    ) -> Result<SyncPreview, String> {
+        self.run(move |core| async move {
+            let SyncPair {
+                local,
+                profile_id,
+                bucket,
+                prefix,
+            } = pair;
+            let region = bucket_region(&core, &profile_id, &bucket).await;
+            let options = SyncOptions {
+                skip_existing,
+                ..Default::default()
+            };
+            with_profile(
+                profile_id.clone(),
+                sync::preview_folder_sync(
+                    local.to_string_lossy().into_owned(),
+                    bucket,
+                    Some(region),
+                    prefix,
+                    profile_id,
+                    Some(options),
+                    core.profiles(),
+                    core.s3(),
+                    core.sync_plans(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Queues the uploads of a compared plan. `replace_existing` is the
+    /// user's agreement to replace objects that differ. Returns how many
+    /// uploads were queued.
+    pub async fn start_sync(
+        &self,
+        profile_id: String,
+        plan_id: String,
+        replace_existing: bool,
+    ) -> Result<usize, String> {
+        self.run(move |core| async move {
+            with_profile(
+                profile_id.clone(),
+                sync::start_folder_sync(
+                    plan_id,
+                    replace_existing,
+                    profile_id,
+                    core.profiles(),
+                    core.s3(),
+                    core.transfers(),
+                    core.sync_plans(),
+                    core.app(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())
         })
         .await
     }
@@ -1071,6 +1451,388 @@ mod tests {
             for id in [one.id, two.id] {
                 let _ = requests.delete_profile(id).await;
             }
+            steps
+        });
+        drop(backend);
+        let _ = std::fs::remove_dir_all(config);
+        let _ = std::fs::remove_dir_all(work);
+
+        for (step, result) in &report {
+            println!("{step}: {}", if result.is_ok() { "ok" } else { "FAILED" });
+        }
+        let failed: Vec<_> = report
+            .iter()
+            .filter(|(_, result)| result.is_err())
+            .collect();
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    /// Runs what the object dialogs do against real storage: read and save
+    /// text, refuse a stale save, read an image, make links and fetch through
+    /// the signed one, list versions, and sync a folder twice.
+    ///
+    /// Uses the SUPAS3_PANE1_* variables of the paging test.
+    #[test]
+    #[ignore]
+    fn object_actions_work_end_to_end_on_real_storage() {
+        use crate::connection::{Draft, Service};
+        use crate::listing::Entry;
+        use crate::object_actions::{sync_pair, FileRef, ObjectRef};
+        use crate::tasks::{EventQueue, Tasks};
+        use crate::transfer_plan::{plan, plan_deletion};
+        let key = |field: &str| {
+            let name = format!("SUPAS3_PANE1_{field}");
+            std::env::var(&name).unwrap_or_else(|_| panic!("{name} is required"))
+        };
+        let service = match key("SERVICE").as_str() {
+            "oss" => Service::Oss,
+            "cos" => Service::Cos,
+            "obs" => Service::Obs,
+            _ => Service::Generic,
+        };
+        let draft = Draft {
+            name: "objects".into(),
+            region: key("REGION"),
+            endpoint: key("ENDPOINT"),
+            access_key: key("ACCESS_KEY"),
+            secret_key: key("SECRET_KEY"),
+            bucket: key("BUCKET"),
+            ..Draft::new(service)
+        };
+        // The smallest PNG: one transparent pixel.
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let config = test_dir("objects");
+        let work = test_dir("objects-data");
+        std::fs::create_dir_all(work.join("in")).unwrap();
+        std::fs::write(work.join("in/notes.md"), "first 文本\n").unwrap();
+        std::fs::write(work.join("in/dot.png"), PNG).unwrap();
+        std::fs::create_dir_all(work.join("site/css")).unwrap();
+        std::fs::write(work.join("site/index.html"), b"<p>one</p>").unwrap();
+        std::fs::write(work.join("site/css/main.css"), b"p{}").unwrap();
+
+        let queue = std::sync::Arc::new(EventQueue::default());
+        let backend = Backend::start(config.clone(), queue.sink()).unwrap();
+        let requests = backend.requests().unwrap();
+        let run = format!("supas3-ui-objects/{}/", std::process::id());
+
+        let report = futures_lite(async {
+            let mut steps: Vec<(&str, Result<(), String>)> = Vec::new();
+            let profile = requests
+                .save_profile(draft.to_profile(None), false)
+                .await
+                .unwrap();
+            let here = Location::objects(&profile.id, &draft.bucket, &run);
+            let local_in = Location::Local(work.join("in"));
+            let object = |name: &str| ObjectRef {
+                profile_id: profile.id.clone(),
+                bucket: draft.bucket.clone(),
+                key: format!("{run}{name}"),
+            };
+            let settle = || async {
+                let mut tasks = Tasks::default();
+                for _ in 0..600 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    tasks.merge_snapshot(&requests.transfers().await?);
+                    if tasks.counts().active == 0 {
+                        let failed: Vec<String> = tasks
+                            .list(crate::tasks::TaskFilter::Failed)
+                            .iter()
+                            .map(|task| format!("{}: {:?}", task.name, task.state))
+                            .collect();
+                        return if failed.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(failed.join("; "))
+                        };
+                    }
+                }
+                Err("transfers did not finish within two minutes".to_string())
+            };
+            let check = |ok: bool, detail: String| if ok { Ok(()) } else { Err(detail) };
+
+            let selection = requests
+                .list(local_in.clone(), None, true)
+                .await
+                .unwrap()
+                .entries;
+            let uploaded = requests
+                .execute(plan(&local_in, &selection, &here).unwrap())
+                .await;
+            steps.push(("queue upload", uploaded.map(|_| ())));
+            steps.push(("upload finishes", settle().await));
+
+            let traits = requests.write_traits(profile.id.clone()).await;
+            steps.push((
+                "the client is known to use a custom endpoint",
+                match traits {
+                    Ok(traits) if traits.custom_endpoint && !traits.refuses_changed_saves => Ok(()),
+                    other => Err(format!("{other:?}")),
+                },
+            ));
+
+            // Text: read, save, read again, and refuse a save with an old tag.
+            let notes = FileRef::Remote(object("notes.md"));
+            let first = requests.read_text(notes.clone()).await;
+            steps.push((
+                "read text",
+                match &first {
+                    Ok(text) if text.content == "first 文本\n" && text.etag.is_some() => Ok(()),
+                    other => Err(format!("{other:?}")),
+                },
+            ));
+            let old_tag = first.ok().and_then(|text| text.etag).unwrap_or_default();
+            let saved = requests
+                .save_text(object("notes.md"), "second 文本\n".into(), old_tag.clone())
+                .await;
+            steps.push(("save text", saved.clone().map(|_| ())));
+            let again = requests.read_text(notes.clone()).await;
+            steps.push((
+                "saved text is read back",
+                match &again {
+                    Ok(text) if text.content == "second 文本\n" => Ok(()),
+                    other => Err(format!("{other:?}")),
+                },
+            ));
+            let stale = requests
+                .save_text(object("notes.md"), "third\n".into(), old_tag)
+                .await;
+            steps.push((
+                "a save with an old tag is refused",
+                check(stale.is_err(), format!("{stale:?}")),
+            ));
+            let kept = requests.read_text(notes).await;
+            steps.push((
+                "the refused save changed nothing",
+                match &kept {
+                    Ok(text) if text.content == "second 文本\n" => Ok(()),
+                    other => Err(format!("{other:?}")),
+                },
+            ));
+            let local_text = requests
+                .read_text(FileRef::Local(work.join("in/notes.md")))
+                .await;
+            steps.push((
+                "read local text",
+                match &local_text {
+                    Ok(text) if text.content == "first 文本\n" && text.etag.is_none() => Ok(()),
+                    other => Err(format!("{other:?}")),
+                },
+            ));
+
+            // Image bytes, remote and local.
+            let image = requests
+                .read_image(FileRef::Remote(object("dot.png")))
+                .await;
+            steps.push((
+                "read image",
+                check(image.as_deref() == Ok(PNG), "bytes differ".into()),
+            ));
+            let local_image = requests
+                .read_image(FileRef::Local(work.join("in/dot.png")))
+                .await;
+            steps.push((
+                "read local image",
+                check(local_image.as_deref() == Ok(PNG), "bytes differ".into()),
+            ));
+
+            // Links: the signed one must fetch the content without credentials.
+            let signed = requests.signed_link(object("notes.md"), 3600).await;
+            let fetched = match &signed {
+                Ok(link) => std::process::Command::new("curl")
+                    .args(["-fsS", "--max-time", "30", link])
+                    .output()
+                    .map_err(|error| error.to_string())
+                    .and_then(|output| {
+                        if output.stdout == "second 文本\n".as_bytes() {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "status {:?}, {} bytes",
+                                output.status.code(),
+                                output.stdout.len()
+                            ))
+                        }
+                    }),
+                Err(error) => Err(error.clone()),
+            };
+            steps.push(("signed link fetches the content", fetched));
+            let plain = requests.plain_link(object("notes.md")).await;
+            steps.push((
+                "plain address",
+                match &plain {
+                    Ok(link) if link.starts_with("http") && link.ends_with("notes.md") => Ok(()),
+                    other => Err(format!("{other:?}")),
+                },
+            ));
+
+            // Versions: a list with the current version, or a clear refusal
+            // from a service without versioning.
+            let history = requests.versions(object("notes.md"), None).await;
+            steps.push((
+                "version history",
+                match &history {
+                    Ok(history) => {
+                        println!(
+                            "versioning {:?}, {} versions",
+                            history.versioning,
+                            history.versions.len()
+                        );
+                        check(
+                            history.versions.iter().any(|version| version.is_latest),
+                            "no current version listed".into(),
+                        )
+                    }
+                    Err(error)
+                        if ["NotImplemented", "501", "AccessDenied"]
+                            .iter()
+                            .any(|refusal| error.contains(refusal)) =>
+                    {
+                        println!("versions unsupported: {error}");
+                        Ok(())
+                    }
+                    Err(error) => Err(error.clone()),
+                },
+            ));
+
+            // Sync: everything is new, then nothing is, then one file changed.
+            let target = here.child("site");
+            let pair = sync_pair(&Location::Local(work.clone()), Some("site"), &here).unwrap();
+            let compared = requests.compare_for_sync(pair.clone(), false).await;
+            steps.push((
+                "first comparison finds two new files",
+                match &compared {
+                    Ok(preview) if preview.new_files == 2 && preview.changed_files == 0 => Ok(()),
+                    Ok(preview) => Err(format!(
+                        "new {}, changed {}",
+                        preview.new_files, preview.changed_files
+                    )),
+                    Err(error) => Err(error.clone()),
+                },
+            ));
+            if let Ok(preview) = compared {
+                let started = requests
+                    .start_sync(profile.id.clone(), preview.id.clone(), false)
+                    .await;
+                steps.push((
+                    "sync queues two uploads",
+                    check(started == Ok(2), format!("{started:?}")),
+                ));
+                steps.push(("sync finishes", settle().await));
+                let reused = requests
+                    .start_sync(profile.id.clone(), preview.id, false)
+                    .await;
+                steps.push((
+                    "a plan cannot be used twice",
+                    check(reused.is_err(), format!("{reused:?}")),
+                ));
+            }
+            let synced = requests.list(target.child("css"), None, true).await;
+            steps.push((
+                "synced files keep their folders",
+                match synced {
+                    Ok(page) if page.entries.len() == 1 && page.entries[0].name == "main.css" => {
+                        Ok(())
+                    }
+                    other => Err(format!("{other:?}")),
+                },
+            ));
+            let second = requests.compare_for_sync(pair.clone(), false).await;
+            steps.push((
+                "second comparison finds nothing to upload",
+                match &second {
+                    Ok(preview)
+                        if preview.new_files == 0
+                            && preview.changed_files + preview.unverified_files == 0
+                            && preview.unchanged_files == 2 =>
+                    {
+                        Ok(())
+                    }
+                    Ok(preview) => Err(format!(
+                        "new {}, changed {}, unverified {}, unchanged {}",
+                        preview.new_files,
+                        preview.changed_files,
+                        preview.unverified_files,
+                        preview.unchanged_files
+                    )),
+                    Err(error) => Err(error.clone()),
+                },
+            ));
+            std::fs::write(work.join("site/index.html"), b"<p>two, longer</p>").unwrap();
+            let third = requests.compare_for_sync(pair.clone(), false).await;
+            steps.push((
+                "a changed file is found",
+                match &third {
+                    Ok(preview) if preview.changed_files + preview.unverified_files == 1 => Ok(()),
+                    Ok(preview) => Err(format!(
+                        "changed {}, unverified {}",
+                        preview.changed_files, preview.unverified_files
+                    )),
+                    Err(error) => Err(error.clone()),
+                },
+            ));
+            if let Ok(preview) = third {
+                let refused = requests
+                    .start_sync(profile.id.clone(), preview.id.clone(), false)
+                    .await;
+                steps.push((
+                    "replacing without agreement is refused",
+                    check(refused.is_err(), format!("{refused:?}")),
+                ));
+                let agreed = requests
+                    .start_sync(profile.id.clone(), preview.id, true)
+                    .await;
+                steps.push((
+                    "replacing with agreement is queued",
+                    check(agreed == Ok(1), format!("{agreed:?}")),
+                ));
+                steps.push(("replacement finishes", settle().await));
+                let replaced = requests
+                    .read_text(FileRef::Remote(object("site/index.html")))
+                    .await;
+                steps.push((
+                    "the object holds the new content",
+                    match &replaced {
+                        Ok(text) if text.content == "<p>two, longer</p>" => Ok(()),
+                        other => Err(format!("{other:?}")),
+                    },
+                ));
+            }
+            let skipping = requests.compare_for_sync(pair, true).await;
+            steps.push((
+                "skipping existing files uploads nothing",
+                match &skipping {
+                    Ok(preview) if preview.skipped_files == 2 && preview.new_files == 0 => Ok(()),
+                    Ok(preview) => Err(format!(
+                        "skipped {}, new {}",
+                        preview.skipped_files, preview.new_files
+                    )),
+                    Err(error) => Err(error.clone()),
+                },
+            ));
+
+            // Remove what this run created.
+            let parent = here.parent().unwrap();
+            let rows = requests
+                .list(parent.clone(), None, true)
+                .await
+                .unwrap_or_default()
+                .entries;
+            let own: Vec<Entry> = rows
+                .into_iter()
+                .filter(|entry| entry.prefix.as_deref() == Some(run.as_str()))
+                .collect();
+            let deleted = match plan_deletion(&parent, &own) {
+                Ok(deletion) => requests.delete(deletion).await.map(|_| ()),
+                Err(refusal) => Err(format!("{refusal:?}")),
+            };
+            steps.push(("delete", deleted));
+            let _ = requests.delete_profile(profile.id).await;
             steps
         });
         drop(backend);

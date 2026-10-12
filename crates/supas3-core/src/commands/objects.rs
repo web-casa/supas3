@@ -901,9 +901,9 @@ pub async fn get_presigned_url(
 
 #[derive(Serialize)]
 pub struct ObjectText {
-    content: String,
-    e_tag: Option<String>,
-    profile_id: String,
+    pub content: String,
+    pub e_tag: Option<String>,
+    pub profile_id: String,
 }
 
 pub async fn get_object_content(

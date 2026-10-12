@@ -21,6 +21,8 @@ gpui-kit = "=0.7.1"
 anyhow = "1"
 dirs = "5"
 env_logger = "0.11"
+# Reads an image's dimensions before it is decoded. Same crate GPUI decodes with.
+image = { version = "0.25", default-features = false }
 log = "0.4"
 rust-i18n = "4.2"
 serde = { version = "1.0", features = ["derive"] }

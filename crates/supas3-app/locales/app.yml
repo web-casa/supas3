@@ -415,3 +415,246 @@ copy.unsafe_local_name:
 copy.maybe_partial:
   en: Some items may already have been copied.
   zh-CN: 部分内容可能已经复制。
+action.close:
+  en: Close
+  zh-CN: 关闭
+action.refresh:
+  en: Refresh
+  zh-CN: 刷新
+action.open:
+  en: Open
+  zh-CN: 打开
+action.share_ellipsis:
+  en: Share link…
+  zh-CN: 分享链接…
+action.versions_ellipsis:
+  en: Version history…
+  zh-CN: 版本历史…
+action.sync_ellipsis:
+  en: Sync to other side…
+  zh-CN: 同步到另一侧…
+view.loading:
+  en: Loading…
+  zh-CN: 正在加载…
+view.unsupported:
+  en: This kind of file can’t be shown here. Copy it to this computer to open it.
+  zh-CN: 此类文件无法在这里显示。请复制到本机后打开。
+view.too_large:
+  en: "This file is larger than %{limit} and isn’t shown here. Copy it to this computer to open it."
+  zh-CN: "此文件超过 %{limit}，不在这里显示。请复制到本机后打开。"
+view.image_too_many_pixels:
+  en: This image has too many pixels to show here. Copy it to this computer to open it.
+  zh-CN: 此图片像素过多，无法在这里显示。请复制到本机后打开。
+view.image_unreadable:
+  en: This file can’t be read as an image.
+  zh-CN: 无法将此文件读取为图片。
+view.failed:
+  en: "Couldn’t open the file: %{detail}"
+  zh-CN: "无法打开文件：%{detail}"
+view.local_read_only:
+  en: Files on this computer are shown read-only.
+  zh-CN: 本机文件仅供查看，不能在这里编辑。
+view.no_etag:
+  en: The service didn’t report a version tag for this object, so it can’t be edited safely here. Reopen it to try again.
+  zh-CN: 服务没有返回此对象的版本标识，无法在这里安全编辑。请重新打开后再试。
+view.save_not_guarded:
+  en: This service can’t refuse a save when the object has changed. supaS3 checks before saving, but a change made between the check and the save is overwritten.
+  zh-CN: 此服务无法在对象已被修改时拒绝保存。supaS3 会在保存前检查，但检查与保存之间发生的修改会被覆盖。
+view.save_failed:
+  en: "Couldn’t save: %{detail}"
+  zh-CN: "保存失败：%{detail}"
+view.unsaved:
+  en: Unsaved changes
+  zh-CN: 有未保存的修改
+view.discard_question:
+  en: Discard unsaved changes?
+  zh-CN: 放弃未保存的修改？
+view.keep_editing:
+  en: Keep editing
+  zh-CN: 继续编辑
+view.discard:
+  en: Discard changes
+  zh-CN: 放弃修改
+share.title:
+  en: "Share “%{name}”"
+  zh-CN: "分享“%{name}”"
+share.signed_title:
+  en: Signed link
+  zh-CN: 签名链接
+share.signed_note:
+  en: Anyone with this link can download the object until the link expires. It can’t be withdrawn early.
+  zh-CN: 任何拿到此链接的人都能在到期前下载该对象，且无法提前撤回。
+share.expires_after:
+  en: Expires after
+  zh-CN: 有效期
+share.expiry_hour:
+  en: 1 hour
+  zh-CN: 1 小时
+share.expiry_day:
+  en: 1 day
+  zh-CN: 1 天
+share.expiry_week:
+  en: 7 days
+  zh-CN: 7 天
+share.early_expiry:
+  en: This connection may use temporary credentials. The link stops working when they expire, even if that is sooner.
+  zh-CN: 此连接可能使用临时凭据。凭据到期后链接即失效，即使早于所选有效期。
+share.plain_title:
+  en: Plain address
+  zh-CN: 直接地址
+share.plain_note:
+  en: Works only if the object can be read without signing in.
+  zh-CN: 仅当该对象允许匿名读取时可用。
+share.preparing:
+  en: Preparing…
+  zh-CN: 正在生成…
+share.failed:
+  en: "Couldn’t make the link: %{detail}"
+  zh-CN: "无法生成链接：%{detail}"
+share.copy:
+  en: Copy link
+  zh-CN: 复制链接
+share.copied:
+  en: Link copied
+  zh-CN: 已复制链接
+versions.title:
+  en: "Versions of “%{name}”"
+  zh-CN: "“%{name}”的版本"
+versions.status_enabled:
+  en: Versioning is on for this bucket.
+  zh-CN: 此存储桶已开启版本控制。
+versions.status_suspended:
+  en: Versioning is suspended for this bucket. Older versions are kept but can’t be restored here, because the write would replace the current content.
+  zh-CN: 此存储桶的版本控制已暂停。旧版本仍保留，但不能在这里恢复，因为写入会替换当前内容。
+versions.status_disabled:
+  en: Versioning is off for this bucket, so only the current content exists.
+  zh-CN: 此存储桶未开启版本控制，只有当前内容。
+versions.current:
+  en: Current
+  zh-CN: 当前
+versions.delete_marker:
+  en: Deleted
+  zh-CN: 已删除
+versions.none:
+  en: No versions found.
+  zh-CN: 没有找到版本。
+versions.loading:
+  en: Loading versions…
+  zh-CN: 正在加载版本…
+versions.failed:
+  en: "Couldn’t complete the request: %{detail}"
+  zh-CN: "请求未能完成：%{detail}"
+versions.restore_ellipsis:
+  en: Restore…
+  zh-CN: 恢复…
+versions.restore:
+  en: Restore
+  zh-CN: 恢复
+versions.restore_question:
+  en: Make this version the current one? The current content stays in the history.
+  zh-CN: 把此版本恢复为当前内容？现有内容会保留在历史中。
+versions.restore_queued:
+  en: Restore added to transfers
+  zh-CN: 已将恢复加入传输
+sync.title:
+  en: Sync folder to storage
+  zh-CN: 将文件夹同步到存储
+sync.button_hint:
+  en: Upload what is new or changed in this folder to the location on the other side
+  zh-CN: 把此文件夹中新增或有变化的文件上传到另一侧的位置
+sync.source_not_local:
+  en: Only a folder on this computer can be synced.
+  zh-CN: 只能同步本机上的文件夹。
+sync.target_not_in_bucket:
+  en: Open a bucket or a folder in a bucket on the other side first.
+  zh-CN: 请先在另一侧打开一个存储桶或其中的文件夹。
+sync.from:
+  en: From
+  zh-CN: 从
+sync.to:
+  en: To
+  zh-CN: 到
+sync.one_way_note:
+  en: Files are only uploaded. Nothing is deleted from storage, and nothing is downloaded.
+  zh-CN: 只上传文件。不会删除存储中的任何对象，也不会下载。
+sync.skip_existing:
+  en: Leave files that already exist in storage alone, without comparing them
+  zh-CN: 存储中已存在的文件一律不动，也不比较内容
+sync.not_compared:
+  en: Not compared yet.
+  zh-CN: 尚未比较。
+sync.comparing:
+  en: Comparing…
+  zh-CN: 正在比较…
+sync.compare_failed:
+  en: "Couldn’t compare: %{detail}"
+  zh-CN: "比较失败：%{detail}"
+sync.compare_again:
+  en: Compare again
+  zh-CN: 重新比较
+sync.count_new:
+  en: new, will be uploaded
+  zh-CN: 个新文件，将上传
+sync.count_changed:
+  en: changed, will replace the object in storage
+  zh-CN: 个有变化，将替换存储中的对象
+sync.count_unverified:
+  en: can’t be compared, will replace the object in storage
+  zh-CN: 个无法比较，将替换存储中的对象
+sync.count_unchanged:
+  en: unchanged, left alone
+  zh-CN: 个没有变化，不处理
+sync.count_skipped:
+  en: already in storage, left alone
+  zh-CN: 个已存在于存储中，不处理
+sync.count_remote_only:
+  en: only in storage, left alone
+  zh-CN: 个仅存在于存储中，不处理
+sync.upload_total:
+  en: "To upload: %{size}"
+  zh-CN: "待上传：%{size}"
+sync.nothing_to_upload:
+  en: Storage already has everything in this folder.
+  zh-CN: 存储中已包含此文件夹的全部内容。
+sync.more_not_listed:
+  en: "%{count} more not listed"
+  zh-CN: "另有 %{count} 个未列出"
+sync.action_new:
+  en: New
+  zh-CN: 新增
+sync.action_changed:
+  en: Replace
+  zh-CN: 替换
+sync.action_unverified:
+  en: Replace (unverified)
+  zh-CN: 替换（无法比较）
+sync.action_unchanged:
+  en: Unchanged
+  zh-CN: 无变化
+sync.action_skipped:
+  en: Skipped
+  zh-CN: 跳过
+sync.action_filtered:
+  en: Filtered out
+  zh-CN: 已过滤
+sync.action_other:
+  en: Other
+  zh-CN: 其他
+sync.agree_replace:
+  en: "Replace %{count} objects in storage with the files from this computer"
+  zh-CN: "用本机文件替换存储中的 %{count} 个对象"
+sync.start:
+  en: Start sync
+  zh-CN: 开始同步
+sync.started:
+  en: "%{count} uploads added to transfers"
+  zh-CN: "已将 %{count} 个上传加入传输"
+sync.start_failed:
+  en: "Couldn’t start the sync: %{detail}. Compare again."
+  zh-CN: "无法开始同步：%{detail}。请重新比较。"
+view.image_form_unsupported:
+  en: This form of WebP image (animated or with extra data) isn’t shown here. Copy it to this computer to open it.
+  zh-CN: 此类 WebP 图片（动画或带附加数据）不在这里显示。请复制到本机后打开。
+sync.nothing_with_options:
+  en: Nothing to upload with this option. Files already in storage were not compared and may differ.
+  zh-CN: 按当前选项没有需要上传的文件。存储中已存在的文件未做比较，内容可能不同。

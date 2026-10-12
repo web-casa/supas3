@@ -68,9 +68,10 @@ pub async fn page(
         .map_err(|e| AppError::S3Error(format!("Cannot list versions. Check ListBucketVersions permission and provider support: {}", DisplayErrorContext(&e))))?;
     let mut versions = Vec::new();
     for v in output.versions().iter().filter(|v| v.key() == Some(key)) {
+        let is_latest = v.is_latest().unwrap_or(false);
         versions.push(Version {
-            version_id: required_id(v.version_id())?,
-            is_latest: v.is_latest().unwrap_or(false),
+            version_id: current_or_required_id(v.version_id(), is_latest)?,
+            is_latest,
             is_delete_marker: false,
             size: v.size().and_then(|n| u64::try_from(n).ok()),
             modified: v.last_modified().map(ToString::to_string),
@@ -123,6 +124,17 @@ pub async fn page(
         None
     };
     Ok((versions, next))
+}
+/// COS lists the object of a bucket that never had versioning without any
+/// version id, where S3 says `null`. Only the current version may be named
+/// that way: it is never restored, and an older version without an id could
+/// not be told from another.
+fn current_or_required_id(id: Option<&str>, is_latest: bool) -> Result<String> {
+    match id.filter(|id| !id.is_empty()) {
+        Some(id) => Ok(id.to_owned()),
+        None if is_latest => Ok("null".to_owned()),
+        None => required_id(None),
+    }
 }
 fn required_id(id: Option<&str>) -> Result<String> {
     id.filter(|s| !s.is_empty())
@@ -200,6 +212,17 @@ mod tests {
         let requests = server.await.unwrap();
         assert!(requests[1].contains("version-id-marker=old%2B1"));
         assert!(requests.iter().all(|r| r.starts_with("GET ")));
+    }
+    #[tokio::test]
+    async fn only_the_current_version_may_lack_an_id() {
+        let current = "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>file</Key><IsLatest>true</IsLatest><Size>5</Size></Version></ListVersionsResult>";
+        let older = "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>file</Key><IsLatest>false</IsLatest><Size>5</Size></Version></ListVersionsResult>";
+        let (client, server) =
+            scripted_client(vec![response(200, "", current), response(200, "", older)]).await;
+        let (items, _) = page(&client, "bucket", "file", None, 100).await.unwrap();
+        assert_eq!(items[0].version_id, "null");
+        assert!(page(&client, "bucket", "file", None, 100).await.is_err());
+        assert_eq!(server.await.unwrap().len(), 2);
     }
     #[tokio::test]
     async fn malformed_or_repeated_history_cursors_fail() {

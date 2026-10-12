@@ -4,6 +4,7 @@ pub mod cross_copy;
 pub mod jobs;
 pub mod objects;
 pub mod operations;
+pub mod preview;
 pub mod profiles;
 pub mod sync;
 pub mod transfer;

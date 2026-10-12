@@ -93,6 +93,26 @@ impl Protection {
     }
 }
 
+/// What the interface needs to know about how a client writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteTraits {
+    /// The client talks to a custom endpoint, whether entered in the
+    /// connection or picked up from the environment or shared configuration.
+    pub custom_endpoint: bool,
+    /// The service itself refuses to save over an object that has changed.
+    /// Where it does not, the check and the write are two requests.
+    pub refuses_changed_saves: bool,
+}
+
+/// Reads the traits back from the client that will actually be used.
+pub fn write_traits(client: &Client) -> WriteTraits {
+    let protection = Protection::of(client);
+    WriteTraits {
+        custom_endpoint: protection != Protection::Native,
+        refuses_changed_saves: protection.enforces_if_match(Operation::Put),
+    }
+}
+
 /// Checks the destination before a write when the service cannot enforce the
 /// condition itself. `expected_etag` is `Some` when a known object is being
 /// replaced or removed, `None` when the object must not exist yet.
@@ -394,6 +414,13 @@ mod tests {
     async fn the_protection_is_read_back_from_the_client() {
         let (native, _) = client_with(None, vec![]).await;
         assert_eq!(Protection::of(&native), Protection::Native);
+        assert_eq!(
+            write_traits(&native),
+            WriteTraits {
+                custom_endpoint: false,
+                refuses_changed_saves: true,
+            }
+        );
         for guard in [
             WriteGuard::Conditional,
             WriteGuard::OssForbidOverwrite,
@@ -402,6 +429,14 @@ mod tests {
         ] {
             let (client, _) = client_with(Some(guard), vec![]).await;
             assert_eq!(Protection::of(&client), Protection::Custom(guard));
+            // No custom endpoint was measured to enforce `If-Match` on a save.
+            assert_eq!(
+                write_traits(&client),
+                WriteTraits {
+                    custom_endpoint: true,
+                    refuses_changed_saves: false,
+                }
+            );
         }
     }
 

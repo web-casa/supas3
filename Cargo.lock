@@ -7723,6 +7723,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "gpui-kit",
+ "image",
  "log",
  "rust-i18n",
  "serde",

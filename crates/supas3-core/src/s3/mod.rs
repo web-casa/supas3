@@ -1,6 +1,7 @@
 pub mod client;
 pub mod content_type;
 pub(crate) mod guard;
+pub use guard::WriteTraits;
 pub mod listing;
 pub mod multipart;
 pub mod versions;

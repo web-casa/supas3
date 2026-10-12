@@ -27,6 +27,21 @@ pub enum RowCommand {
     Copy(DraggedEntries),
     /// Delete these rows.
     Delete(DraggedEntries),
+    /// Something for one row alone, whatever else is marked.
+    One(RowAction, Location, Entry),
+}
+
+/// What can be asked for a single row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowAction {
+    /// Show the file, for editing where that is possible.
+    Open,
+    /// Make links to the object.
+    Share,
+    /// Show the object's version history.
+    Versions,
+    /// Sync the local folder to the other pane.
+    Sync,
 }
 
 /// Carries a row command to the owning pane.
@@ -265,6 +280,35 @@ impl TableDelegate for EntriesDelegate {
         let taken = self.taken(Some(row_ix));
         let (copy, delete) = (self.commands.clone(), self.commands.clone());
         let (copied, deleted) = (taken.clone(), taken);
+        // Actions for the row under the pointer alone.
+        let mut menu = menu;
+        if let Some(entry) = self.entries.get(row_ix) {
+            let remote = matches!(self.location, Location::Objects { .. });
+            let local = matches!(self.location, Location::Local(_));
+            let actions: &[(RowAction, &str)] = match entry.kind {
+                EntryKind::File if remote => &[
+                    (RowAction::Open, "action.open"),
+                    (RowAction::Share, "action.share_ellipsis"),
+                    (RowAction::Versions, "action.versions_ellipsis"),
+                ],
+                EntryKind::File => &[(RowAction::Open, "action.open")],
+                EntryKind::Folder if local => &[(RowAction::Sync, "action.sync_ellipsis")],
+                _ => &[],
+            };
+            for (action, label) in actions.iter().copied() {
+                let commands = self.commands.clone();
+                let (location, entry) = (self.location.clone(), entry.clone());
+                menu = menu.item(PopupMenuItem::new(t!(label).into_owned()).on_click(
+                    move |_, window, cx| {
+                        let command = RowCommand::One(action, location.clone(), entry.clone());
+                        commands(command, window, cx)
+                    },
+                ));
+            }
+            if !actions.is_empty() {
+                menu = menu.separator();
+            }
+        }
         menu.item(
             PopupMenuItem::new(t!("action.copy_to_other").into_owned())
                 .on_click(move |_, window, cx| copy(RowCommand::Copy(copied.clone()), window, cx)),
