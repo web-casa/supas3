@@ -200,9 +200,41 @@ jobs:
           test -f /usr/share/doc/supas3/THIRD_PARTY_LICENSES.txt
           grep -q 'Lucide Icons and Contributors' /usr/share/doc/supas3/LICENSES/Lucide-ISC.txt
 
+      # With a Developer ID certificate in the repository's secrets the app
+      # is signed with it, and a version tag is also notarized. Without one
+      # (forks, pull requests) the package is signed ad hoc as before.
       - name: Package (macOS)
         if: runner.os == 'macOS'
-        run: packaging/macos/package.sh target/release/supas3 THIRD_PARTY_LICENSES.txt dist
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          if [ -n "$APPLE_CERTIFICATE" ]; then
+            keychain=$RUNNER_TEMP/signing.keychain-db
+            keychain_password=$(uuidgen)
+            printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+            security create-keychain -p "$keychain_password" "$keychain"
+            security set-keychain-settings -lut 3600 "$keychain"
+            security unlock-keychain -p "$keychain_password" "$keychain"
+            security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" \
+              -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+            rm "$RUNNER_TEMP/certificate.p12"
+            security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
+            security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+            MACOS_SIGN_IDENTITY=$(security find-identity -v -p codesigning "$keychain" \
+              | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)
+            test -n "$MACOS_SIGN_IDENTITY" || { echo "the certificate holds no Developer ID Application identity" >&2; exit 1; }
+            export MACOS_SIGN_IDENTITY
+            if [ "$IS_TAG" = true ] && [ -n "$APPLE_PASSWORD" ]; then export MACOS_NOTARIZE=1; fi
+          else
+            echo "No signing certificate is configured; the package is signed ad hoc."
+          fi
+          packaging/macos/package.sh target/release/supas3 THIRD_PARTY_LICENSES.txt dist
+          if [ -n "$APPLE_CERTIFICATE" ]; then security delete-keychain "$keychain"; fi
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
