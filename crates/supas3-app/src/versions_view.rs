@@ -3,10 +3,9 @@
 //! Lives inside a dialog the workspace opens.
 
 use crate::app_state::AppBackend;
+use crate::error_details::ErrorDetails;
 use crate::listing::{format_modified, format_size};
-use crate::object_actions::{
-    brief_error, can_restore, short_version_id, versioning_key, ObjectRef,
-};
+use crate::object_actions::{can_restore, short_version_id, versioning_key, ObjectRef};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::scroll::ScrollableElement as _;
@@ -317,12 +316,7 @@ impl Render for VersionsView {
                     }),
             )
             .when_some(self.error.clone(), |this, error| {
-                this.child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().danger)
-                        .child(t!("versions.failed", detail = brief_error(&error)).into_owned()),
-                )
+                this.child(ErrorDetails::new("versions-error", error).danger())
             })
             .child(
                 h_flex()

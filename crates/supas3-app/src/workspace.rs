@@ -13,6 +13,8 @@ use crate::object_actions::{
 };
 use crate::object_view::{ObjectView, ObjectViewEvent};
 use crate::pane::{Pane, PaneEvent};
+use crate::places::{full_name, short_name, Layout, PaneLayout, Places};
+use crate::properties_view::PropertiesView;
 use crate::settings::{Appearance, Language, Settings};
 use crate::share_view::ShareView;
 use crate::sync_view::SyncView;
@@ -43,6 +45,12 @@ enum Side {
 
 pub struct Workspace {
     connections: Entity<Connections>,
+    /// Favorites, recent places and the saved layout, written to disk on
+    /// every change.
+    places: Entity<Places>,
+    /// Whether the panes were opened from a saved layout, which the first
+    /// connection must not replace.
+    restored: bool,
     left: Entity<Pane>,
     right: Entity<Pane>,
     task_center: Entity<TaskCenter>,
@@ -53,6 +61,8 @@ pub struct Workspace {
     form: Option<Entity<ConnectionForm>>,
     /// A problem that is not tied to one pane, shown above the panes.
     notice: Option<String>,
+    /// Places could not be saved; said once, not on every navigation.
+    places_unsaved: bool,
     /// Counts connection reloads, so only the latest answer is applied.
     reload_generation: u64,
     _subscriptions: Vec<Subscription>,
@@ -86,8 +96,51 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let connections = cx.new(|_| Connections::default());
-        let left = cx.new(|cx| Pane::new("left", home(), connections.clone(), window, cx));
-        let right = cx.new(|cx| Pane::new("right", home(), connections.clone(), window, cx));
+        let mut saved = default_config_dir()
+            .map(|dir| Places::load(&dir))
+            .unwrap_or_default();
+        let restored = saved.layout.is_some();
+        let layout = saved.layout.clone().unwrap_or_default();
+        let pane_layout = |pane: &PaneLayout| {
+            // A folder on this computer may have gone since the last run.
+            let mut pane = pane.usable(&home());
+            for tab in &mut pane.tabs {
+                if matches!(tab, Location::Local(path) if !path.is_dir()) {
+                    *tab = home();
+                }
+            }
+            pane
+        };
+        let (left_layout, right_layout) = (pane_layout(&layout.left), pane_layout(&layout.right));
+        // Keep the layout as opened, so a later save writes it back intact.
+        if restored {
+            saved.layout = Some(Layout {
+                left: left_layout.clone(),
+                right: right_layout.clone(),
+                left_active: layout.left_active,
+            });
+        }
+        let places = cx.new(|_| saved);
+        let left = cx.new(|cx| {
+            Pane::new(
+                "left",
+                left_layout,
+                connections.clone(),
+                places.clone(),
+                window,
+                cx,
+            )
+        });
+        let right = cx.new(|cx| {
+            Pane::new(
+                "right",
+                right_layout,
+                connections.clone(),
+                places.clone(),
+                window,
+                cx,
+            )
+        });
         let task_center = cx.new(|cx| TaskCenter::new(events, cx));
         let subscriptions = vec![
             cx.subscribe_in(&left, window, |workspace, _, event, window, cx| {
@@ -103,6 +156,18 @@ impl Workspace {
                 }
             }),
             cx.observe(&connections, |_, _, cx| cx.notify()),
+            // Places are small; they are written whenever they change.
+            cx.observe(&places, |workspace, places, cx| {
+                let saved = workspace.save_places(places.read(cx));
+                if !saved && !workspace.places_unsaved {
+                    workspace.places_unsaved = true;
+                    workspace.notice = Some(t!("places.not_saved").into_owned());
+                } else if saved && workspace.places_unsaved {
+                    workspace.places_unsaved = false;
+                    workspace.notice = None;
+                }
+                cx.notify();
+            }),
             cx.observe_window_appearance(window, |workspace, window, cx| {
                 if workspace.settings.appearance == Appearance::System {
                     Theme::sync_system_appearance(Some(window), cx);
@@ -111,15 +176,22 @@ impl Workspace {
         ];
         let mut workspace = Self {
             connections,
+            places,
+            restored,
             left,
             right,
             task_center,
-            active: Side::Right,
+            active: if layout.left_active {
+                Side::Left
+            } else {
+                Side::Right
+            },
             settings,
             form: None,
             notice: AppBackend::start_error(cx)
                 .map(|error| t!("error.backend_failed", error = error).into_owned()),
             reload_generation: 0,
+            places_unsaved: false,
             _subscriptions: subscriptions,
         };
         workspace.apply_appearance(window, cx);
@@ -134,10 +206,14 @@ impl Workspace {
         }
     }
 
-    fn activate(&mut self, side: Side, cx: &mut Context<Self>) {
+    /// Makes a pane the active one; true if it was not already.
+    fn activate(&mut self, side: Side, cx: &mut Context<Self>) -> bool {
         if self.active != side {
             self.active = side;
             cx.notify();
+            true
+        } else {
+            false
         }
     }
 
@@ -169,7 +245,9 @@ impl Workspace {
                             .profiles()
                             .first()
                             .map(start_of);
-                        let untouched = workspace.right.read(cx).is_untouched();
+                        workspace.forget_missing_connections(cx);
+                        let untouched =
+                            !workspace.restored && workspace.right.read(cx).is_untouched();
                         if let (true, true, Some(location)) = (first_load, untouched, first) {
                             workspace
                                 .right
@@ -187,6 +265,75 @@ impl Workspace {
         .detach();
     }
 
+    /// Records where the panes are, and the place just opened as recent.
+    fn remember_layout(&mut self, side: Side, cx: &mut Context<Self>) {
+        let layout = Layout {
+            left: self.left.read(cx).layout(),
+            right: self.right.read(cx).layout(),
+            left_active: self.active == Side::Left,
+        };
+        let visited = self.pane(side).read(cx).location().clone();
+        self.places.update(cx, |places, cx| {
+            places.visited(&visited);
+            places.layout = Some(layout);
+            cx.notify();
+        });
+    }
+
+    /// Writes the places; false if that failed.
+    fn save_places(&self, places: &Places) -> bool {
+        let saved = default_config_dir()
+            .map_err(|error| error.to_string())
+            .and_then(|dir| places.save(&dir).map_err(|error| error.to_string()));
+        if let Err(error) = &saved {
+            log::warn!("could not save places: {error}");
+        }
+        saved.is_ok()
+    }
+
+    /// Closes tabs, favorites and recent places of connections that no
+    /// longer exist, for example after the profile file was replaced.
+    fn forget_missing_connections(&mut self, cx: &mut Context<Self>) {
+        let known: Vec<String> = self
+            .connections
+            .read(cx)
+            .profiles()
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect();
+        // No connections at all is more likely an unreadable profile file
+        // than every connection deleted; keep the places until it is clear.
+        // Deleting a connection forgets its places on its own.
+        if known.is_empty() {
+            return;
+        }
+        let mut missing: Vec<String> = Vec::new();
+        {
+            let places = self.places.read(cx);
+            let mut consider = |location: &Location| {
+                if let Some(id) = location.profile_id() {
+                    if !known.iter().any(|known| known == id) && !missing.iter().any(|m| m == id) {
+                        missing.push(id.to_string());
+                    }
+                }
+            };
+            places.favorites.iter().for_each(&mut consider);
+            places.recent.iter().for_each(&mut consider);
+            for pane in [&self.left, &self.right] {
+                pane.read(cx).layout().tabs.iter().for_each(&mut consider);
+            }
+        }
+        for id in missing {
+            for pane in [self.left.clone(), self.right.clone()] {
+                pane.update(cx, |pane, cx| pane.leave_profile(&id, &home(), cx));
+            }
+            self.places.update(cx, |places, cx| {
+                places.forget_profile(&id);
+                cx.notify();
+            });
+        }
+    }
+
     fn other(side: Side) -> Side {
         match side {
             Side::Left => Side::Right,
@@ -201,9 +348,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.activate(side, cx);
+        let changed = self.activate(side, cx);
         match event {
-            PaneEvent::Activated => {}
+            PaneEvent::Activated => {
+                if changed {
+                    self.remember_layout(side, cx);
+                }
+            }
+            PaneEvent::Moved => self.remember_layout(side, cx),
             // Each request names the location its rows were read from, which
             // may no longer be what the pane shows.
             PaneEvent::CopyRequested(taken) => {
@@ -519,6 +671,15 @@ impl Workspace {
             }
             return;
         };
+        if action == RowAction::Properties {
+            let view = cx.new(|cx| PropertiesView::new(object, cx));
+            let title: SharedString = t!("properties.title", name = name).into_owned().into();
+            let width = rems(36.).to_pixels(window.rem_size());
+            window.open_dialog(cx, move |dialog, _, _| {
+                dialog.title(title.clone()).width(width).child(view.clone())
+            });
+            return;
+        }
         if action == RowAction::Versions {
             let view = cx.new(|cx| VersionsView::new(object, cx));
             let title: SharedString = t!("versions.title", name = name).into_owned().into();
@@ -623,12 +784,18 @@ impl Workspace {
                 return;
             }
         };
-        let view = cx.new(|cx| SyncView::new(pair, cx));
+        let view = cx.new(|cx| SyncView::new(pair, window, cx));
         let title: SharedString = t!("sync.title").into_owned().into();
         let width = rems(40.).to_pixels(window.rem_size());
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, _, cx| {
             let enter = view.clone();
+            // Once a sync is being started it goes ahead; the dialog stays
+            // until the answer arrives, so what it shows stays true.
+            let starting = view.read(cx).is_starting();
             dialog
+                .keyboard(!starting)
+                .overlay_closable(!starting)
+                .close_button(!starting)
                 .title(title.clone())
                 .width(width)
                 // Enter starts the sync when it may start, and never closes
@@ -642,7 +809,7 @@ impl Workspace {
     }
 
     /// Says what this application is, which version, and under what terms.
-    fn show_about(window: &mut Window, cx: &mut App) {
+    pub fn show_about(window: &mut Window, cx: &mut App) {
         const SOURCE: &str = env!("CARGO_PKG_REPOSITORY");
         const UPSTREAM: &str = "https://github.com/rgcsekaraa/brows3";
         const LICENSE_TEXT: &str = "https://www.gnu.org/licenses/agpl-3.0.html";
@@ -831,6 +998,10 @@ impl Workspace {
                     for pane in [workspace.left.clone(), workspace.right.clone()] {
                         pane.update(cx, |pane, cx| pane.leave_profile(&profile_id, &home(), cx));
                     }
+                    workspace.places.update(cx, |places, cx| {
+                        places.forget_profile(&profile_id);
+                        cx.notify();
+                    });
                     workspace.reload_connections(false, cx);
                 }
                 Err(error) => {
@@ -859,6 +1030,7 @@ impl Workspace {
     ) {
         change(&mut self.settings);
         i18n::apply(self.settings.language);
+        crate::set_app_menus(cx);
         self.apply_appearance(window, cx);
         // Column titles are fetched once per table; fetch them again.
         for pane in [self.left.clone(), self.right.clone()] {
@@ -939,7 +1111,69 @@ impl Workspace {
                         })
                 })
         });
+        let connection_items: Vec<_> = connection_items.collect();
         let has_connections = !self.connections.read(cx).profiles().is_empty();
+
+        let place_item = |location: &Location, favorite: bool, cx: &mut Context<Self>| {
+            let connection = location
+                .profile_id()
+                .map(|id| self.connections.read(cx).name_of(id))
+                .unwrap_or_default();
+            let target = location.clone();
+            let item = SidebarMenuItem::new(short_name(location, &connection))
+                .icon(if favorite {
+                    IconName::Star
+                } else {
+                    match location {
+                        Location::Local(_) => IconName::Folder,
+                        _ => IconName::Globe,
+                    }
+                })
+                .active(*location == active_location)
+                .on_click(cx.listener(move |workspace, _, _, cx| {
+                    workspace.open_in_active(target.clone(), cx);
+                }));
+            let full: SharedString = full_name(location, &connection).into();
+            let places = self.places.clone();
+            let removed = location.clone();
+            // The full place and removal are in the item's context menu, so
+            // nothing inside the row competes with opening it.
+            item.accessibility_label(full.clone())
+                .context_menu(move |menu, _, _| {
+                    let (places, removed) = (places.clone(), removed.clone());
+                    let menu = menu.label(full.clone());
+                    if favorite {
+                        menu.separator().item(
+                            PopupMenuItem::new(t!("places.remove_favorite").into_owned()).on_click(
+                                move |_, _, cx| {
+                                    let removed = removed.clone();
+                                    places.update(cx, |places, cx| {
+                                        places.toggle_favorite(&removed);
+                                        cx.notify();
+                                    });
+                                },
+                            ),
+                        )
+                    } else {
+                        menu
+                    }
+                })
+        };
+        let (favorites, recent) = {
+            let places = self.places.read(cx);
+            (places.favorites.clone(), places.recent.clone())
+        };
+        let favorite_items: Vec<_> = favorites
+            .iter()
+            .map(|location| place_item(location, true, cx))
+            .collect();
+        // Favorites are already one click away; recent lists the others.
+        let recent_items: Vec<_> = recent
+            .iter()
+            .filter(|location| !favorites.contains(location))
+            .take(5)
+            .map(|location| place_item(location, false, cx))
+            .collect();
 
         Sidebar::new("sidebar")
             .header(div().px_2().py_1().font_semibold().child("supaS3"))
@@ -947,6 +1181,18 @@ impl Workspace {
                 SidebarGroup::new(t!("sidebar.places").into_owned())
                     .child(SidebarMenu::new().child(this_computer)),
             )
+            .when(!favorite_items.is_empty(), |this| {
+                this.child(
+                    SidebarGroup::new(t!("sidebar.favorites").into_owned())
+                        .child(SidebarMenu::new().children(favorite_items)),
+                )
+            })
+            .when(!recent_items.is_empty(), |this| {
+                this.child(
+                    SidebarGroup::new(t!("sidebar.recent").into_owned())
+                        .child(SidebarMenu::new().children(recent_items)),
+                )
+            })
             .child(
                 SidebarGroup::new(t!("sidebar.connections").into_owned())
                     .child(SidebarMenu::new().children(connection_items)),
@@ -1065,8 +1311,23 @@ impl Workspace {
     }
 }
 
+/// For launch checks: SUPAS3_LAUNCH_REPORT names a file written once the
+/// main window has drawn its first frame, which a check can wait for on
+/// systems where the window itself cannot be inspected.
+fn report_first_frame() {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if let Some(path) = std::env::var_os("SUPAS3_LAUNCH_REPORT") {
+        let _ = std::fs::write(path, "drawn\n");
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Painting follows this render; report once it is on screen.
+        window.on_next_frame(|_, _| report_first_frame());
         // Narrower than this, a pane's navigation bar no longer fits.
         let min_pane = rems(18.).to_pixels(window.rem_size());
         h_flex()

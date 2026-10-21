@@ -3,9 +3,11 @@
 
 use crate::app_state::{AppBackend, Connections};
 use crate::entries_table::{DraggedEntries, EntriesDelegate, RowAction, RowCommand};
+use crate::error_details::ErrorDetails;
 use crate::listing::Entry;
 use crate::listing::{Listing, LoadState, Page};
 use crate::location::{collapse, CrumbSlot, History, Location};
+use crate::places::{is_memorable, PaneLayout, Places};
 use gpui_kit::component::breadcrumb::{Breadcrumb, BreadcrumbItem};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -13,6 +15,7 @@ use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::{
     h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
+    WindowExt as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -38,6 +41,8 @@ pub enum PaneEvent {
     RowActionRequested(RowAction, Location, Entry),
     /// Sync the local folder this pane shows to the other pane.
     SyncRequested(Location),
+    /// The tabs or what they show changed; the layout is worth saving.
+    Moved,
 }
 
 struct PaneTab {
@@ -56,6 +61,7 @@ pub struct Pane {
     /// Distinguishes the two panes' element ids.
     side: &'static str,
     connections: Entity<Connections>,
+    places: Entity<Places>,
     tabs: Vec<PaneTab>,
     active: usize,
     next_tab_id: u64,
@@ -67,10 +73,12 @@ pub struct Pane {
 impl EventEmitter<PaneEvent> for Pane {}
 
 impl Pane {
+    /// Opens the tabs of `layout`, which must have at least one.
     pub fn new(
         side: &'static str,
-        start: Location,
+        layout: PaneLayout,
         connections: Entity<Connections>,
+        places: Entity<Places>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -79,10 +87,13 @@ impl Pane {
             cx.subscribe_in(&path_input, window, Self::on_path_input),
             // Connection names appear in tabs and breadcrumbs.
             cx.observe(&connections, |_, _, cx| cx.notify()),
+            // The favorite mark follows changes made anywhere.
+            cx.observe(&places, |_, _, cx| cx.notify()),
         ];
         let mut pane = Self {
             side,
             connections,
+            places,
             tabs: Vec::new(),
             active: 0,
             next_tab_id: 0,
@@ -90,8 +101,23 @@ impl Pane {
             editing_path: false,
             _subscriptions: subscriptions,
         };
-        pane.add_tab(start, window, cx);
+        for location in layout.tabs {
+            pane.add_tab(location, window, cx);
+        }
+        pane.active = layout.active.min(pane.tabs.len().saturating_sub(1));
         pane
+    }
+
+    /// The tabs as they would be restored.
+    pub fn layout(&self) -> PaneLayout {
+        PaneLayout {
+            tabs: self
+                .tabs
+                .iter()
+                .map(|tab| tab.history.current().clone())
+                .collect(),
+            active: self.active,
+        }
     }
 
     /// The location of the active tab.
@@ -149,6 +175,7 @@ impl Pane {
             self.active = self.active.saturating_sub(1);
         }
         self.editing_path = false;
+        cx.emit(PaneEvent::Moved);
         cx.notify();
     }
 
@@ -341,6 +368,9 @@ impl Pane {
 
     /// Loads a tab's current location from the start.
     fn load(&mut self, tab_id: u64, fresh: bool, cx: &mut Context<Self>) {
+        if !fresh {
+            cx.emit(PaneEvent::Moved);
+        }
         let Some(index) = self.tab_index(tab_id) else {
             return;
         };
@@ -536,6 +566,7 @@ impl Pane {
                 pane.editing_path = false;
                 pane.reload_stale(cx);
                 cx.emit(PaneEvent::Activated);
+                cx.emit(PaneEvent::Moved);
                 cx.notify();
             }))
             .children(self.tabs.iter().map(|tab| {
@@ -658,6 +689,32 @@ impl Pane {
                     .overflow_hidden()
                     .child(path),
             )
+            .when(!self.editing_path && is_memorable(location), |this| {
+                let favorite = self.places.read(cx).is_favorite(location);
+                let target = location.clone();
+                this.child(
+                    nav_button(
+                        "favorite",
+                        if favorite {
+                            IconName::StarFill
+                        } else {
+                            IconName::Star
+                        },
+                        if favorite {
+                            t!("places.remove_favorite").into_owned()
+                        } else {
+                            t!("places.add_favorite").into_owned()
+                        },
+                    )
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        let target = target.clone();
+                        pane.places.update(cx, |places, cx| {
+                            places.toggle_favorite(&target);
+                            cx.notify();
+                        });
+                    })),
+                )
+            })
             .when(!self.editing_path, |this| {
                 this.child(
                     Button::new(self.id("edit-path"))
@@ -690,7 +747,7 @@ impl Pane {
                         .max_w(rems(36.))
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(message.clone()),
+                        .child(ErrorDetails::new(self.id("load-error"), message.clone())),
                 )
                 .child(
                     Button::new(self.id("retry"))
@@ -723,7 +780,12 @@ impl Pane {
                 (t!("status.loading_more", count = count).into_owned(), false)
             }
             LoadState::Failed(message) if count > 0 => (
-                t!("status.more_failed", count = count, error = message).into_owned(),
+                t!(
+                    "status.more_failed",
+                    count = count,
+                    error = crate::error_details::summary(message)
+                )
+                .into_owned(),
                 true,
             ),
             LoadState::Failed(_) => (String::new(), false),
@@ -733,6 +795,11 @@ impl Pane {
             LoadState::Loaded => (t!("status.items", count = count).into_owned(), false),
         };
         let can_load_more = tab.listing.has_more() && !tab.listing.is_busy();
+        // A later page failed: the rows stay, and the error is one click away.
+        let more_failure = match tab.listing.state() {
+            LoadState::Failed(message) if count > 0 => Some(message.clone()),
+            _ => None,
+        };
         let marked = tab.table.read(cx).delegate().marked_count();
         let has_selection = !self.selection(cx).entries.is_empty();
         let text = if marked > 0 {
@@ -761,6 +828,22 @@ impl Pane {
                 cx.theme().muted_foreground
             })
             .child(div().flex_1().min_w_0().truncate().child(text))
+            .when_some(more_failure, |this, error| {
+                this.child(
+                    Button::new(self.id("failure-details"))
+                        .ghost()
+                        .xsmall()
+                        .label(t!("error.show_details").into_owned())
+                        .on_click(move |_, window, cx| {
+                            let error = error.clone();
+                            window.open_dialog(cx, move |dialog, _, _| {
+                                dialog
+                                    .title(t!("status.more_failed_title").into_owned())
+                                    .child(ErrorDetails::new("more-failed", error.clone()))
+                            });
+                        }),
+                )
+            })
             .when(can_load_more, |this| {
                 let id = tab.id;
                 this.child(

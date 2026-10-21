@@ -3,8 +3,10 @@
 
 use std::path::{Path, PathBuf};
 
-/// A place a pane can show.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A place a pane can show. Saved between runs as part of the layout,
+/// favorites and recent places; it holds no secrets.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Location {
     /// A folder on this computer.
     Local(PathBuf),

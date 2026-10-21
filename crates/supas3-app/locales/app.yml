@@ -581,8 +581,8 @@ sync.skip_existing:
   en: Leave files that already exist in storage alone, without comparing them
   zh-CN: 存储中已存在的文件一律不动，也不比较内容
 sync.not_compared:
-  en: Not compared yet.
-  zh-CN: 尚未比较。
+  en: Not compared with the current settings. Choose Compare again.
+  zh-CN: 尚未按当前设置比较。请点“重新比较”。
 sync.comparing:
   en: Comparing…
   zh-CN: 正在比较…
@@ -685,3 +685,120 @@ about.upstream:
 about.notices:
   en: The LICENSE, LICENSES and THIRD_PARTY_LICENSES.txt files that come with this application hold the full text of this license and of the licenses of the libraries and icons included.
   zh-CN: 随本应用提供的 LICENSE、LICENSES 与 THIRD_PARTY_LICENSES.txt 文件包含本许可证以及所含程序库与图标的许可证全文。
+hint.unreachable:
+  en: The service could not be reached. Check the network, any proxy or firewall, and the endpoint address.
+  zh-CN: 无法连接到该服务。请检查网络、代理或防火墙，以及端点地址。
+hint.credentials:
+  en: The service rejected the access key or secret key.
+  zh-CN: 服务拒绝了访问密钥或私有密钥。
+hint.denied:
+  en: These credentials are not allowed to do this.
+  zh-CN: 这组凭据没有执行此操作的权限。
+hint.no_bucket:
+  en: The bucket does not exist on this endpoint.
+  zh-CN: 该端点上不存在这个存储桶。
+menu.quit:
+  en: Quit supaS3
+  zh-CN: 退出 supaS3
+menu.edit:
+  en: Edit
+  zh-CN: 编辑
+menu.undo:
+  en: Undo
+  zh-CN: 撤销
+menu.redo:
+  en: Redo
+  zh-CN: 重做
+menu.cut:
+  en: Cut
+  zh-CN: 剪切
+menu.copy:
+  en: Copy
+  zh-CN: 拷贝
+menu.paste:
+  en: Paste
+  zh-CN: 粘贴
+menu.select_all:
+  en: Select All
+  zh-CN: 全选
+menu.window:
+  en: Window
+  zh-CN: 窗口
+menu.minimize:
+  en: Minimize
+  zh-CN: 最小化
+menu.close_window:
+  en: Close Window
+  zh-CN: 关闭窗口
+sidebar.favorites:
+  en: Favorites
+  zh-CN: 收藏
+sidebar.recent:
+  en: Recent
+  zh-CN: 最近
+places.add_favorite:
+  en: Add to favorites
+  zh-CN: 加入收藏
+places.remove_favorite:
+  en: Remove from favorites
+  zh-CN: 移出收藏
+form.test_failed_title:
+  en: Couldn’t connect.
+  zh-CN: 连接失败。
+error.show_details:
+  en: Show details
+  zh-CN: 显示详情
+error.hide_details:
+  en: Hide details
+  zh-CN: 隐藏详情
+error.copy_details:
+  en: Copy the full error
+  zh-CN: 复制完整错误
+sync.include:
+  en: Include
+  zh-CN: 包含
+sync.exclude:
+  en: Exclude
+  zh-CN: 排除
+sync.include_placeholder:
+  en: Every file
+  zh-CN: 全部文件
+sync.exclude_placeholder:
+  en: Nothing
+  zh-CN: 不排除
+sync.patterns_hint:
+  en: "Separate patterns with commas. Paths are inside the folder and use /. *.log matches files at the top level only; **/*.log matches them at any depth. Exclusions win."
+  zh-CN: "多个规则用逗号分隔。路径相对于该文件夹，用 / 分隔。*.log 只匹配第一层的文件，**/*.log 匹配任意层级。排除优先。"
+action.properties_ellipsis:
+  en: Properties…
+  zh-CN: 属性…
+properties.title:
+  en: "Properties of “%{name}”"
+  zh-CN: "“%{name}”的属性"
+properties.key:
+  en: Key
+  zh-CN: 对象键
+properties.size:
+  en: Size
+  zh-CN: 大小
+properties.modified:
+  en: Modified
+  zh-CN: 修改时间
+properties.content_type:
+  en: Content type
+  zh-CN: 内容类型
+properties.storage_class:
+  en: Storage class
+  zh-CN: 存储类型
+properties.unknown:
+  en: Not reported
+  zh-CN: 服务未提供
+menu.close_dialog_first:
+  en: Close the open dialog first.
+  zh-CN: 请先关闭打开的对话框。
+places.not_saved:
+  en: Favorites and open tabs could not be saved; they will not be there after a restart.
+  zh-CN: 无法保存收藏和打开的标签，重启后它们将不会保留。
+status.more_failed_title:
+  en: Couldn’t load more items
+  zh-CN: 无法加载更多项目

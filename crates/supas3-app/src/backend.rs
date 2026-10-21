@@ -4,7 +4,7 @@
 
 use crate::listing::{display_order, Entry, EntryKind, Page};
 use crate::location::Location;
-use crate::object_actions::{FileRef, ObjectRef, SyncPair, IMAGE_LIMIT, TEXT_LIMIT};
+use crate::object_actions::{FileRef, ObjectRef, SyncFilters, SyncPair, IMAGE_LIMIT, TEXT_LIMIT};
 use crate::transfer_plan::{Deletion, Plan};
 use anyhow::{Context as _, Result};
 use std::future::Future;
@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use supas3_core::commands::cross_copy::{self, CopyItem};
+use supas3_core::commands::operations::ObjectMetadata;
 use supas3_core::commands::sync::Preview as SyncPreview;
 use supas3_core::commands::{
     buckets, objects, operations, preview, profiles, sync, transfer, urls, versions,
@@ -544,6 +545,32 @@ impl Requests {
         .await
     }
 
+    /// What the service reports about an object: size, type, ETag and the
+    /// user metadata.
+    pub async fn object_properties(&self, object: ObjectRef) -> Result<ObjectMetadata, String> {
+        self.run(move |core| async move {
+            let ObjectRef {
+                profile_id,
+                bucket,
+                key,
+            } = object;
+            with_profile(
+                profile_id.clone(),
+                operations::get_object_metadata(
+                    bucket,
+                    None,
+                    key,
+                    profile_id,
+                    core.profiles(),
+                    core.s3(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
     /// Reads a text file or object, refusing one over `TEXT_LIMIT` or one
     /// that is not UTF-8 text.
     pub async fn read_text(&self, file: FileRef) -> Result<TextContent, String> {
@@ -793,7 +820,7 @@ impl Requests {
     pub async fn compare_for_sync(
         &self,
         pair: SyncPair,
-        skip_existing: bool,
+        filters: SyncFilters,
     ) -> Result<SyncPreview, String> {
         self.run(move |core| async move {
             let SyncPair {
@@ -804,8 +831,9 @@ impl Requests {
             } = pair;
             let region = bucket_region(&core, &profile_id, &bucket).await;
             let options = SyncOptions {
-                skip_existing,
-                ..Default::default()
+                include: filters.include,
+                exclude: filters.exclude,
+                skip_existing: filters.skip_existing,
             };
             with_profile(
                 profile_id.clone(),
@@ -1477,7 +1505,7 @@ mod tests {
     fn object_actions_work_end_to_end_on_real_storage() {
         use crate::connection::{Draft, Service};
         use crate::listing::Entry;
-        use crate::object_actions::{sync_pair, FileRef, ObjectRef};
+        use crate::object_actions::{sync_pair, FileRef, ObjectRef, SyncFilters};
         use crate::tasks::{EventQueue, Tasks};
         use crate::transfer_plan::{plan, plan_deletion};
         let key = |field: &str| {
@@ -1700,10 +1728,65 @@ mod tests {
                 },
             ));
 
+            let properties = requests.object_properties(object("notes.md")).await;
+            steps.push((
+                "object properties",
+                match &properties {
+                    Ok(metadata) if metadata.size == "second 文本\n".len() as i64 => Ok(()),
+                    other => Err(format!("{:?}", other.as_ref().map(|m| m.size))),
+                },
+            ));
+
+            // Filters: excluding the stylesheets leaves one new file.
+            let filtered = requests
+                .compare_for_sync(
+                    sync_pair(&Location::Local(work.clone()), Some("site"), &here).unwrap(),
+                    SyncFilters {
+                        exclude: vec!["**/*.css".into()],
+                        ..Default::default()
+                    },
+                )
+                .await;
+            steps.push((
+                "an exclusion leaves files out of the comparison",
+                match &filtered {
+                    Ok(preview) if preview.new_files == 1 && preview.filtered_files == 1 => Ok(()),
+                    Ok(preview) => Err(format!(
+                        "new {}, filtered {}",
+                        preview.new_files, preview.filtered_files
+                    )),
+                    Err(error) => Err(error.clone()),
+                },
+            ));
+            let rejected = requests
+                .compare_for_sync(
+                    sync_pair(&Location::Local(work.clone()), Some("site"), &here).unwrap(),
+                    SyncFilters {
+                        include: vec!["/absolute/**".into()],
+                        ..Default::default()
+                    },
+                )
+                .await;
+            steps.push((
+                "an invalid pattern is refused",
+                check(
+                    rejected.is_err(),
+                    format!("{:?}", rejected.map(|p| p.new_files)),
+                ),
+            ));
+
             // Sync: everything is new, then nothing is, then one file changed.
             let target = here.child("site");
             let pair = sync_pair(&Location::Local(work.clone()), Some("site"), &here).unwrap();
-            let compared = requests.compare_for_sync(pair.clone(), false).await;
+            let compared = requests
+                .compare_for_sync(
+                    pair.clone(),
+                    SyncFilters {
+                        skip_existing: false,
+                        ..Default::default()
+                    },
+                )
+                .await;
             steps.push((
                 "first comparison finds two new files",
                 match &compared {
@@ -1742,7 +1825,15 @@ mod tests {
                     other => Err(format!("{other:?}")),
                 },
             ));
-            let second = requests.compare_for_sync(pair.clone(), false).await;
+            let second = requests
+                .compare_for_sync(
+                    pair.clone(),
+                    SyncFilters {
+                        skip_existing: false,
+                        ..Default::default()
+                    },
+                )
+                .await;
             steps.push((
                 "second comparison finds nothing to upload",
                 match &second {
@@ -1764,7 +1855,15 @@ mod tests {
                 },
             ));
             std::fs::write(work.join("site/index.html"), b"<p>two, longer</p>").unwrap();
-            let third = requests.compare_for_sync(pair.clone(), false).await;
+            let third = requests
+                .compare_for_sync(
+                    pair.clone(),
+                    SyncFilters {
+                        skip_existing: false,
+                        ..Default::default()
+                    },
+                )
+                .await;
             steps.push((
                 "a changed file is found",
                 match &third {
@@ -1803,7 +1902,15 @@ mod tests {
                     },
                 ));
             }
-            let skipping = requests.compare_for_sync(pair, true).await;
+            let skipping = requests
+                .compare_for_sync(
+                    pair,
+                    SyncFilters {
+                        skip_existing: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
             steps.push((
                 "skipping existing files uploads nothing",
                 match &skipping {

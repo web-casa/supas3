@@ -85,6 +85,37 @@ impl Service {
     }
 }
 
+/// What a storage error most likely means, as a translation key, for the
+/// errors a person can act on. The SDK's own wording for a request that
+/// never reached the service is "dispatch failure", which says nothing.
+pub fn error_hint_key(error: &str) -> Option<&'static str> {
+    let error = error.to_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|needle| error.contains(needle));
+    if has(&[
+        "invalidaccesskeyid",
+        "signaturedoesnotmatch",
+        "invalid access key",
+    ]) {
+        Some("hint.credentials")
+    } else if has(&["nosuchbucket"]) {
+        Some("hint.no_bucket")
+    } else if has(&["accessdenied", "access denied", "forbidden"]) {
+        Some("hint.denied")
+    } else if has(&[
+        "dispatch failure",
+        "timed out",
+        "timeout",
+        "dns error",
+        "connection refused",
+        "connection reset",
+        "failed to lookup",
+    ]) {
+        Some("hint.unreachable")
+    } else {
+        None
+    }
+}
+
 /// A problem with one field, as a translation key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Problem {
@@ -288,6 +319,27 @@ fn ends_with_app_id(bucket: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn storage_errors_are_explained_when_the_cause_is_known() {
+        assert_eq!(
+            super::error_hint_key("S3 error: dispatch failure"),
+            Some("hint.unreachable")
+        );
+        assert_eq!(
+            super::error_hint_key("service error: SignatureDoesNotMatch"),
+            Some("hint.credentials")
+        );
+        assert_eq!(
+            super::error_hint_key("unhandled error (AccessDenied)"),
+            Some("hint.denied")
+        );
+        assert_eq!(
+            super::error_hint_key("NoSuchBucket: The bucket does not exist"),
+            Some("hint.no_bucket")
+        );
+        assert_eq!(super::error_hint_key("something else"), None);
+    }
+
     use super::{Draft, Problem, Service};
     use supas3_core::credentials::{Addressing, CredentialType, ListVersion, WriteGuard};
 

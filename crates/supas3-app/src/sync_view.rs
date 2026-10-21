@@ -3,13 +3,19 @@
 //! uploaded, then start. Lives inside a dialog the workspace opens.
 
 use crate::app_state::AppBackend;
+use crate::error_details::ErrorDetails;
 use crate::listing::format_size;
-use crate::object_actions::{brief_error, sync_action_key, SyncCounts, SyncPair};
+use crate::object_actions::{
+    brief_error, split_patterns, sync_action_key, SyncCounts, SyncFilters, SyncPair,
+};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Disableable as _, WindowExt as _};
+use gpui_kit::component::{
+    h_flex, v_flex, ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rust_i18n::t;
@@ -29,6 +35,8 @@ pub struct SyncView {
     pair: SyncPair,
     /// Leave files that already exist remotely alone, without comparing.
     skip_existing: bool,
+    include: Entity<InputState>,
+    exclude: Entity<InputState>,
     comparison: Comparison,
     /// The user agreed to replace remote objects that differ.
     replace_agreed: bool,
@@ -36,13 +44,26 @@ pub struct SyncView {
     start_error: Option<String>,
     /// Counts comparisons, so only the latest answer is shown.
     generation: u64,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl SyncView {
-    pub fn new(pair: SyncPair, cx: &mut Context<Self>) -> Self {
+    pub fn new(pair: SyncPair, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let pattern_input = |placeholder: String, window: &mut Window, cx: &mut Context<Self>| {
+            cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
+        };
+        let include = pattern_input(t!("sync.include_placeholder").into_owned(), window, cx);
+        let exclude = pattern_input(t!("sync.exclude_placeholder").into_owned(), window, cx);
+        let subscriptions = vec![
+            cx.subscribe(&include, Self::on_filter),
+            cx.subscribe(&exclude, Self::on_filter),
+        ];
         let mut view = Self {
             pair,
             skip_existing: false,
+            include,
+            exclude,
+            _subscriptions: subscriptions,
             comparison: Comparison::NotRun,
             replace_agreed: false,
             starting: false,
@@ -64,6 +85,36 @@ impl SyncView {
         }
     }
 
+    /// Changed filters make the comparison out of date; Enter compares.
+    fn on_filter(&mut self, _: Entity<InputState>, event: &InputEvent, cx: &mut Context<Self>) {
+        match event {
+            InputEvent::Change => self.mark_stale(cx),
+            InputEvent::PressEnter { .. } => self.compare(cx),
+            _ => {}
+        }
+    }
+
+    pub fn is_starting(&self) -> bool {
+        self.starting
+    }
+
+    fn filters(&self, cx: &App) -> SyncFilters {
+        SyncFilters {
+            include: split_patterns(&self.include.read(cx).value()),
+            exclude: split_patterns(&self.exclude.read(cx).value()),
+            skip_existing: self.skip_existing,
+        }
+    }
+
+    /// Drops a comparison that no longer matches the filters, so a sync
+    /// cannot start from it.
+    fn mark_stale(&mut self, cx: &mut Context<Self>) {
+        self.generation += 1;
+        self.replace_agreed = false;
+        self.comparison = Comparison::NotRun;
+        cx.notify();
+    }
+
     fn compare(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
@@ -76,9 +127,9 @@ impl SyncView {
         };
         self.comparison = Comparison::Running;
         cx.notify();
-        let (pair, skip_existing) = (self.pair.clone(), self.skip_existing);
+        let (pair, filters) = (self.pair.clone(), self.filters(cx));
         cx.spawn(async move |view, cx| {
-            let result = requests.compare_for_sync(pair, skip_existing).await;
+            let result = requests.compare_for_sync(pair, filters).await;
             let _ = view.update(cx, |view, cx| {
                 if view.generation == generation {
                     view.comparison = match result {
@@ -266,10 +317,8 @@ impl Render for SyncView {
                 .text_color(muted)
                 .child(t!("sync.comparing").into_owned())
                 .into_any_element(),
-            Comparison::Failed(error) => div()
-                .text_sm()
-                .text_color(cx.theme().danger)
-                .child(t!("sync.compare_failed", detail = brief_error(error)).into_owned())
+            Comparison::Failed(error) => ErrorDetails::new("compare-error", error.clone())
+                .danger()
                 .into_any_element(),
             Comparison::Done(preview) => v_flex()
                 .gap_3()
@@ -330,6 +379,50 @@ impl Render for SyncView {
                         view.compare(cx);
                     })),
             )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(rems(4.))
+                                    .flex_shrink_0()
+                                    .text_sm()
+                                    .text_color(muted)
+                                    .child(t!("sync.include").into_owned()),
+                            )
+                            .child(
+                                div().flex_1().child(
+                                    Input::new(&self.include).small().disabled(self.starting),
+                                ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(rems(4.))
+                                    .flex_shrink_0()
+                                    .text_sm()
+                                    .text_color(muted)
+                                    .child(t!("sync.exclude").into_owned()),
+                            )
+                            .child(
+                                div().flex_1().child(
+                                    Input::new(&self.exclude).small().disabled(self.starting),
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(t!("sync.patterns_hint").into_owned()),
+                    ),
+            )
             .child(result)
             .when(counts.replaced() > 0, |this| {
                 this.child(
@@ -366,6 +459,7 @@ impl Render for SyncView {
                         Button::new("cancel-sync")
                             .outline()
                             .label(t!("action.cancel").into_owned())
+                            .disabled(self.starting)
                             .on_click(|_, window, cx| window.close_dialog(cx)),
                     )
                     .child(

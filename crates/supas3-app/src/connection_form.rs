@@ -3,6 +3,7 @@
 
 use crate::app_state::AppBackend;
 use crate::connection::{Draft, Problem, Service};
+use crate::error_details::ErrorDetails;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::form::{Field, Form};
 use gpui_kit::component::input::{Input, InputState};
@@ -243,17 +244,18 @@ impl Render for ConnectionForm {
         let busy = self.is_busy();
 
         // A finished result is shown only for the values it was run against.
-        let (check_text, check_failed) = match &self.check {
-            Check::Running => (Some(t!("form.testing").into_owned()), false),
+        let (check_text, check_error) = match &self.check {
+            Check::Running => (Some(t!("form.testing").into_owned()), None),
             Check::Passed(tested) if *tested == draft => {
-                (Some(t!("form.test_passed").into_owned()), false)
+                (Some(t!("form.test_passed").into_owned()), None)
             }
             Check::Failed(tested, message) if *tested == draft => (
-                Some(t!("form.test_failed", detail = message).into_owned()),
-                true,
+                Some(t!("form.test_failed_title").into_owned()),
+                Some(message.clone()),
             ),
-            _ => (None, false),
+            _ => (None, None),
         };
+        let check_failed = check_error.is_some();
 
         v_flex()
             .gap_4()
@@ -368,6 +370,9 @@ impl Render for ConnectionForm {
                         })
                         .child(text),
                 )
+            })
+            .when_some(check_error, |this, error| {
+                this.child(ErrorDetails::new("check-error", error))
             })
             .when_some(self.save_error.clone(), |this, error| {
                 this.child(

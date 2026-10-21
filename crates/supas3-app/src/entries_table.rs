@@ -42,6 +42,8 @@ pub enum RowAction {
     Versions,
     /// Sync the local folder to the other pane.
     Sync,
+    /// Show what the service reports about the object.
+    Properties,
 }
 
 /// Carries a row command to the owning pane.
@@ -290,6 +292,7 @@ impl TableDelegate for EntriesDelegate {
                     (RowAction::Open, "action.open"),
                     (RowAction::Share, "action.share_ellipsis"),
                     (RowAction::Versions, "action.versions_ellipsis"),
+                    (RowAction::Properties, "action.properties_ellipsis"),
                 ],
                 EntryKind::File => &[(RowAction::Open, "action.open")],
                 EntryKind::Folder if local => &[(RowAction::Sync, "action.sync_ellipsis")],

@@ -382,6 +382,28 @@ pub fn sync_pair(
     })
 }
 
+/// Which files of the folder a sync considers.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SyncFilters {
+    /// Patterns a file must match to be synced; empty means every file.
+    pub include: Vec<String>,
+    /// Patterns that leave a file out, even if it is included.
+    pub exclude: Vec<String>,
+    /// Leave files that already exist remotely alone, without comparing.
+    pub skip_existing: bool,
+}
+
+/// Splits what the user typed into patterns: separated by commas or new
+/// lines, with surrounding spaces and empty entries dropped. A pattern names
+/// a path inside the folder, with forward slashes; the backend checks them.
+pub fn split_patterns(text: &str) -> Vec<String> {
+    text.split([',', '\n'])
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// The counts of a comparison that decide what the user is asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SyncCounts {
@@ -601,6 +623,15 @@ mod tests {
             sync_pair(&local, None, &local),
             Err(SyncRefusal::TargetNotInBucket)
         );
+    }
+
+    #[test]
+    fn patterns_are_split_on_commas_and_lines() {
+        assert_eq!(
+            split_patterns(" **/*.log, tmp/** ,\n\n*.bak,"),
+            vec!["**/*.log", "tmp/**", "*.bak"]
+        );
+        assert!(split_patterns("  , ").is_empty());
     }
 
     #[test]

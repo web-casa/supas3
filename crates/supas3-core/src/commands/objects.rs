@@ -521,9 +521,18 @@ pub async fn list_objects(
 
                 crate::s3::listing::send(&new_client, retry_req)
                     .await
-                    .map_err(|e| crate::error::AppError::S3Error(format!("Retry failed: {}", e)))?
+                    .map_err(|e| {
+                        crate::error::AppError::S3Error(format!(
+                            "Retry failed: {}",
+                            aws_sdk_s3::error::DisplayErrorContext(&e)
+                        ))
+                    })?
             } else {
-                return Err(crate::error::AppError::S3Error(err.to_string()));
+                // The full context names the service's error code; plain
+                // Display says only "service error".
+                return Err(crate::error::AppError::S3Error(
+                    aws_sdk_s3::error::DisplayErrorContext(&err).to_string(),
+                ));
             }
         }
     };
