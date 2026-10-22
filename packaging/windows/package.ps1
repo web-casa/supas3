@@ -41,19 +41,34 @@ try {
     Compress-Archive -Path $tree -DestinationPath $zip
 
     # --- installer
-    # The newest one found: an upgrade may leave an older one on PATH.
-    $candidates = @(Get-Command ISCC.exe -All -ErrorAction SilentlyContinue | ForEach-Object Source)
+    # The newest one found: an upgrade may leave an older one on PATH. The
+    # installations are listed in the registry; ISCC.exe on PATH may be a
+    # Chocolatey shim, which reports no version of its own.
+    $uninstall = 'Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup *_is1'
+    $candidates = @(Get-ItemProperty -ErrorAction SilentlyContinue `
+            "HKLM:\SOFTWARE\WOW6432Node\$uninstall", "HKLM:\SOFTWARE\$uninstall", "HKCU:\Software\$uninstall" |
+        Where-Object { $_.InstallLocation } |
+        ForEach-Object { Join-Path $_.InstallLocation 'ISCC.exe' })
     $candidates += foreach ($major in 7, 6) {
         (Join-Path ${env:ProgramFiles(x86)} "Inno Setup $major\ISCC.exe")
         (Join-Path $env:ProgramFiles "Inno Setup $major\ISCC.exe")
     }
-    $versionOf = { param($path) [version](((Get-Item $path).VersionInfo.ProductVersion) -replace '[^0-9.].*$', '') }
-    $iscc = $candidates | Where-Object { $_ -and (Test-Path $_) } |
+    $candidates += @(Get-Command ISCC.exe -All -ErrorAction SilentlyContinue | ForEach-Object Source)
+    $versionOf = {
+        param($path)
+        $text = ((Get-Item $path).VersionInfo.ProductVersion) -replace '[^0-9.].*$', ''
+        if ($text) { [version]$text } else { [version]'0.0' }
+    }
+    $iscc = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique |
         Sort-Object { & $versionOf $_ } -Descending | Select-Object -First 1
     if (-not $iscc) { throw 'Inno Setup (ISCC.exe) was not found' }
     $found = & $versionOf $iscc
     Write-Host "Inno Setup $found at $iscc"
-    if ($found -lt [version]'6.5.0') {
+    if ($found.Major -eq 0) {
+        # Only a shim was found; the compiler itself refuses messages it
+        # does not know.
+        Write-Warning "The version of $iscc is unknown; Inno Setup 6.5 or later is needed"
+    } elseif ($found -lt [version]'6.5.0') {
         throw "Inno Setup 6.5 or later is needed for the Simplified Chinese installer; found $found"
     }
     & $iscc "/DAppVersion=$version" "/DArch=$Arch" "/DSourceDir=$tree" "/DOutputDir=$Out" /Qp (Join-Path $PSScriptRoot 'supas3.iss')
