@@ -13,6 +13,8 @@
 - Version history, restore, download and delete of versions are now tested on Tencent Cloud COS and MinIO.
 - Uploads, downloads and copies that fail on a network error are retried up to three times. An upload is retried only while the target is still as it was before, and its unfinished parts are removed first.
 - Copy and move to the other pane with Cmd/Ctrl+Shift+C and Cmd/Ctrl+Shift+M.
+- Files under 100 MiB upload many times faster to distant services: they are read in 1 MiB pieces instead of 4 KiB.
+- Uploads of large files no longer fail when the network pauses for a few seconds.
 - The sidebar folds to icons when the details panel leaves little room; dialogs have consistent widths; field errors show beside their field.
 
 ## 0.2.0

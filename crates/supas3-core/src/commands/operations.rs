@@ -604,7 +604,7 @@ async fn put_object_with_profile(
 
     if let Some(ref path) = local_path {
         // Upload file
-        let body = ByteStream::from_path(Path::new(path))
+        let body = crate::transfer::manager::file_body(Path::new(path), 0)
             .await
             .map_err(|e| crate::error::AppError::IoError(e.to_string()))?;
         request = request.body(body);
@@ -644,7 +644,7 @@ async fn put_object_with_profile(
                 .set_content_type(content_type);
 
             if let Some(ref path) = local_path {
-                let body = ByteStream::from_path(Path::new(path))
+                let body = crate::transfer::manager::file_body(Path::new(path), 0)
                     .await
                     .map_err(|e| crate::error::AppError::IoError(e.to_string()))?;
                 retry_request = retry_request.body(body);

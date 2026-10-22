@@ -25,6 +25,21 @@ fn transfer_timeout_for(size_bytes: u64) -> Duration {
     Duration::from_secs(scaled_secs).clamp(MIN_TRANSFER_TIMEOUT, MAX_TRANSFER_TIMEOUT)
 }
 
+/// supaS3: a whole file as an upload body, read in large pieces. The SDK's
+/// `from_path` reads 4 KiB at a time, and those small writes held a single
+/// upload to a distant service to a tenth of what the link carries. Slow
+/// pacing keeps small pieces, as parts already do.
+pub(crate) async fn file_body(
+    path: impl AsRef<std::path::Path>,
+    rate: u64,
+) -> Result<ByteStream, aws_smithy_types::byte_stream::error::Error> {
+    ByteStream::read_from()
+        .path(path)
+        .buffer_size(if rate == 0 { 1024 * 1024 } else { 16 * 1024 })
+        .build()
+        .await
+}
+
 fn upload_timeout_for(size: u64, rate: u64) -> Duration {
     if rate == 0 {
         return transfer_timeout_for(size);
@@ -829,7 +844,7 @@ impl TransferManager {
                 crate::s3::versions::validate_restore(client, &job.bucket, &job.key, guard).await?;
                 self.ensure_multipart_job_active(&job.id).await?;
             }
-            let body = ByteStream::from_path(&job.local_path)
+            let body = file_body(&job.local_path, job.bandwidth_limit.unwrap_or(0))
                 .await
                 .map_err(|error| crate::error::AppError::IoError(error.to_string()))?;
             let body = super::speed::track_limited(
@@ -860,7 +875,7 @@ impl TransferManager {
                 request = request.set_metadata(Some(metadata.clone()));
             }
             let without_acl = if let Some(attributes) = &attributes {
-                let body = ByteStream::from_path(&job.local_path)
+                let body = file_body(&job.local_path, job.bandwidth_limit.unwrap_or(0))
                     .await
                     .map_err(|e| crate::error::AppError::IoError(e.to_string()))?;
                 let request = client
