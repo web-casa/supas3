@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The table that shows the contents of one tab.
 
-use crate::listing::{format_modified, format_size, Entry, EntryKind};
+use crate::listing::{
+    format_modified, format_size, matches_filter, Entry, EntryKind, Sort, SortField,
+};
 use crate::location::Location;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
-use gpui_kit::component::table::{Column, TableDelegate, TableState};
+use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
 use gpui_kit::component::{h_flex, ActiveTheme as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -23,8 +25,12 @@ pub enum RowCommand {
     LoadMore,
     /// The set of marked rows changed.
     MarksChanged,
+    /// A column header asked for a different order.
+    Sort(Sort),
     /// Copy these rows to the other pane.
     Copy(DraggedEntries),
+    /// Move these rows to the other pane.
+    Move(DraggedEntries),
     /// Delete these rows.
     Delete(DraggedEntries),
     /// Something for one row alone, whatever else is marked.
@@ -44,6 +50,8 @@ pub enum RowAction {
     Sync,
     /// Show what the service reports about the object.
     Properties,
+    /// Give the file or folder a new name.
+    Rename,
 }
 
 /// Carries a row command to the owning pane.
@@ -56,11 +64,26 @@ pub struct DraggedEntries {
     pub entries: Rc<Vec<Entry>>,
 }
 
+/// Whether the keys held turn a drag into a move: Command on macOS, as in
+/// the Finder; Shift elsewhere, as in Windows Explorer.
+pub fn drag_moves(modifiers: &Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.platform
+    } else {
+        modifiers.shift
+    }
+}
+
 /// What follows the pointer while rows are dragged.
 struct DragLabel(SharedString);
 
 impl Render for DragLabel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let label: SharedString = if drag_moves(&window.modifiers()) {
+            t!("drag.move", what = self.0.as_ref()).into_owned().into()
+        } else {
+            self.0.clone()
+        };
         div()
             .px_2()
             .py_1()
@@ -70,14 +93,20 @@ impl Render for DragLabel {
             .bg(cx.theme().popover)
             .text_color(cx.theme().popover_foreground)
             .text_sm()
-            .child(self.0.clone())
+            .child(label)
     }
 }
 
 /// Rows and loading state for one tab's table. The pane that owns the tab
 /// writes them; the table only reads.
 pub struct EntriesDelegate {
+    /// Every row loaded for the location.
+    all: Vec<Entry>,
+    /// The rows shown: those of `all` that pass the filter. Row numbers and
+    /// marks refer to these, so a hidden row can never be acted on.
     entries: Vec<Entry>,
+    /// Text the shown rows' names contain; empty shows every row.
+    filter: String,
     /// Rows marked for a batch action, by position.
     marked: BTreeSet<usize>,
     /// The marked rows, built once per change of marks rather than once per
@@ -87,6 +116,8 @@ pub struct EntriesDelegate {
     location: Location,
     loading: bool,
     has_more: bool,
+    /// The order the rows are in, shown in the column headers.
+    sort: Sort,
     /// The window's rem size when the table was created. The table component
     /// sizes columns in pixels, so widths are derived from it to keep them in
     /// proportion to the text.
@@ -105,27 +136,92 @@ impl EntriesDelegate {
         commands: impl Fn(RowCommand, &mut Window, &mut App) + 'static,
     ) -> Self {
         Self {
+            all: Vec::new(),
             entries: Vec::new(),
+            filter: String::new(),
             marked: BTreeSet::new(),
             marked_rows: Default::default(),
             location,
             loading: false,
             has_more: false,
+            sort: Sort::default(),
             rem_size,
             commands: Rc::new(commands),
         }
     }
 
+    pub fn set_sort(&mut self, sort: Sort) {
+        self.sort = sort;
+    }
+
+    /// How a column header shows the order: arrows on the sorted column.
+    fn column_sort(&self, field: SortField) -> ColumnSort {
+        if self.sort.field != field {
+            ColumnSort::Default
+        } else if self.sort.descending {
+            ColumnSort::Descending
+        } else {
+            ColumnSort::Ascending
+        }
+    }
+
     /// Removes every row and mark, when a location is loaded from the start.
+    /// Where the rows are from.
+    pub fn location(&self) -> &Location {
+        &self.location
+    }
+
+    /// Drops the rows before `location` is loaded. Reloading the same
+    /// location keeps the filter; another location starts unfiltered.
     pub fn clear(&mut self, location: Location) {
+        self.all.clear();
         self.entries.clear();
+        if location != self.location {
+            self.filter.clear();
+        }
         self.set_marks(BTreeSet::new());
         self.location = location;
     }
 
     /// Adds the rows of the page that just arrived.
     pub fn append(&mut self, entries: Vec<Entry>) {
-        self.entries.extend(entries);
+        self.entries.extend(
+            entries
+                .iter()
+                .filter(|entry| matches_filter(entry, &self.filter))
+                .cloned(),
+        );
+        self.all.extend(entries);
+    }
+
+    /// Shows only the rows whose names contain `filter`. Marks are dropped:
+    /// rows that disappear must not stay marked out of sight.
+    pub fn set_filter(&mut self, filter: &str) {
+        if self.filter == filter {
+            return;
+        }
+        self.filter = filter.to_string();
+        self.entries = self
+            .all
+            .iter()
+            .filter(|entry| matches_filter(entry, filter))
+            .cloned()
+            .collect();
+        self.set_marks(BTreeSet::new());
+    }
+
+    /// The names of every loaded row, shown or not.
+    pub fn all_names(&self) -> Vec<String> {
+        self.all.iter().map(|entry| entry.name.clone()).collect()
+    }
+
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// How many rows are shown, out of how many loaded.
+    pub fn shown_count(&self) -> (usize, usize) {
+        (self.entries.len(), self.all.len())
     }
 
     /// `loading`: a request is in flight. `load_more`: the table may ask for
@@ -209,11 +305,44 @@ impl TableDelegate for EntriesDelegate {
                 .width(self.rem_size * 2.25)
                 .resizable(false)
                 .movable(false),
-            NAME => Column::new("name", t!("column.name").into_owned()).width(self.rem_size * 15.),
-            SIZE => Column::new("size", t!("column.size").into_owned()).width(self.rem_size * 6.),
+            NAME => Column::new("name", t!("column.name").into_owned())
+                .width(self.rem_size * 15.)
+                .sort(self.column_sort(SortField::Name)),
+            SIZE => Column::new("size", t!("column.size").into_owned())
+                .width(self.rem_size * 6.)
+                .sort(self.column_sort(SortField::Size)),
             _ => Column::new("modified", t!("column.modified").into_owned())
-                .width(self.rem_size * 10.),
+                .width(self.rem_size * 10.)
+                .sort(self.column_sort(SortField::Modified)),
         }
+    }
+
+    fn perform_sort(
+        &mut self,
+        col_ix: usize,
+        sort: ColumnSort,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        let field = match col_ix {
+            NAME => SortField::Name,
+            SIZE => SortField::Size,
+            MARK => return,
+            _ => SortField::Modified,
+        };
+        // Clearing the order means the ordinary one: name, ascending.
+        let wanted = match sort {
+            ColumnSort::Default => Sort::default(),
+            ColumnSort::Ascending => Sort {
+                field,
+                descending: false,
+            },
+            ColumnSort::Descending => Sort {
+                field,
+                descending: true,
+            },
+        };
+        (self.commands)(RowCommand::Sort(wanted), window, cx);
     }
 
     fn render_th(
@@ -281,7 +410,8 @@ impl TableDelegate for EntriesDelegate {
         // What the menu acts on is fixed now, while the user is looking at it.
         let taken = self.taken(Some(row_ix));
         let (copy, delete) = (self.commands.clone(), self.commands.clone());
-        let (copied, deleted) = (taken.clone(), taken);
+        let send_move = self.commands.clone();
+        let (copied, moved, deleted) = (taken.clone(), taken.clone(), taken);
         // Actions for the row under the pointer alone.
         let mut menu = menu;
         if let Some(entry) = self.entries.get(row_ix) {
@@ -293,9 +423,17 @@ impl TableDelegate for EntriesDelegate {
                     (RowAction::Share, "action.share_ellipsis"),
                     (RowAction::Versions, "action.versions_ellipsis"),
                     (RowAction::Properties, "action.properties_ellipsis"),
+                    (RowAction::Rename, "action.rename_ellipsis"),
                 ],
-                EntryKind::File => &[(RowAction::Open, "action.open")],
-                EntryKind::Folder if local => &[(RowAction::Sync, "action.sync_ellipsis")],
+                EntryKind::File => &[
+                    (RowAction::Open, "action.open"),
+                    (RowAction::Rename, "action.rename_ellipsis"),
+                ],
+                EntryKind::Folder if local => &[
+                    (RowAction::Sync, "action.sync_ellipsis"),
+                    (RowAction::Rename, "action.rename_ellipsis"),
+                ],
+                EntryKind::Folder if remote => &[(RowAction::Rename, "action.rename_ellipsis")],
                 _ => &[],
             };
             for (action, label) in actions.iter().copied() {
@@ -315,6 +453,11 @@ impl TableDelegate for EntriesDelegate {
         menu.item(
             PopupMenuItem::new(t!("action.copy_to_other").into_owned())
                 .on_click(move |_, window, cx| copy(RowCommand::Copy(copied.clone()), window, cx)),
+        )
+        .item(
+            PopupMenuItem::new(t!("action.move_to_other").into_owned()).on_click(
+                move |_, window, cx| send_move(RowCommand::Move(moved.clone()), window, cx),
+            ),
         )
         .separator()
         .item(

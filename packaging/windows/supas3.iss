@@ -32,6 +32,9 @@ UninstallDisplayIcon={app}\supas3.exe
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+; The installer speaks the system's language, asking only when it is
+; neither English nor Simplified Chinese.
+ShowLanguageDialog=auto
 ; Installs for the current user unless they choose otherwise, so no
 ; administrator rights are needed.
 PrivilegesRequired=lowest
@@ -46,6 +49,15 @@ ArchitecturesInstallIn64BitMode=x64compatible
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
+; Simplified Chinese ships with Inno Setup from 7.0.2. For earlier
+; compilers (6.5 or later) the same file is kept here, unmodified, from
+; https://github.com/jrsoftware/issrc (Files/Languages, commit 6ef3219),
+; under the Inno Setup License.
+#if FileExists(CompilerPath + "Languages\ChineseSimplified.isl")
+Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+#else
+Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
+#endif
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked

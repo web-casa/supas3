@@ -69,6 +69,7 @@ pub async fn preview_folder_sync(
     profile_state: State<'_, ProfileState>,
     s3_state: State<'_, S3State>,
     sync_plans: State<'_, SyncPlans>,
+    transfer_state: State<'_, super::transfer::TransferState>,
 ) -> Result<Preview> {
     let options = options.unwrap_or_default();
     Filters::new(&options)?;
@@ -93,8 +94,17 @@ pub async fn preview_folder_sync(
             None => manager.get_client(&profile).await?.clone(),
         }
     };
-    let (preview, mut uploads) =
-        compare_options(&client, &bucket_name, &prefix, local, &options).await?;
+    let records = transfer_state.sync_records().await;
+    let identity = profile.cache_identity();
+    let (preview, mut uploads) = compare_options(
+        &client,
+        &bucket_name,
+        &prefix,
+        local,
+        &options,
+        Some((&identity, &records)),
+    )
+    .await?;
     let current = selected(profile_state.inner(), &expected_profile_id).await?;
     if current.cache_identity() != profile.cache_identity() {
         return Err(AppError::ConfigError(
@@ -136,8 +146,20 @@ async fn compare(
     prefix: &str,
     local: Vec<LocalFile>,
 ) -> Result<(Preview, Vec<LocalFile>)> {
-    compare_options(client, bucket_name, prefix, local, &SyncOptions::default()).await
+    compare_options(
+        client,
+        bucket_name,
+        prefix,
+        local,
+        &SyncOptions::default(),
+        None,
+    )
+    .await
 }
+
+/// What earlier sync uploads recorded: the connection's settings identity
+/// and the ETags by `sync_state::record_key`.
+pub(crate) type Recorded<'a> = Option<(&'a str, &'a HashMap<String, String>)>;
 
 pub(crate) async fn compare_options(
     client: &aws_sdk_s3::Client,
@@ -145,6 +167,7 @@ pub(crate) async fn compare_options(
     prefix: &str,
     local: Vec<LocalFile>,
     options: &SyncOptions,
+    recorded: Recorded<'_>,
 ) -> Result<(Preview, Vec<LocalFile>)> {
     let filters = Filters::new(options)?;
     let remote = crate::s3::listing::list_recursive(client, bucket_name, prefix).await?;
@@ -205,7 +228,19 @@ pub(crate) async fn compare_options(
                     )
                 })?;
                 file.source.expected_etag = Some(etag.into());
-                if sync::unchanged(&file, &head) {
+                let uploaded_unchanged = recorded.is_some_and(|(identity, records)| {
+                    crate::transfer::sync_state::uploaded_unchanged(
+                        &head,
+                        file.source.size,
+                        &file.source.sha256,
+                        records.get(&crate::transfer::sync_state::record_key(
+                            identity,
+                            bucket_name,
+                            &file.key,
+                        )),
+                    )
+                });
+                if sync::unchanged(&file, &head) || uploaded_unchanged {
                     preview.unchanged_files += 1;
                     "Unchanged"
                 } else if head.content_length() != Some(file.source.size as i64)
@@ -342,7 +377,7 @@ mod tests {
             exclude: vec!["excluded.txt".into()],
             skip_existing: true,
         };
-        let (preview, jobs) = compare_options(&client, "bucket", "dest/", local, &options)
+        let (preview, jobs) = compare_options(&client, "bucket", "dest/", local, &options, None)
             .await
             .unwrap();
         assert_eq!(

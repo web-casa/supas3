@@ -97,6 +97,60 @@ pub async fn connection_write_traits(
     Ok(crate::s3::guard::write_traits(client))
 }
 
+/// One object found under a prefix.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ListedKey {
+    pub key: String,
+    pub size: u64,
+    pub etag: Option<String>,
+}
+
+/// Every object under `prefix`, at any depth, up to the backend's limit for
+/// a complete listing (100 pages of 1,000). Fails rather than return part.
+pub async fn list_keys(
+    bucket_name: String,
+    prefix: String,
+    expected_profile_id: String,
+    profile_state: State<'_, ProfileState>,
+    s3_state: State<'_, S3State>,
+) -> Result<Vec<ListedKey>> {
+    let profile = profile_state
+        .read()
+        .await
+        .get_active_profile()
+        .await?
+        .ok_or_else(|| AppError::ProfileNotFound("No active profile".into()))?;
+    super::operations::validate_operation_profile(Some(&expected_profile_id), &profile.id)?;
+    let region = {
+        let manager = s3_state.read().await;
+        manager.get_bucket_region(&profile, &bucket_name)
+    };
+    let client = {
+        let mut manager = s3_state.write().await;
+        match &region {
+            Some(region) => manager
+                .get_client_for_region(&profile, region)
+                .await?
+                .clone(),
+            None => manager.get_client(&profile).await?.clone(),
+        }
+    };
+    let objects = crate::s3::listing::list_recursive(&client, &bucket_name, &prefix).await?;
+    Ok(objects
+        .into_iter()
+        .filter_map(|object| {
+            Some(ListedKey {
+                key: object.key?,
+                size: object
+                    .size
+                    .and_then(|size| u64::try_from(size).ok())
+                    .unwrap_or(0),
+                etag: object.e_tag,
+            })
+        })
+        .collect())
+}
+
 fn within_limit(have: usize, more: usize, max_bytes: u64) -> bool {
     have.checked_add(more)
         .and_then(|total| u64::try_from(total).ok())

@@ -6,9 +6,11 @@ pub mod objects;
 pub mod operations;
 pub mod preview;
 pub mod profiles;
+pub mod replace;
 pub mod sync;
 pub mod transfer;
 pub mod urls;
+pub mod version_ops;
 pub mod versions;
 
 #[cfg(test)]

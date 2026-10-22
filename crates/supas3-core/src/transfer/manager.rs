@@ -170,6 +170,10 @@ impl TransferManager {
     async fn persist_or_log(&self) {
         if let Err(error) = self.persist_jobs().await {
             log::error!("Transfer recovery journal could not be saved: {error}");
+            // The interface says so; the transfers themselves go on.
+            if let Some(app) = self.app_handle.read().await.as_ref() {
+                let _ = app.emit("transfer-journal-error", error.to_string());
+            }
         }
     }
 
@@ -402,6 +406,10 @@ impl TransferManager {
                     new_job.remote_source = job.remote_source.clone();
                     new_job.url_import = job.url_import.clone();
                     new_job.restore_guard = job.restore_guard.clone();
+                    // A retried replacement still replaces only what the
+                    // user saw.
+                    new_job.replace_etag = job.replace_etag.clone();
+                    new_job.version_id = job.version_id.clone();
                     new_job.bandwidth_limit = job.bandwidth_limit;
 
                     // Preserve grouping info
@@ -685,6 +693,49 @@ impl TransferManager {
         }
     }
 
+    /// Keeps the ETag the service gave an uploaded object, so whoever waits
+    /// on the upload can tell the stored object is the one written.
+    async fn record_result_etag(&self, id: &str, etag: Option<&str>) {
+        let Some(etag) = etag else {
+            return;
+        };
+        let synced = {
+            let mut jobs = self.jobs.write().await;
+            jobs.get_mut(id).and_then(|job| {
+                job.result_etag = Some(etag.to_string());
+                job.sync_source.as_ref().map(|source| {
+                    super::sync_state::record_key(&source.profile_identity, &job.bucket, &job.key)
+                })
+            })
+        };
+        // A sync upload remembers what it wrote, so the next comparison can
+        // tell the object is still this file.
+        let journal = self.journal.lock().await.clone();
+        if let (Some(key), Some(path)) = (
+            synced,
+            journal.as_deref().and_then(super::sync_state::path_beside),
+        ) {
+            let etag = etag.to_string();
+            let saved =
+                tokio::task::spawn_blocking(move || super::sync_state::record(&path, key, &etag))
+                    .await;
+            if !matches!(saved, Ok(Ok(()))) {
+                log::warn!("Could not record a sync upload; it will be compared as unknown.");
+            }
+        }
+    }
+
+    /// Every ETag recorded for sync uploads, by `sync_state::record_key`.
+    pub async fn sync_records(&self) -> std::collections::HashMap<String, String> {
+        let journal = self.journal.lock().await.clone();
+        match journal.as_deref().and_then(super::sync_state::path_beside) {
+            Some(path) => tokio::task::spawn_blocking(move || super::sync_state::load(&path))
+                .await
+                .unwrap_or_default(),
+            None => Default::default(),
+        }
+    }
+
     async fn update_job_progress(&self, id: &str, processed: u64) {
         {
             let mut jobs = self.jobs.write().await;
@@ -799,6 +850,15 @@ impl TransferManager {
             if let Some(attributes) = &attributes {
                 request = super::sync::apply_put(request, attributes);
             }
+            let sync_metadata = job.sync_source.as_ref().map(|source| {
+                super::sync_state::with_hash(
+                    attributes.and_then(|a| a.head.metadata.as_ref()),
+                    &source.sha256,
+                )
+            });
+            if let Some(metadata) = &sync_metadata {
+                request = request.set_metadata(Some(metadata.clone()));
+            }
             let without_acl = if let Some(attributes) = &attributes {
                 let body = ByteStream::from_path(&job.local_path)
                     .await
@@ -816,11 +876,17 @@ impl TransferManager {
                         job.bandwidth_limit.unwrap_or(0),
                     ));
                 Some(
-                    super::sync::apply_put(request, attributes)
-                        .set_grant_full_control(None)
-                        .set_grant_read(None)
-                        .set_grant_read_acp(None)
-                        .set_grant_write_acp(None),
+                    // Only a sync upload replaces the metadata; anything
+                    // else keeps what `apply_put` carried over.
+                    match &sync_metadata {
+                        Some(metadata) => super::sync::apply_put(request, attributes)
+                            .set_metadata(Some(metadata.clone())),
+                        None => super::sync::apply_put(request, attributes),
+                    }
+                    .set_grant_full_control(None)
+                    .set_grant_read(None)
+                    .set_grant_read_acp(None)
+                    .set_grant_write_acp(None),
                 )
             } else {
                 None
@@ -844,7 +910,7 @@ impl TransferManager {
                 }
             };
             match tokio::time::timeout(timeout, send).await {
-                Ok(Ok(_)) => {}
+                Ok(Ok(output)) => self.record_result_etag(&job.id, output.e_tag()).await,
                 Ok(Err(error)) => {
                     return Err(crate::error::AppError::S3Error(format!(
                         "Single-part upload failed for s3://{}/{}: {}",
@@ -888,6 +954,12 @@ impl TransferManager {
             .content_type(content_type);
         if let Some(attributes) = attributes {
             create_request = super::sync::apply_multipart(create_request, attributes);
+        }
+        if let Some(source) = &job.sync_source {
+            create_request = create_request.set_metadata(Some(super::sync_state::with_hash(
+                attributes.and_then(|a| a.head.metadata.as_ref()),
+                &source.sha256,
+            )));
         }
         let create_send = async {
             let result = create_request.clone().send().await;
@@ -1038,7 +1110,7 @@ impl TransferManager {
                 .multipart_upload(completed_upload)
                 .send();
             match tokio::time::timeout(METADATA_REQUEST_TIMEOUT, complete_send).await {
-                Ok(Ok(_)) => {}
+                Ok(Ok(output)) => self.record_result_etag(&job.id, output.e_tag()).await,
                 Ok(Err(error)) => {
                     return Err(crate::error::AppError::S3Error(format!(
                         "Could not complete multipart upload for s3://{}/{}: {}",
@@ -1318,7 +1390,12 @@ impl TransferManager {
             TransferType::Download => {
                 let result = tokio::time::timeout(
                     METADATA_REQUEST_TIMEOUT,
-                    client.get_object().bucket(&job.bucket).key(&job.key).send(),
+                    client
+                        .get_object()
+                        .bucket(&job.bucket)
+                        .key(&job.key)
+                        .set_version_id(job.version_id.clone())
+                        .send(),
                 )
                 .await;
 
@@ -1353,6 +1430,7 @@ impl TransferManager {
                                     .get_object()
                                     .bucket(&job.bucket)
                                     .key(&job.key)
+                                    .set_version_id(job.version_id.clone())
                                     .send(),
                             )
                             .await
@@ -1380,6 +1458,19 @@ impl TransferManager {
                     }
                 };
 
+                // A version asked for by id must be the one that arrived.
+                if let Some(expected) = &job.version_id {
+                    // In a bucket without versioning the one version is
+                    // "null", and the answer may name no version at all.
+                    let answered = output.version_id().unwrap_or("null");
+                    if answered != expected {
+                        return Err(crate::error::AppError::S3Error(format!(
+                            "The service returned a different version of s3://{}/{} than the one \
+                             asked for; nothing was saved.",
+                            job.bucket, job.key
+                        )));
+                    }
+                }
                 let destination = job.download_destination.as_ref().ok_or_else(|| {
                     crate::error::AppError::IoError(
                         "Missing download destination. Queue the download again.".to_string(),
@@ -2172,6 +2263,35 @@ mod tests {
             })
             .unwrap();
         assert_eq!(std::fs::read_to_string(backup).unwrap(), "broken");
+    }
+
+    #[tokio::test]
+    async fn a_journal_that_stops_saving_later_is_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = TransferManager::new();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_seen = seen.clone();
+        manager
+            .set_app_handle(crate::host::AppHandle::new(Arc::new(move |event| {
+                sink_seen.lock().unwrap().push(event)
+            })))
+            .await;
+        let journal = root.path().join("transfers.json");
+        *manager.journal.lock().await = Some(journal.clone());
+        let job = test_job(TransferStatus::Completed);
+        manager.try_add_jobs(vec![job.clone()]).await.unwrap();
+        // The journal cannot be replaced any more: a folder in its place.
+        std::fs::remove_file(&journal).unwrap();
+        std::fs::create_dir(&journal).unwrap();
+        std::fs::write(journal.join("blocker"), b"x").unwrap();
+        assert!(manager.remove_job(&job.id).await);
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|event| event.name == "transfer-journal-error"),
+            "{:?}",
+            seen.iter().map(|event| &event.name).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

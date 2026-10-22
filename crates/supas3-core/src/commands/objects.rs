@@ -747,7 +747,9 @@ pub async fn search_objects(
             if key.ends_with('/') && size == 0 {
                 continue;
             }
-            if key.to_lowercase().contains(&query_lower) {
+            // Match below the place searched, not the place itself.
+            let below = key.strip_prefix(prefix_str.as_str()).unwrap_or(key);
+            if below.to_lowercase().contains(&query_lower) {
                 objects.push(S3Object {
                     key: key.to_string(),
                     size,
@@ -994,7 +996,10 @@ pub async fn get_object_content(
                         crate::error::AppError::S3Error(format!("Retry get content failed: {}", e))
                     })?
             } else {
-                return Err(crate::error::AppError::S3Error(err.to_string()));
+                return Err(crate::error::AppError::S3Error(format!(
+                    "{}",
+                    aws_sdk_s3::error::DisplayErrorContext(&err)
+                )));
             }
         }
     };

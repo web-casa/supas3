@@ -104,7 +104,9 @@ pub async fn stage(
         .set_content_disposition(output.content_disposition.clone())
         .set_content_encoding(output.content_encoding.clone())
         .set_content_language(output.content_language.clone())
-        .set_metadata(output.metadata.clone())
+        .set_metadata(crate::s3::guard::without_e2_metadata(
+            output.metadata.clone(),
+        ))
         .build();
     let temporary = tempfile::NamedTempFile::new()?;
     let mut file = tokio::fs::File::from_std(temporary.reopen()?);

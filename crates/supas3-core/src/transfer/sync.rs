@@ -1,6 +1,6 @@
 //! Local-to-S3 sync primitives. Only an explicitly accepted preview can create sync jobs.
 use crate::commands::operations::{
-    classify_acl_error, copy_acl_headers, encode_object_tags, s3_error_message, CopyAclHeaders,
+    classify_acl_error, encode_object_tags, s3_error_message, CopyAclHeaders,
 };
 use crate::error::{AppError, Result};
 use aws_sdk_s3::{operation::head_object::HeadObjectOutput, Client};
@@ -208,6 +208,7 @@ pub struct Attributes {
 
 fn permission_headers(
     output: &aws_sdk_s3::operation::get_object_acl::GetObjectAclOutput,
+    owner_without_id: bool,
 ) -> Result<Option<CopyAclHeaders>> {
     // MinIO's documented dummy ACL has exactly one anonymous CanonicalUser
     // FULL_CONTROL grant and an empty owner. It carries no per-object grants.
@@ -228,7 +229,7 @@ fn permission_headers(
     if empty_owner && placeholder {
         Ok(None)
     } else {
-        copy_acl_headers(output).map(Some)
+        crate::commands::operations::acl_to_preserve(output, owner_without_id)
     }
 }
 
@@ -264,7 +265,10 @@ pub async fn attributes(
             .send()
             .await
         {
-            Ok(a) => permission_headers(&a)?,
+            Ok(a) => permission_headers(
+                &a,
+                crate::s3::guard::owner_grant_without_id_is_default(client),
+            )?,
             Err(e)
                 if matches!(
                     classify_acl_error(&s3_error_message(&e)),
@@ -447,12 +451,12 @@ mod tests {
             )
             .build();
         let placeholder = GetObjectAclOutput::builder().grants(grant.clone()).build();
-        assert!(permission_headers(&placeholder).unwrap().is_none());
+        assert!(permission_headers(&placeholder, false).unwrap().is_none());
         let additional = GetObjectAclOutput::builder()
             .grants(grant.clone())
             .grants(grant)
             .build();
-        assert!(permission_headers(&additional).is_err());
+        assert!(permission_headers(&additional, false).is_err());
         let real = GetObjectAclOutput::builder()
             .grants(
                 Grant::builder()
@@ -467,7 +471,7 @@ mod tests {
                     .build(),
             )
             .build();
-        assert!(permission_headers(&real).unwrap().is_some());
+        assert!(permission_headers(&real, false).unwrap().is_some());
     }
     #[test]
     fn maps_contents_not_parent_and_snapshots_exact_bytes() {

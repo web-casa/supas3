@@ -4,21 +4,27 @@ A native desktop application for browsing object storage and moving files betwee
 
 [简体中文](README.zh-CN.md)
 
-> **Status:** first public version, 0.1.0. It has been tested against real buckets on the services listed below, but it is new software: keep a copy of anything you cannot afford to lose.
+> **Status:** version 0.2.0. It has been tested against real buckets on the services listed below, but it is new software: keep a copy of anything you cannot afford to lose.
 
 ## What it does
 
 - Two panes side by side, each with its own tabs. Either pane shows a folder on this computer or a location in any connection.
 - Upload, download, copy within a connection, and copy between two connections. A copy between connections passes through this computer and says so before it starts.
+- Move items to the other pane, from the menu or by dragging with Command held on macOS or Shift on Windows and Linux. Each original is removed only after its copy has been checked; anything that cannot be checked keeps its original.
+- New folder and rename, in storage and on this computer. A folder in storage is renamed object by object, in the background.
 - A transfer list with progress, cancel and retry.
-- Delete files and folders, after a confirmation.
-- Open text files to read or edit them, and view PNG, JPEG and simple WebP images.
+- Delete files and folders, after a confirmation. On this computer they go to the recycle bin.
+- Sort by name, size or date, filter the rows shown, and search names below a location in a bucket.
+- Open text files of up to 8 MiB in a tab to read or edit them, and view PNG, JPEG and simple WebP images with zoom. Quitting or closing the window asks about unsaved edits.
+- Change an object's Content-Type, and see or change whether it is private or public, from the details panel.
+- Set how many transfers run at once and a speed limit for each transfer.
 - Make a signed link to an object that expires after an hour, a day or a week.
-- Show an object's version history and restore an older version, on buckets with versioning turned on.
+- Show an object's version history, download a chosen version, and restore an older version or delete a version for good on buckets with versioning turned on.
 - Sync a folder on this computer to storage: compare first, see what would be uploaded, then start. Nothing in storage is deleted.
+- A details panel for the selected item, a sidebar that collapses to icons, and keyboard movement between the sidebar and the panes.
 - English and 简体中文, light and dark appearance.
 
-An upload or a copy refuses to replace an object that already exists. Saving an edited file and syncing a changed file are the two places that replace an object on purpose, and both first check that it has not changed since it was read. On some services and operations these checks are a separate request made just before the write, so a change made by someone else in between is not noticed; the editor says so when that applies to the connection.
+When a copy finds a name already taken, it asks whether to skip the item, keep both under a new name, or replace the existing file or object. A replacement, like saving an edited file or syncing a changed file, goes ahead only if what it replaces has not changed since it was seen. A move offers only skip and keep both. On some services and operations these checks are a separate request made just before the write, so a change made by someone else in between is not noticed; the editor says so when that applies to the connection.
 
 ## Storage services
 
@@ -27,11 +33,11 @@ An upload or a copy refuses to replace an object that already exists. Saving an 
 | Alibaba Cloud OSS | Tested against a real bucket |
 | Tencent Cloud COS | Tested against a real bucket |
 | Cloudflare R2 (as a generic S3-compatible service) | Tested against a real bucket |
-| IDrive e2 (as a generic S3-compatible service) | Browsing, upload, download and delete tested. Copying, saving an edited file and replacing a file during sync fail on buckets that report object owners without an ID |
+| IDrive e2 | Tested against a real bucket, with its own preset. Copying, saving and replacing check first and then write, which is not atomic. Sync recognises unchanged files only after supaS3 itself uploaded them |
 | Huawei Cloud OBS | Implemented from Huawei's documentation, not tested |
-| Amazon S3 | Not tested against a real bucket in this version |
+| Amazon S3 | Not tested against a real bucket in this version. Connects with typed keys or with a profile of this computer's AWS configuration |
 
-The domestic cloud services are used through their S3-compatible interface. Version history has been tested only on buckets without versioning; restoring a version follows the services' documentation and is untested.
+The domestic cloud services are used through their S3-compatible interface. Alibaba Cloud requires accounts that started using OSS after 20 March 2025 to reach buckets in mainland China through a custom domain bound to the bucket; supaS3 cannot use such a domain yet, and says so when OSS refuses a request for this reason. Version history has been tested only on buckets without versioning; restoring a version follows the services' documentation and is untested.
 
 ## Install
 

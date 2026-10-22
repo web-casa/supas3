@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use supas3_core::credentials::{CredentialType, Profile};
 
 /// The largest text that is opened for viewing or editing.
-pub const TEXT_LIMIT: u64 = 2 * 1024 * 1024;
+pub const TEXT_LIMIT: u64 = 8 * 1024 * 1024;
 
 /// The largest image that is fetched and decoded.
 pub const IMAGE_LIMIT: u64 = 20 * 1024 * 1024;
@@ -192,6 +192,140 @@ pub fn image_fits(width: u32, height: u32) -> bool {
     width > 0 && height > 0 && u64::from(width) * u64::from(height) <= IMAGE_PIXEL_LIMIT
 }
 
+/// The largest object whose Content-Type is changed here: larger ones are
+/// copied in parts, and the last step of that copy takes no condition.
+pub const CONTENT_TYPE_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Whether an object of this storage class cannot be copied until it is
+/// restored: archive classes refuse CopyObject.
+pub fn needs_restore(storage_class: Option<&str>) -> bool {
+    storage_class.is_some_and(|class| {
+        let class = class.to_ascii_uppercase();
+        class == "GLACIER" || class.contains("ARCHIVE")
+    })
+}
+
+/// Who may read an object, as far as the two choices offered here go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Only the owner has any grant.
+    Private,
+    /// The owner, and anyone may read.
+    PublicRead,
+    /// Grants neither choice expresses; changing replaces them.
+    Custom,
+}
+
+/// Whether a group is everyone: AWS names it
+/// `http://acs.amazonaws.com/groups/global/AllUsers`, Tencent COS
+/// `http://cam.qcloud.com/groups/global/AllUsers`.
+fn is_all_users(uri: &str) -> bool {
+    uri.strip_prefix("http://")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(_, path)| path == "groups/global/AllUsers")
+}
+
+/// One grant of an object's ACL, as far as it matters here.
+pub struct Grant<'a> {
+    pub grantee_type: Option<&'a str>,
+    pub id: Option<&'a str>,
+    pub uri: Option<&'a str>,
+    pub permission: Option<&'a str>,
+}
+
+/// Reads an ACL as one of the two choices, or as custom. On IDrive e2
+/// (`e2`), a single full-control grant to a user without an ID is the
+/// owner's, as e2 lists its default ACL that way; elsewhere a grant without
+/// an ID is someone else's.
+pub fn access_of(owner_id: Option<&str>, grants: &[Grant], e2: bool) -> Access {
+    let owner_id = owner_id.filter(|id| !id.is_empty());
+    let mut public_read = false;
+    for grant in grants {
+        let to_owner = grant.grantee_type == Some("CanonicalUser")
+            && match (grant.id.filter(|id| !id.is_empty()), owner_id) {
+                (Some(id), Some(owner)) => id == owner,
+                (None, _) => e2 && grants.len() == 1,
+                (Some(_), None) => false,
+            };
+        match (to_owner, grant.uri, grant.permission) {
+            (true, _, Some("FULL_CONTROL")) => {}
+            (false, Some(uri), Some("READ"))
+                if grant.grantee_type == Some("Group") && is_all_users(uri) =>
+            {
+                public_read = true
+            }
+            _ => return Access::Custom,
+        }
+    }
+    if public_read {
+        Access::PublicRead
+    } else {
+        Access::Private
+    }
+}
+
+/// How large an image is shown: fitted into the view, never above its own
+/// size, or at a chosen scale where one image pixel is `scale` pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Zoom {
+    Fit,
+    Scale(f32),
+}
+
+/// The smallest and largest scale, and the factor of one zoom step.
+pub const ZOOM_RANGE: (f32, f32) = (0.25, 4.0);
+const ZOOM_STEP: f32 = 1.25;
+
+impl Zoom {
+    /// The scale that fits an image of `image` pixels into `view`, not
+    /// above its own size.
+    pub fn fit_scale(image: (u32, u32), view: (f32, f32)) -> f32 {
+        let (width, height) = (image.0.max(1) as f32, image.1.max(1) as f32);
+        (view.0 / width)
+            .min(view.1 / height)
+            .clamp(f32::MIN_POSITIVE, 1.0)
+    }
+
+    /// The scale in use, given the fitting one.
+    pub fn scale(self, fit: f32) -> f32 {
+        match self {
+            Self::Fit => fit,
+            Self::Scale(scale) => scale,
+        }
+    }
+
+    fn step(self, fit: f32, factor: f32) -> Self {
+        let scale = (self.scale(fit) * factor).clamp(ZOOM_RANGE.0, ZOOM_RANGE.1);
+        // Stepping through actual size lands on it exactly.
+        Self::Scale(if (scale - 1.0).abs() < 0.05 {
+            1.0
+        } else {
+            scale
+        })
+    }
+
+    pub fn zoomed_in(self, fit: f32) -> Self {
+        self.step(fit, ZOOM_STEP)
+    }
+
+    pub fn zoomed_out(self, fit: f32) -> Self {
+        self.step(fit, 1.0 / ZOOM_STEP)
+    }
+
+    pub fn can_zoom_in(self, fit: f32) -> bool {
+        self.scale(fit) < ZOOM_RANGE.1
+    }
+
+    pub fn can_zoom_out(self, fit: f32) -> bool {
+        self.scale(fit) > ZOOM_RANGE.0
+    }
+
+    /// The scale as a whole percentage.
+    pub fn percent(self, fit: f32) -> u32 {
+        (self.scale(fit) * 100.0).round() as u32
+    }
+}
+
 /// The translation key for a bucket's versioning status as the service
 /// reports it.
 pub fn versioning_key(status: &str) -> &'static str {
@@ -199,6 +333,41 @@ pub fn versioning_key(status: &str) -> &'static str {
         "Enabled" => "versions.status_enabled",
         "Suspended" => "versions.status_suspended",
         _ => "versions.status_disabled",
+    }
+}
+
+/// Whether a version can be downloaded: a delete marker has no content.
+pub fn can_download_version(is_delete_marker: bool) -> bool {
+    !is_delete_marker
+}
+
+/// Whether a version can be deleted for good: anything but the current
+/// data version, which is what the object is now.
+pub fn can_delete_version(is_latest: bool, is_delete_marker: bool) -> bool {
+    !is_latest || is_delete_marker
+}
+
+/// What deleting the version at `index` of `versions` (newest first) does,
+/// as a translation key.
+pub fn version_delete_note(
+    versions: &[supas3_core::s3::versions::Version],
+    index: usize,
+) -> &'static str {
+    let Some(version) = versions.get(index) else {
+        return "versions.delete_data_note";
+    };
+    if !version.is_delete_marker {
+        return "versions.delete_data_note";
+    }
+    let older_is_data = versions
+        .get(index + 1)
+        .is_some_and(|older| !older.is_delete_marker);
+    if version.is_latest && older_is_data {
+        "versions.delete_marker_reappears"
+    } else if version.is_latest {
+        "versions.delete_marker_current"
+    } else {
+        "versions.delete_marker_no_change"
     }
 }
 
@@ -443,6 +612,45 @@ mod tests {
     }
 
     #[test]
+    fn which_versions_can_be_downloaded_or_deleted() {
+        use supas3_core::s3::versions::Version;
+        let version = |latest: bool, marker: bool| Version {
+            version_id: "v".into(),
+            is_latest: latest,
+            is_delete_marker: marker,
+            size: None,
+            modified: None,
+            etag: None,
+        };
+        assert!(super::can_download_version(false));
+        assert!(!super::can_download_version(true));
+        assert!(!super::can_delete_version(true, false));
+        assert!(super::can_delete_version(true, true));
+        assert!(super::can_delete_version(false, false));
+        let history = [
+            version(true, true),
+            version(false, false),
+            version(false, true),
+        ];
+        assert_eq!(
+            super::version_delete_note(&history, 0),
+            "versions.delete_marker_reappears"
+        );
+        assert_eq!(
+            super::version_delete_note(&history, 1),
+            "versions.delete_data_note"
+        );
+        assert_eq!(
+            super::version_delete_note(&history, 2),
+            "versions.delete_marker_no_change"
+        );
+        assert_eq!(
+            super::version_delete_note(&[version(true, true)], 0),
+            "versions.delete_marker_current"
+        );
+    }
+
+    #[test]
     fn a_row_names_the_exact_file_or_object() {
         let remote = Location::objects("p", "bucket", "a//b/");
         assert_eq!(
@@ -650,5 +858,119 @@ mod tests {
         assert!(!replaces.may_start(false));
         assert!(replaces.may_start(true));
         assert!(!SyncCounts::default().may_start(true));
+    }
+
+    #[test]
+    fn zoom_steps_from_the_fitted_size_and_stays_in_range() {
+        // A 2000×1000 image in a 500×500 view fits at a quarter.
+        let fit = Zoom::fit_scale((2000, 1000), (500.0, 500.0));
+        assert_eq!(fit, 0.25);
+        assert_eq!(Zoom::Fit.percent(fit), 25);
+        assert!(!Zoom::Fit.can_zoom_out(fit));
+        assert_eq!(Zoom::Fit.zoomed_out(fit), Zoom::Scale(0.25));
+        assert_eq!(Zoom::Fit.zoomed_in(fit), Zoom::Scale(0.3125));
+
+        // A small image is not blown up to fit.
+        assert_eq!(Zoom::fit_scale((10, 10), (500.0, 500.0)), 1.0);
+        assert_eq!(Zoom::fit_scale((0, 0), (500.0, 500.0)), 1.0);
+
+        // Stepping lands on actual size, and stops at the largest scale.
+        let mut zoom = Zoom::Scale(0.5);
+        let mut seen_actual = false;
+        while zoom.can_zoom_in(fit) {
+            zoom = zoom.zoomed_in(fit);
+            seen_actual |= zoom == Zoom::Scale(1.0);
+        }
+        assert!(seen_actual);
+        assert_eq!(zoom, Zoom::Scale(4.0));
+        assert_eq!(zoom.zoomed_in(fit), Zoom::Scale(4.0));
+        assert_eq!(Zoom::Scale(1.0).percent(fit), 100);
+    }
+
+    const ALL_USERS: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
+
+    #[test]
+    fn acls_are_read_as_private_public_or_custom() {
+        let owner = |id: Option<&'static str>| Grant {
+            grantee_type: Some("CanonicalUser"),
+            id,
+            uri: None,
+            permission: Some("FULL_CONTROL"),
+        };
+        let everyone = |permission: &'static str| Grant {
+            grantee_type: Some("Group"),
+            id: None,
+            uri: Some(ALL_USERS),
+            permission: Some(permission),
+        };
+        assert_eq!(
+            access_of(Some("me"), &[owner(Some("me"))], false),
+            Access::Private
+        );
+        // e2: the owner's grant has no ID, and the owner's own ID is empty.
+        assert_eq!(access_of(Some(""), &[owner(None)], true), Access::Private);
+        // Elsewhere, or beside other grants, a grant without an ID is not
+        // known to be the owner's.
+        assert_eq!(access_of(Some(""), &[owner(None)], false), Access::Custom);
+        assert_eq!(
+            access_of(Some(""), &[owner(None), owner(None)], true),
+            Access::Custom
+        );
+        assert_eq!(access_of(None, &[], false), Access::Private);
+        assert_eq!(
+            access_of(Some("me"), &[owner(Some("me")), everyone("READ")], false),
+            Access::PublicRead
+        );
+        // Anything else is kept apart, so changing it can be warned about.
+        assert_eq!(
+            access_of(Some("me"), &[owner(Some("me")), everyone("WRITE")], false),
+            Access::Custom
+        );
+        assert_eq!(
+            access_of(Some("me"), &[owner(Some("someone else"))], false),
+            Access::Custom
+        );
+        assert_eq!(
+            access_of(None, &[owner(Some("someone"))], false),
+            Access::Custom
+        );
+        let cos_everyone = Grant {
+            uri: Some("http://cam.qcloud.com/groups/global/AllUsers"),
+            ..everyone("READ")
+        };
+        assert_eq!(
+            access_of(Some("me"), &[cos_everyone, owner(Some("me"))], false),
+            Access::PublicRead
+        );
+        let authenticated = Grant {
+            uri: Some("http://acs.amazonaws.com/groups/global/AuthenticatedUsers"),
+            ..everyone("READ")
+        };
+        assert_eq!(
+            access_of(Some("me"), &[owner(Some("me")), authenticated], false),
+            Access::Custom
+        );
+        let read_only = Grant {
+            permission: Some("READ"),
+            ..owner(Some("me"))
+        };
+        assert_eq!(access_of(Some("me"), &[read_only], false), Access::Custom);
+    }
+
+    #[test]
+    fn archived_objects_are_known_to_refuse_a_copy() {
+        for class in [
+            "GLACIER",
+            "DEEP_ARCHIVE",
+            "Archive",
+            "ColdArchive",
+            "ARCHIVE",
+        ] {
+            assert!(needs_restore(Some(class)), "{class}");
+        }
+        for class in ["STANDARD", "GLACIER_IR", "IA", "STANDARD_IA"] {
+            assert!(!needs_restore(Some(class)), "{class}");
+        }
+        assert!(!needs_restore(None));
     }
 }

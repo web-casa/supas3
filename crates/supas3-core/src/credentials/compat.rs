@@ -19,6 +19,8 @@ pub enum Provider {
     Cos,
     /// Huawei Cloud OBS.
     Obs,
+    /// IDrive e2.
+    IdriveE2,
 }
 
 /// Where the bucket name goes in a request URL.
@@ -60,6 +62,12 @@ pub enum WriteGuard {
     /// The service has no usable header, so the client checks first and then
     /// writes. This is not atomic.
     CheckFirst,
+    /// IDrive e2, measured: `If-None-Match` refuses an existing object on
+    /// PutObject but is ignored on CopyObject and when completing a
+    /// multipart upload; `If-Match` is refused even with the current ETag on
+    /// encrypted buckets. New objects keep the header; everything else is
+    /// checked first.
+    IdriveE2,
 }
 
 impl WriteGuard {
@@ -68,7 +76,7 @@ impl WriteGuard {
         match self {
             Self::OssForbidOverwrite => Some("x-oss-forbid-overwrite"),
             Self::CosForbidOverwrite => Some("x-cos-forbid-overwrite"),
-            Self::Conditional | Self::CheckFirst => None,
+            Self::Conditional | Self::CheckFirst | Self::IdriveE2 => None,
         }
     }
 
@@ -112,6 +120,7 @@ impl Compatibility {
                 WriteGuard::CosForbidOverwrite,
             ),
             Provider::Obs => (Addressing::Virtual, ListVersion::V1, WriteGuard::CheckFirst),
+            Provider::IdriveE2 => (Addressing::Path, ListVersion::V2, WriteGuard::IdriveE2),
         };
         Self {
             provider,
@@ -163,6 +172,11 @@ mod tests {
         assert_eq!(obs.write_guard.forbid_overwrite_header(), None);
         assert!(!obs.write_guard.honours_if_match_on_write());
         assert!(!Compatibility::is_verified(Provider::Obs));
+
+        let e2 = Compatibility::preset(Provider::IdriveE2);
+        assert_eq!(e2.write_guard, WriteGuard::IdriveE2);
+        assert!(!e2.write_guard.honours_if_match_on_write());
+        assert!(Compatibility::is_verified(Provider::IdriveE2));
 
         assert_eq!(
             Compatibility::preset(Provider::Generic),

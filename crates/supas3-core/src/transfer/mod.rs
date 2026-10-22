@@ -5,6 +5,7 @@ pub mod public_url;
 pub mod remote;
 mod speed;
 pub mod sync;
+pub mod sync_state;
 pub mod url_import;
 pub mod web;
 
@@ -56,6 +57,17 @@ pub struct TransferJob {
     pub remote_source: Option<remote::RemoteSource>,
     #[serde(default)]
     pub restore_guard: Option<crate::s3::versions::RestoreGuard>,
+    /// For a download of one version of an object: that version. The
+    /// download fails if the service answers with another.
+    #[serde(default)]
+    pub version_id: Option<String>,
+    /// The ETag of an existing target the user chose to replace. The write
+    /// goes ahead only while the target still has it.
+    #[serde(default)]
+    pub replace_etag: Option<String>,
+    /// The ETag the service gave the object an upload wrote.
+    #[serde(default)]
+    pub result_etag: Option<String>,
     #[serde(default)]
     pub bandwidth_limit: Option<u64>,
     #[serde(skip)]
@@ -97,7 +109,8 @@ impl TransferJob {
             None => self
                 .sync_source
                 .as_ref()
-                .and_then(|s| s.expected_etag.as_deref()),
+                .and_then(|s| s.expected_etag.as_deref())
+                .or(self.replace_etag.as_deref()),
         }
     }
     pub fn new(
@@ -122,6 +135,9 @@ impl TransferJob {
             sync_source: None,
             remote_source: None,
             restore_guard: None,
+            version_id: None,
+            replace_etag: None,
+            result_etag: None,
             bandwidth_limit: None,
             download_destination: None,
             transfer_type,

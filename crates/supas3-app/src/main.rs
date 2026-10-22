@@ -4,26 +4,37 @@
 // Release builds on Windows are GUI programs and must not open a console.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod app_jobs;
 mod app_state;
+mod aws_profiles;
 mod backend;
+mod conflicts;
 mod connection;
 mod connection_form;
+mod content_type_view;
+mod details;
+mod details_view;
 mod entries_table;
 mod error_details;
+mod file_ops;
 mod i18n;
 mod listing;
+mod local_copy;
 mod location;
+mod moves;
+mod name_dialog;
 mod object_actions;
 mod object_view;
 mod pane;
 mod places;
-mod properties_view;
+mod search_view;
 mod settings;
 mod share_view;
 mod sync_view;
 mod task_center;
 mod tasks;
 mod transfer_plan;
+mod transfers_view;
 mod versions_view;
 mod workspace;
 
@@ -35,10 +46,58 @@ use workspace::Workspace;
 
 rust_i18n::i18n!("locales", fallback = "en");
 
-actions!(supas3, [About, Quit, CloseWindow, Minimize]);
+actions!(
+    supas3,
+    [
+        About,
+        Quit,
+        CloseWindow,
+        Minimize,
+        ToggleSidebar,
+        ToggleDetails,
+        NewFolder,
+        RenameSelection,
+        FilterRows
+    ]
+);
+
+/// The main window's workspace, for application actions.
+struct MainWorkspace(WeakEntity<Workspace>);
+
+impl Global for MainWorkspace {}
+
+/// Runs `action` on the main window's workspace, if it is open.
+fn with_workspace(
+    cx: &mut App,
+    action: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+) {
+    let Some(workspace) = cx
+        .try_global::<MainWorkspace>()
+        .and_then(|main| main.0.upgrade())
+    else {
+        return;
+    };
+    with_front_window(cx, move |window, cx| {
+        workspace.update(cx, |workspace, cx| action(workspace, window, cx));
+    });
+}
+
+/// Leaves through the workspace, which asks about unsaved edits first.
+/// Returns false when there is no workspace to ask.
+fn leave_workspace(cx: &mut App, how: workspace::Leave) -> bool {
+    let open = cx
+        .try_global::<MainWorkspace>()
+        .is_some_and(|main| main.0.upgrade().is_some());
+    if open {
+        with_workspace(cx, move |workspace, window, cx| {
+            workspace.leave(how, window, cx)
+        });
+    }
+    open
+}
 
 /// Stops the backend, then ends the program. Every way of quitting ends here.
-fn quit(cx: &mut App) {
+pub(crate) fn quit(cx: &mut App) {
     AppBackend::shutdown(cx);
     cx.quit();
 }
@@ -77,6 +136,10 @@ pub fn set_app_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action(t!("menu.quit").into_owned(), Quit),
         ]),
+        Menu::new(t!("menu.file").into_owned()).items([
+            MenuItem::action(t!("menu.new_folder").into_owned(), NewFolder),
+            MenuItem::action(t!("menu.rename").into_owned(), RenameSelection),
+        ]),
         Menu::new(t!("menu.edit").into_owned()).items([
             MenuItem::os_action(t!("menu.undo").into_owned(), Undo, OsAction::Undo),
             MenuItem::os_action(t!("menu.redo").into_owned(), Redo, OsAction::Redo),
@@ -90,6 +153,12 @@ pub fn set_app_menus(cx: &mut App) {
                 OsAction::SelectAll,
             ),
         ]),
+        Menu::new(t!("menu.view").into_owned()).items([
+            MenuItem::action(t!("menu.toggle_sidebar").into_owned(), ToggleSidebar),
+            MenuItem::action(t!("menu.toggle_details").into_owned(), ToggleDetails),
+            MenuItem::separator(),
+            MenuItem::action(t!("menu.filter").into_owned(), FilterRows),
+        ]),
         Menu::new(t!("menu.window").into_owned()).items([
             MenuItem::action(t!("menu.minimize").into_owned(), Minimize),
             MenuItem::action(t!("menu.close_window").into_owned(), CloseWindow),
@@ -97,11 +166,15 @@ pub fn set_app_menus(cx: &mut App) {
     ]);
 }
 
-/// Runs `action` on the window in front, if there is one.
-fn with_front_window(cx: &mut App, action: impl FnOnce(&mut Window, &mut App)) {
-    if let Some(window) = cx.active_window().or_else(|| cx.windows().first().copied()) {
-        let _ = window.update(cx, |_, window, cx| action(window, cx));
-    }
+/// Runs `action` on the window in front, if there is one. It runs once the
+/// current event is handled: an action from a key press arrives while the
+/// window is being updated, when it cannot be updated again.
+fn with_front_window(cx: &mut App, action: impl FnOnce(&mut Window, &mut App) + 'static) {
+    cx.defer(move |cx| {
+        if let Some(window) = cx.active_window().or_else(|| cx.windows().first().copied()) {
+            let _ = window.update(cx, |_, window, cx| action(window, cx));
+        }
+    });
 }
 
 fn main() {
@@ -121,6 +194,9 @@ fn main() {
     let events = std::sync::Arc::new(tasks::EventQueue::default());
     let sink = events.sink();
     let started = config_dir.and_then(|dir| backend::Backend::start(dir, sink));
+    if let Ok(backend) = &started {
+        backend.apply_transfer_limits(settings.transfers);
+    }
 
     let application = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     // macOS keeps a program in the Dock while it is ending. If its icon is
@@ -132,6 +208,10 @@ fn main() {
             return;
         }
         if AppBackend::requests(cx).is_some() {
+            // Preferences changed since launch are on disk.
+            let settings = backend::default_config_dir()
+                .map(|dir| Settings::load(&dir))
+                .unwrap_or(settings);
             open_main_window(settings, reopen_events.clone(), cx);
         } else {
             cx.quit();
@@ -141,22 +221,21 @@ fn main() {
         gpui_kit::init(cx);
         i18n::apply(settings.language);
         cx.set_global(AppBackend::new(started));
+        cx.set_global(app_jobs::AppJobs::default());
 
-        // "secondary" is Command on macOS and Control elsewhere. Keys are bound
-        // before the menus are built, so the menus show them.
-        cx.bind_keys([
-            KeyBinding::new("secondary-q", Quit, None),
-            KeyBinding::new("secondary-w", CloseWindow, None),
-        ]);
-        #[cfg(target_os = "macos")]
-        cx.bind_keys([KeyBinding::new("cmd-m", Minimize, None)]);
+        // Keys are bound before the menus are built, so the menus show them.
+        bind_keys(cx);
         set_app_menus(cx);
+        // Both checks read the windows, which a key press is still updating;
+        // they run once it has been handled.
         cx.on_action(|_: &Quit, cx| {
-            if dialog_open(cx) {
-                explain_dialog_open(cx);
-            } else {
-                quit(cx);
-            }
+            cx.defer(|cx| {
+                if dialog_open(cx) {
+                    explain_dialog_open(cx);
+                } else if !leave_workspace(cx, workspace::Leave::Quit) {
+                    quit(cx);
+                }
+            });
         });
         // Quitting from the Dock or when the session ends does not go
         // through the Quit action; stop the backend there too. Stopping it
@@ -168,12 +247,32 @@ fn main() {
         .detach();
         cx.on_action(|_: &About, cx| with_front_window(cx, Workspace::show_about));
         cx.on_action(|_: &CloseWindow, cx| {
-            if dialog_open(cx) {
-                explain_dialog_open(cx);
-            } else {
-                with_front_window(cx, |window, _| window.remove_window());
-            }
+            cx.defer(|cx| {
+                if dialog_open(cx) {
+                    explain_dialog_open(cx);
+                } else if !leave_workspace(cx, workspace::Leave::CloseWindow) {
+                    with_front_window(cx, |window, _| window.remove_window());
+                }
+            });
         });
+        cx.on_action(|_: &ToggleSidebar, cx| {
+            with_workspace(cx, |workspace, window, cx| {
+                workspace.toggle_sidebar(window, cx)
+            });
+        });
+        cx.on_action(|_: &ToggleDetails, cx| {
+            with_workspace(cx, |workspace, window, cx| {
+                workspace.toggle_details(window, cx)
+            });
+        });
+        fn on_pane(cx: &mut App, command: workspace::PaneCommand) {
+            with_workspace(cx, move |workspace, window, cx| {
+                workspace.pane_command(command, window, cx)
+            });
+        }
+        cx.on_action(|_: &NewFolder, cx| on_pane(cx, workspace::PaneCommand::NewFolder));
+        cx.on_action(|_: &RenameSelection, cx| on_pane(cx, workspace::PaneCommand::Rename));
+        cx.on_action(|_: &FilterRows, cx| on_pane(cx, workspace::PaneCommand::Filter));
         cx.on_action(|_: &Minimize, cx| {
             with_front_window(cx, |window, _| window.minimize_window());
         });
@@ -214,6 +313,40 @@ fn main() {
     });
 }
 
+/// The app's shortcuts. "secondary" is Command on macOS and Control
+/// elsewhere.
+fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("secondary-q", Quit, None),
+        KeyBinding::new("secondary-w", CloseWindow, None),
+        KeyBinding::new("secondary-b", ToggleSidebar, None),
+        KeyBinding::new("secondary-i", ToggleDetails, None),
+        KeyBinding::new("secondary-shift-n", NewFolder, None),
+        KeyBinding::new("f2", RenameSelection, None),
+        KeyBinding::new("secondary-f", FilterRows, None),
+        KeyBinding::new("tab", workspace::FocusNextRegion, Some("Workspace")),
+        KeyBinding::new(
+            "shift-tab",
+            workspace::FocusPreviousRegion,
+            Some("Workspace"),
+        ),
+        // Tables would take Tab to move between columns; in a pane it
+        // leaves the pane instead.
+        KeyBinding::new(
+            "tab",
+            workspace::FocusNextRegion,
+            Some("Workspace > DataTable"),
+        ),
+        KeyBinding::new(
+            "shift-tab",
+            workspace::FocusPreviousRegion,
+            Some("Workspace > DataTable"),
+        ),
+    ]);
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([KeyBinding::new("cmd-m", Minimize, None)]);
+}
+
 fn open_main_window(settings: Settings, events: std::sync::Arc<tasks::EventQueue>, cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(1200.), px(760.)), cx)),
@@ -228,11 +361,12 @@ fn open_main_window(settings: Settings, events: std::sync::Arc<tasks::EventQueue
         ..Default::default()
     };
 
-    gpui_kit::open_window(options, cx, move |window, cx| {
+    let (_, workspace) = gpui_kit::open_window(options, cx, move |window, cx| {
         window.activate_window();
         cx.new(|cx| Workspace::new(settings, events.clone(), window, cx))
     })
     .expect("failed to open the main window");
+    cx.set_global(MainWorkspace(workspace.downgrade()));
 }
 
 /// Records panics in `panic.log` in the configuration directory as well as the

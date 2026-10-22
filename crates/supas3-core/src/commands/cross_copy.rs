@@ -23,6 +23,12 @@ pub struct CopyItem {
     pub region: String,
     pub key: String,
     pub is_folder: bool,
+    /// The name to give it at the destination, when not its own.
+    #[serde(default)]
+    pub target_name: Option<String>,
+    /// For a file: the ETag of the existing target to replace.
+    #[serde(default)]
+    pub replace_etag: Option<String>,
 }
 
 fn destination_key(item: &CopyItem, key: &str, prefix: &str) -> Result<String> {
@@ -36,11 +42,18 @@ fn destination_key(item: &CopyItem, key: &str, prefix: &str) -> Result<String> {
     } else {
         &item.key
     };
-    let name = selected
+    let own_name = selected
         .rsplit('/')
         .next()
         .filter(|n| !n.is_empty())
         .ok_or_else(|| AppError::ConfigError("Invalid source name".into()))?;
+    let name = match item.target_name.as_deref() {
+        Some(name) if name.is_empty() || name.contains('/') => {
+            return Err(AppError::ConfigError("Invalid destination name".into()))
+        }
+        Some(name) => name,
+        None => own_name,
+    };
     let suffix = if item.is_folder {
         format!(
             "/{rest}",
@@ -77,6 +90,35 @@ pub async fn copy_between_profiles(
     transfer_state: State<'_, TransferState>,
     app_handle: AppHandle,
 ) -> Result<usize> {
+    queue_between_profiles(
+        items,
+        destination_bucket,
+        destination_region,
+        destination_prefix,
+        expected_profile_id,
+        profile_state,
+        s3_state,
+        transfer_state,
+        app_handle,
+    )
+    .await
+    .map(|ids| ids.len())
+}
+
+/// Queues the copy like `copy_between_profiles` and returns the ids of the
+/// transfers queued, so a caller can follow exactly those.
+#[allow(clippy::too_many_arguments)]
+pub async fn queue_between_profiles(
+    items: Vec<CopyItem>,
+    destination_bucket: String,
+    destination_region: String,
+    destination_prefix: String,
+    expected_profile_id: String,
+    profile_state: State<'_, ProfileState>,
+    s3_state: State<'_, S3State>,
+    transfer_state: State<'_, TransferState>,
+    app_handle: AppHandle,
+) -> Result<Vec<String>> {
     if items.is_empty()
         || items.len() > 10_000
         || destination_bucket.is_empty()
@@ -183,6 +225,9 @@ pub async fn copy_between_profiles(
                     group.clone(),
                     format!("Copy: {} to {}", source.name, destination.name),
                 );
+                if !item.is_folder {
+                    job.replace_etag = item.replace_etag.clone();
+                }
                 job.remote_source = Some(RemoteSource {
                     profile_id: source.id.clone(),
                     profile_identity: source.cache_identity(),
@@ -221,11 +266,10 @@ pub async fn copy_between_profiles(
         }
     }
     let ids: Vec<_> = jobs.iter().map(|j| j.id.clone()).collect();
-    let count = jobs.len();
     transfer_state.set_app_handle(app_handle).await;
     transfer_state.try_add_jobs(jobs).await?;
-    for id in ids {
-        if let Some(job) = transfer_state.get_job(&id).await {
+    for id in &ids {
+        if let Some(job) = transfer_state.get_job(id).await {
             if let crate::transfer::TransferStatus::Failed(error) = job.status {
                 return Err(AppError::IoError(error));
             }
@@ -236,7 +280,7 @@ pub async fn copy_between_profiles(
         .clone()
         .process_queue(s3_state.inner().clone(), profile_state.inner().clone())
         .await;
-    Ok(count)
+    Ok(ids)
 }
 
 #[cfg(test)]
@@ -249,6 +293,8 @@ mod tests {
             region: "r".into(),
             key: key.into(),
             is_folder: folder,
+            target_name: None,
+            replace_etag: None,
         }
     }
     #[test]

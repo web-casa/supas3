@@ -14,6 +14,8 @@ pub struct AppBackend {
 
 impl Global for AppBackend {}
 
+impl Global for crate::app_jobs::AppJobs {}
+
 impl AppBackend {
     pub fn new(started: anyhow::Result<Backend>) -> Self {
         match started {

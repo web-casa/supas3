@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.0
+
+- New folder, and rename of files and folders, in storage and on this computer.
+- Move to the other pane, from the menu or by dragging with Command (macOS) or Shift (Windows and Linux) held. Each original is removed only after its copy has been checked.
+- When a copy's target name is taken: skip, keep both under a new name, or replace only while the existing item is unchanged.
+- Copy between folders on this computer; deleting there moves items to the recycle bin.
+- Sort by name, size or date; filter the rows shown; search names below a location in a bucket.
+- A details panel (Cmd/Ctrl+I), a sidebar that collapses to icons (Cmd/Ctrl+B), keyboard movement between the sidebar and the panes, and menu entries for new folder, rename and filter.
+- Text files open in a tab of the pane, up to 8 MiB; quitting or closing asks about unsaved edits.
+- Download a chosen version of an object, or delete a version for good.
+- A preset for IDrive e2: copying, saving and syncing now work there.
+- A message that explains Alibaba Cloud's refusal of mainland-China buckets through the public endpoint for newer accounts.
+- Transfer settings: how many transfers run at once, and a speed limit for each transfer.
+- Change an object's Content-Type from the details panel, only while the object still has the content shown, and for objects up to 5 GiB.
+- See whether an object is private or public, and change it, from the details panel. IDrive e2 refuses changes to object permissions, so there they are only shown.
+- Zoom in image previews: fit, actual size, and steps between 25% and 400%.
+- Connect to Amazon S3 with a profile of this computer's AWS configuration (~/.aws), whose keys stay there.
+- The Windows installer follows the system language: English or Simplified Chinese.
+
 ## 0.1.0
 
 The first public version.

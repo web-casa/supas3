@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The strip at the bottom of the window that shows transfers.
 
+use crate::app_jobs::AppJobs;
 use crate::app_state::AppBackend;
 use crate::listing::format_size;
-use crate::tasks::{format_speed, EventQueue, Task, TaskFilter, TaskKind, TaskState, Tasks};
+use crate::tasks::{
+    format_speed, EventQueue, Task, TaskFilter, TaskKind, TaskOrigin, TaskState, Tasks,
+};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -23,9 +26,13 @@ const REFRESH: Duration = Duration::from_millis(200);
 /// user asks; every task stays reachable.
 const ROWS_PER_STEP: usize = 200;
 
-/// Emitted when transfers have finished, so panes can show the result.
 pub enum TaskCenterEvent {
+    /// Some work completed, so panes can show the result.
     TransfersFinished,
+    /// Tasks that ended, with how; for work that waits on them.
+    Ended(Vec<(String, TaskState)>),
+    /// The backend could not write something to disk.
+    StorageFailed(Vec<crate::tasks::StorageError>),
 }
 
 pub struct TaskCenter {
@@ -48,6 +55,9 @@ impl TaskCenter {
                 if let Ok(jobs) = requests.transfers().await {
                     let _ = center.update(cx, |center, cx| {
                         center.tasks.merge_snapshot(&jobs);
+                        // Transfers that ended in an earlier run are listed,
+                        // not announced: nothing in this run waits for them.
+                        let _ = center.tasks.take_ended();
                         cx.notify();
                     });
                 }
@@ -57,36 +67,35 @@ impl TaskCenter {
         cx.spawn(async move |center, cx| loop {
             cx.background_executor().timer(REFRESH).await;
             let collected = queue.collect();
-            if collected.is_empty() {
+            let jobs = cx.update(|cx| cx.try_global::<AppJobs>().map(|jobs| jobs.collect()));
+            let jobs = jobs.unwrap_or_default();
+            if collected.is_empty() && jobs.is_empty() {
                 continue;
             }
             let overflowed = collected.overflowed;
             let alive = center.update(cx, |center, cx| {
-                let mut finished = false;
+                if !collected.storage_errors.is_empty() {
+                    cx.emit(TaskCenterEvent::StorageFailed(
+                        collected.storage_errors.clone(),
+                    ));
+                }
                 for job in &collected.added {
-                    finished |= center.tasks.add(job);
+                    center.tasks.add(job);
                 }
                 for update in &collected.updates {
-                    let was_active = center
-                        .tasks
-                        .get(&update.job_id)
-                        .is_some_and(|task| task.state.is_active());
-                    if center.tasks.update(update) && was_active {
-                        let ended = center
-                            .tasks
-                            .get(&update.job_id)
-                            .is_some_and(|task| task.state == TaskState::Completed);
-                        finished |= ended;
-                    }
+                    center.tasks.update(update);
+                }
+                let started = !collected.added.is_empty()
+                    || jobs.iter().any(|job| center.tasks.get(&job.id).is_none());
+                for job in jobs {
+                    center.tasks.upsert_app(job);
                 }
                 // New work is worth seeing; open the strip when it arrives.
-                if !collected.added.is_empty() {
+                if started {
                     center.expanded = true;
                     center.filter = TaskFilter::Current;
                 }
-                if finished {
-                    cx.emit(TaskCenterEvent::TransfersFinished);
-                }
+                center.announce_ended(cx);
                 cx.notify();
             });
             // Too many announcements arrived to keep; read the full list.
@@ -96,6 +105,7 @@ impl TaskCenter {
                     if let Ok(jobs) = requests.transfers().await {
                         let _ = center.update(cx, |center, cx| {
                             center.tasks.merge_snapshot(&jobs);
+                            center.announce_ended(cx);
                             cx.notify();
                         });
                     }
@@ -115,8 +125,41 @@ impl TaskCenter {
         }
     }
 
+    /// Passes on which tasks ended, and whether any completed.
+    fn announce_ended(&mut self, cx: &mut Context<Self>) {
+        let ended = self.tasks.take_ended();
+        if ended.is_empty() {
+            return;
+        }
+        if ended
+            .iter()
+            .any(|(_, state)| *state == TaskState::Completed)
+        {
+            cx.emit(TaskCenterEvent::TransfersFinished);
+        }
+        cx.emit(TaskCenterEvent::Ended(ended));
+    }
+
     /// Runs a request for one task and removes it from the list when asked.
     fn act(&mut self, id: String, action: TaskAction, cx: &mut Context<Self>) {
+        // Work the application runs itself is handled here.
+        if self
+            .tasks
+            .get(&id)
+            .is_some_and(|task| task.origin == TaskOrigin::App)
+        {
+            match action {
+                TaskAction::Cancel => {
+                    if let Some(jobs) = cx.try_global::<AppJobs>() {
+                        jobs.cancel(&id);
+                    }
+                }
+                TaskAction::Remove => self.tasks.remove(&id),
+                TaskAction::Retry => {}
+            }
+            cx.notify();
+            return;
+        }
         let Some(requests) = AppBackend::requests(cx) else {
             return;
         };
@@ -149,7 +192,17 @@ impl TaskCenter {
         let Some(requests) = AppBackend::requests(cx) else {
             return;
         };
-        let ids = self.tasks.cancellable_ids();
+        let (ids, app): (Vec<_>, Vec<_>) = self
+            .tasks
+            .cancellable_ids()
+            .into_iter()
+            .partition(|(_, origin)| *origin == TaskOrigin::Transfer);
+        if let Some(jobs) = cx.try_global::<AppJobs>() {
+            for (id, _) in app {
+                jobs.cancel(&id);
+            }
+        }
+        let ids: Vec<String> = ids.into_iter().map(|(id, _)| id).collect();
         self.error = None;
         cx.spawn(async move |center, cx| {
             if let Err(error) = requests.cancel_transfers(ids).await {
@@ -168,7 +221,15 @@ impl TaskCenter {
         let Some(requests) = AppBackend::requests(cx) else {
             return;
         };
-        let ids = self.tasks.settled_ids();
+        let (ids, app): (Vec<_>, Vec<_>) = self
+            .tasks
+            .settled_ids()
+            .into_iter()
+            .partition(|(_, origin)| *origin == TaskOrigin::Transfer);
+        for (id, _) in app {
+            self.tasks.remove(&id);
+        }
+        let ids: Vec<String> = ids.into_iter().map(|(id, _)| id).collect();
         self.error = None;
         cx.spawn(async move |center, cx| {
             let result = requests.remove_transfers(ids.clone()).await;
@@ -300,17 +361,23 @@ impl TaskCenter {
             TaskKind::Upload => (IconName::ArrowUp, t!("tasks.upload")),
             TaskKind::Download => (IconName::ArrowDown, t!("tasks.download")),
             TaskKind::Copy => (IconName::Copy, t!("tasks.copy")),
+            TaskKind::LocalCopy => (IconName::Copy, t!("tasks.local_copy")),
+            TaskKind::Move => (IconName::ArrowRight, t!("tasks.move")),
+            TaskKind::Rename => (IconName::Replace, t!("tasks.rename")),
         };
         let (state_text, danger) = match &task.state {
             TaskState::Queued => (t!("tasks.state_queued").into_owned(), false),
             TaskState::Running => (
-                match task.fraction() {
-                    Some(fraction) => format!(
+                match (task.fraction(), task.origin) {
+                    // Work the application runs itself reports no speed.
+                    (Some(fraction), TaskOrigin::App) => format!("{:.0}%", fraction * 100.0),
+                    (None, TaskOrigin::App) => t!("tasks.state_running").into_owned(),
+                    (Some(fraction), _) => format!(
                         "{:.0}% · {}",
                         fraction * 100.0,
                         format_speed(task.bytes_per_second)
                     ),
-                    None => format_speed(task.bytes_per_second),
+                    (None, _) => format_speed(task.bytes_per_second),
                 },
                 false,
             ),

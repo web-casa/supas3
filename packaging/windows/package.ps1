@@ -2,7 +2,8 @@
 # Builds the Windows packages from a release binary: a portable .zip and an
 # installer.
 #   packaging/windows/package.ps1 -Binary <supas3.exe> -Licenses <file> -Arch x64|arm64 -Out <dir>
-# The installer needs Inno Setup 6 (ISCC.exe on PATH or in its default folder).
+# The installer needs Inno Setup 6.5 or later (ISCC.exe on PATH or in its
+# default folder), for its Simplified Chinese messages.
 param(
     [Parameter(Mandatory)] [string] $Binary,
     [Parameter(Mandatory)] [string] $Licenses,
@@ -40,17 +41,21 @@ try {
     Compress-Archive -Path $tree -DestinationPath $zip
 
     # --- installer
-    $iscc = $null
-    $onPath = Get-Command ISCC.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($onPath) { $iscc = $onPath.Source }
-    if (-not $iscc) {
-        $candidates = @(
-            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
-            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
-        )
-        $iscc = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    # The newest one found: an upgrade may leave an older one on PATH.
+    $candidates = @(Get-Command ISCC.exe -All -ErrorAction SilentlyContinue | ForEach-Object Source)
+    $candidates += foreach ($major in 7, 6) {
+        (Join-Path ${env:ProgramFiles(x86)} "Inno Setup $major\ISCC.exe")
+        (Join-Path $env:ProgramFiles "Inno Setup $major\ISCC.exe")
     }
-    if (-not $iscc) { throw 'Inno Setup 6 (ISCC.exe) was not found' }
+    $versionOf = { param($path) [version](((Get-Item $path).VersionInfo.ProductVersion) -replace '[^0-9.].*$', '') }
+    $iscc = $candidates | Where-Object { $_ -and (Test-Path $_) } |
+        Sort-Object { & $versionOf $_ } -Descending | Select-Object -First 1
+    if (-not $iscc) { throw 'Inno Setup (ISCC.exe) was not found' }
+    $found = & $versionOf $iscc
+    Write-Host "Inno Setup $found at $iscc"
+    if ($found -lt [version]'6.5.0') {
+        throw "Inno Setup 6.5 or later is needed for the Simplified Chinese installer; found $found"
+    }
     & $iscc "/DAppVersion=$version" "/DArch=$Arch" "/DSourceDir=$tree" "/DOutputDir=$Out" /Qp (Join-Path $PSScriptRoot 'supas3.iss')
     if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
 }

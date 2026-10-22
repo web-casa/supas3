@@ -4,7 +4,7 @@
 
 use crate::listing::{Entry, EntryKind};
 use crate::location::Location;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A storage object or folder prefix named exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +17,8 @@ pub struct RemoteItem {
     pub size: Option<u64>,
     /// The name it will have at the destination.
     pub name: String,
+    /// The existing target it replaces, when the user chose to replace it.
+    pub replace: Option<Replace>,
 }
 
 /// A file or folder on this computer.
@@ -25,6 +27,17 @@ pub struct LocalItem {
     pub path: PathBuf,
     pub is_folder: bool,
     pub name: String,
+    pub replace: Option<Replace>,
+}
+
+/// An existing target to be replaced, as it was when the user chose to
+/// replace it. The replacement goes ahead only while it still is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Replace {
+    /// An object, by its ETag.
+    Object(String),
+    /// A file on this computer, by its identity.
+    File(supas3_core::fsutil::FileIdentity),
 }
 
 /// Where remote data lands: a prefix (empty or ending in `/`) of a bucket.
@@ -67,14 +80,85 @@ pub enum Plan {
         items: Vec<RemoteItem>,
         target: RemoteTarget,
     },
+    /// From one folder on this computer to another; the application copies
+    /// the files itself.
+    CopyLocal {
+        items: Vec<LocalItem>,
+        folder: PathBuf,
+    },
+}
+
+impl Plan {
+    /// Where the plan puts things.
+    pub fn target(&self) -> Location {
+        match self {
+            Plan::Upload { target, .. }
+            | Plan::CopyWithin { target, .. }
+            | Plan::CopyAcross { target, .. } => {
+                Location::objects(&target.profile_id, &target.bucket, &target.prefix)
+            }
+            Plan::Download { folder, .. } | Plan::CopyLocal { folder, .. } => {
+                Location::Local(folder.clone())
+            }
+        }
+    }
+
+    /// Each item's name at the target and whether it is a folder.
+    pub fn target_names(&self) -> Vec<(String, bool)> {
+        match self {
+            Plan::Upload { items, .. } | Plan::CopyLocal { items, .. } => items
+                .iter()
+                .map(|item| (item.name.clone(), item.is_folder))
+                .collect(),
+            Plan::Download { items, .. }
+            | Plan::CopyWithin { items, .. }
+            | Plan::CopyAcross { items, .. } => items
+                .iter()
+                .map(|item| (item.name.clone(), item.is_folder))
+                .collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.target_names().is_empty()
+    }
+}
+
+/// Plans copying paths on this computer into `folder` on this computer.
+fn plan_local(paths: Vec<(PathBuf, bool)>, folder: &Path) -> Result<Plan, Refusal> {
+    if paths.is_empty() {
+        return Err(Refusal::NothingSelected);
+    }
+    for (path, is_folder) in &paths {
+        if path.parent() == Some(folder) {
+            return Err(Refusal::SamePlace);
+        }
+        // A folder copied into itself would copy forever.
+        if *is_folder && folder.starts_with(path) {
+            return Err(Refusal::IntoItself);
+        }
+    }
+    Ok(Plan::CopyLocal {
+        items: paths
+            .into_iter()
+            .filter_map(|(path, is_folder)| {
+                let name = path.file_name()?.to_string_lossy().into_owned();
+                Some(LocalItem {
+                    path,
+                    is_folder,
+                    name,
+                    replace: None,
+                })
+            })
+            .collect(),
+        folder: folder.to_path_buf(),
+    })
 }
 
 /// Why a copy cannot be planned, as a translation key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     NothingSelected,
-    /// Both panes show folders on this computer; that is a file manager's job.
-    LocalToLocal,
     /// The target pane shows a connection's buckets, not a place in one.
     TargetIsBucketList,
     /// Buckets themselves cannot be copied.
@@ -93,7 +177,6 @@ impl Refusal {
     pub fn message_key(self) -> &'static str {
         match self {
             Self::NothingSelected => "copy.nothing_selected",
-            Self::LocalToLocal => "copy.local_to_local",
             Self::TargetIsBucketList => "copy.target_is_bucket_list",
             Self::BucketsSelected => "copy.buckets_selected",
             Self::SamePlace => "copy.same_place",
@@ -145,6 +228,7 @@ fn remote_items(
                 is_folder,
                 size: entry.size,
                 name: entry.name.clone(),
+                replace: None,
             })
         })
         .collect()
@@ -162,7 +246,13 @@ pub fn plan(source: &Location, selection: &[Entry], target: &Location) -> Result
         return Err(Refusal::BucketsSelected);
     }
     match (source, target) {
-        (Location::Local(_), Location::Local(_)) => Err(Refusal::LocalToLocal),
+        (Location::Local(from), Location::Local(to)) => plan_local(
+            selection
+                .iter()
+                .map(|entry| (from.join(&entry.name), entry.kind == EntryKind::Folder))
+                .collect(),
+            to,
+        ),
         (_, Location::Buckets { .. }) => Err(Refusal::TargetIsBucketList),
         (Location::Buckets { .. }, _) => Err(Refusal::BucketsSelected),
         (
@@ -179,6 +269,7 @@ pub fn plan(source: &Location, selection: &[Entry], target: &Location) -> Result
                     path: folder.join(&entry.name),
                     is_folder: entry.kind == EntryKind::Folder,
                     name: entry.name.clone(),
+                    replace: None,
                 })
                 .collect(),
             target: RemoteTarget {
@@ -259,6 +350,7 @@ pub fn plan_drop(paths: Vec<(PathBuf, bool)>, target: &Location) -> Result<Plan,
                 path,
                 is_folder,
                 name,
+                replace: None,
             })
         })
         .collect();
@@ -266,7 +358,13 @@ pub fn plan_drop(paths: Vec<(PathBuf, bool)>, target: &Location) -> Result<Plan,
         return Err(Refusal::NothingSelected);
     }
     match target {
-        Location::Local(_) => Err(Refusal::LocalToLocal),
+        Location::Local(folder) => plan_local(
+            items
+                .into_iter()
+                .map(|item| (item.path, item.is_folder))
+                .collect(),
+            folder,
+        ),
         Location::Buckets { .. } => Err(Refusal::TargetIsBucketList),
         Location::Objects {
             profile_id,
@@ -316,6 +414,29 @@ impl DeleteRefusal {
     }
 }
 
+/// What deleting a selection on this computer removes: the paths go to the
+/// system's recycle bin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDeletion {
+    pub paths: Vec<PathBuf>,
+    pub names: Vec<String>,
+}
+
+/// Plans deleting `selection` from a folder on this computer; `None` if
+/// `source` is not one.
+pub fn plan_local_deletion(source: &Location, selection: &[Entry]) -> Option<LocalDeletion> {
+    let Location::Local(folder) = source else {
+        return None;
+    };
+    (!selection.is_empty()).then(|| LocalDeletion {
+        paths: selection
+            .iter()
+            .map(|entry| folder.join(&entry.name))
+            .collect(),
+        names: selection.iter().map(|entry| entry.name.clone()).collect(),
+    })
+}
+
 /// Plans deleting `selection`, shown in `source`.
 pub fn plan_deletion(source: &Location, selection: &[Entry]) -> Result<Deletion, DeleteRefusal> {
     if selection.is_empty() {
@@ -353,7 +474,9 @@ pub fn plan_deletion(source: &Location, selection: &[Entry]) -> Result<Deletion,
 
 #[cfg(test)]
 mod tests {
-    use super::{plan, plan_deletion, DeleteRefusal, Plan, Refusal};
+    use super::{
+        plan, plan_deletion, plan_local_deletion, DeleteRefusal, LocalDeletion, Plan, Refusal,
+    };
     use crate::listing::{Entry, EntryKind};
     use crate::location::Location;
     use std::path::PathBuf;
@@ -513,6 +636,30 @@ mod tests {
     }
 
     #[test]
+    fn copies_between_local_folders_are_planned() {
+        assert_eq!(
+            plan(&local("/a"), &[file("f"), folder("d", None)], &local("/b")),
+            Ok(Plan::CopyLocal {
+                items: vec![
+                    super::LocalItem {
+                        path: PathBuf::from("/a/f"),
+                        is_folder: false,
+                        name: "f".into(),
+                        replace: None,
+                    },
+                    super::LocalItem {
+                        path: PathBuf::from("/a/d"),
+                        is_folder: true,
+                        name: "d".into(),
+                        replace: None,
+                    },
+                ],
+                folder: PathBuf::from("/b"),
+            })
+        );
+    }
+
+    #[test]
     fn copies_that_make_no_sense_are_refused_with_a_reason() {
         let here = remote("p", "bucket", "x/");
         assert_eq!(
@@ -520,8 +667,12 @@ mod tests {
             Err(Refusal::NothingSelected)
         );
         assert_eq!(
-            plan(&local("/a"), &[file("f")], &local("/b")),
-            Err(Refusal::LocalToLocal)
+            plan(&local("/a"), &[file("f")], &local("/a")),
+            Err(Refusal::SamePlace)
+        );
+        assert_eq!(
+            plan(&local("/a"), &[folder("d", None)], &local("/a/d/e")),
+            Err(Refusal::IntoItself)
         );
         assert_eq!(
             plan(
@@ -582,10 +733,10 @@ mod tests {
             "in/photos/"
         );
 
-        assert_eq!(
+        assert!(matches!(
             plan_drop(dropped.clone(), &local("/tmp")),
-            Err(Refusal::LocalToLocal)
-        );
+            Ok(Plan::CopyLocal { .. })
+        ));
         assert_eq!(
             plan_drop(
                 dropped,
@@ -619,6 +770,17 @@ mod tests {
         assert_eq!(
             plan_deletion(&local("/home"), &[file("a")]),
             Err(DeleteRefusal::LocalFiles)
+        );
+        assert_eq!(
+            plan_local_deletion(&local("/home"), &[file("a"), folder("b", None)]),
+            Some(LocalDeletion {
+                paths: vec![PathBuf::from("/home/a"), PathBuf::from("/home/b")],
+                names: vec!["a".into(), "b".into()],
+            })
+        );
+        assert_eq!(
+            plan_local_deletion(&remote("p", "b", ""), &[file("a")]),
+            None
         );
         assert_eq!(
             plan_deletion(

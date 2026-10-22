@@ -76,7 +76,9 @@ impl Protection {
         match self {
             Self::Native => true,
             Self::Custom(WriteGuard::OssForbidOverwrite | WriteGuard::CosForbidOverwrite) => true,
-            Self::Custom(WriteGuard::Conditional) => operation == Operation::Put,
+            Self::Custom(WriteGuard::Conditional | WriteGuard::IdriveE2) => {
+                operation == Operation::Put
+            }
             Self::Custom(WriteGuard::CheckFirst) => false,
         }
     }
@@ -91,6 +93,44 @@ impl Protection {
             Self::Custom(_) => false,
         }
     }
+}
+
+/// Metadata IDrive e2 sets on each object; never written by a client.
+const E2_INTERNAL_METADATA: &[&str] = &["x-amz-meta-e2iid", "x-amz-meta-erid"];
+
+/// Whether a request is addressed to an IDrive e2 host.
+fn request_goes_to_e2(uri: &str) -> bool {
+    let host = uri
+        .split("://")
+        .nth(1)
+        .unwrap_or(uri)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    host.ends_with(".idrivee2.com")
+}
+
+/// An object's metadata without what e2 adds itself, for writing it to
+/// another object anywhere: elsewhere it means nothing, and on e2 it would
+/// be there twice.
+pub(crate) fn without_e2_metadata(
+    metadata: Option<std::collections::HashMap<String, String>>,
+) -> Option<std::collections::HashMap<String, String>> {
+    metadata.map(|mut metadata| {
+        for internal in E2_INTERNAL_METADATA {
+            metadata.remove(internal.trim_start_matches("x-amz-meta-"));
+        }
+        metadata
+    })
+}
+
+/// Whether the client talks to IDrive e2, whose objects' default ACL names
+/// the owner without an ID.
+pub(crate) fn owner_grant_without_id_is_default(client: &Client) -> bool {
+    Protection::of(client) == Protection::Custom(WriteGuard::IdriveE2)
 }
 
 /// What the interface needs to know about how a client writes.
@@ -216,6 +256,7 @@ impl WriteGuardInterceptor {
             WriteGuard::OssForbidOverwrite => "supas3-write-guard:oss",
             WriteGuard::CosForbidOverwrite => "supas3-write-guard:cos",
             WriteGuard::CheckFirst => "supas3-write-guard:check-first",
+            WriteGuard::IdriveE2 => "supas3-write-guard:idrive-e2",
         }
     }
 
@@ -225,6 +266,7 @@ impl WriteGuardInterceptor {
             WriteGuard::OssForbidOverwrite,
             WriteGuard::CosForbidOverwrite,
             WriteGuard::CheckFirst,
+            WriteGuard::IdriveE2,
         ]
         .into_iter()
         .find(|guard| Self::name_of(*guard) == name)
@@ -244,17 +286,30 @@ impl Intercept for WriteGuardInterceptor {
     ) -> Result<(), BoxError> {
         let request = context.request_mut();
         add_content_md5_to_batch_delete(request);
-        if self.guard == WriteGuard::Conditional {
-            return Ok(());
-        }
         // Reads keep their conditions: every measured service honours
         // If-Match on GET and HEAD.
         let method = request.method().to_string();
         if !matches!(method.as_str(), "PUT" | "POST" | "DELETE") {
             return Ok(());
         }
+        // e2 adds these to every object itself. Written back with the rest of
+        // an object's metadata, they end up twice, and the object can no
+        // longer be read through the SDK.
+        // Also for e2 connected with another preset, as before e2 had its
+        // own, whatever that preset's guard.
+        let to_e2 = self.guard == WriteGuard::IdriveE2 || request_goes_to_e2(request.uri());
         let headers = request.headers_mut();
-        if headers.remove("if-none-match").is_some() {
+        if to_e2 {
+            for internal in E2_INTERNAL_METADATA {
+                headers.remove(*internal);
+            }
+        }
+        if self.guard == WriteGuard::Conditional {
+            return Ok(());
+        }
+        // e2 honours If-None-Match on PutObject; elsewhere it is ignored and
+        // `before_write` has checked already, so it stays.
+        if self.guard != WriteGuard::IdriveE2 && headers.remove("if-none-match").is_some() {
             if let Some(header) = self.guard.forbid_overwrite_header() {
                 headers.insert(header, "true");
             }
@@ -324,6 +379,27 @@ mod tests {
             let (found, value) = line.split_once(':')?;
             found.eq_ignore_ascii_case(name).then(|| value.trim())
         })
+    }
+
+    #[test]
+    fn e2_metadata_is_recognised_by_host_and_dropped_by_name() {
+        assert!(request_goes_to_e2(
+            "https://s3.ap-northeast-1.idrivee2.com/bucket/key?x-id=PutObject"
+        ));
+        assert!(request_goes_to_e2(
+            "https://bucket.s3.us-west-1.idrivee2.com:443/key"
+        ));
+        assert!(!request_goes_to_e2("https://idrivee2.com.example.org/key"));
+        assert!(!request_goes_to_e2(
+            "https://bucket.oss-cn-hangzhou.aliyuncs.com/key"
+        ));
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("e2iid".to_string(), "1".to_string());
+        metadata.insert("erid".to_string(), "2".to_string());
+        metadata.insert("owner".to_string(), "me".to_string());
+        let kept = without_e2_metadata(Some(metadata)).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept["owner"], "me");
     }
 
     #[test]

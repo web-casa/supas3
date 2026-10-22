@@ -399,7 +399,10 @@ fn launch(app: AppHandle, state: JobState, job: SavedJob) {
         let result = if cancelled {
             Err(invalid("Run cancelled before preparation."))
         } else {
-            prepare(&job, &profiles, &s3).await
+            // What earlier sync uploads recorded, so unchanged files are
+            // not uploaded again on services without content ETags.
+            let records = app.state::<TransferState>().inner().sync_records().await;
+            prepare(&job, &profiles, &s3, &records).await
         };
         drop(permit);
         let transfers = app.state::<TransferState>().inner().clone();
@@ -468,6 +471,7 @@ async fn prepare(
     job: &SavedJob,
     profiles: &ProfileState,
     s3: &S3State,
+    records: &std::collections::HashMap<String, String>,
 ) -> Result<Vec<TransferJob>> {
     let profile = profiles
         .read()
@@ -499,6 +503,7 @@ async fn prepare(
         &job.config.prefix,
         local,
         &job.config.options,
+        Some((&job.profile_identity, records)),
     )
     .await?;
     if profiles
@@ -741,7 +746,9 @@ mod tests {
         job.config.bucket = bucket.clone();
         job.reserve(0).unwrap();
         std::fs::write(local.join("fresh.txt"), b"saved job content").unwrap();
-        let transfers = prepare(&job, &profiles, &s3).await.unwrap();
+        let transfers = prepare(&job, &profiles, &s3, &Default::default())
+            .await
+            .unwrap();
         assert_eq!(transfers.len(), 1);
         let ids: Vec<_> = transfers.iter().map(|t| t.id.clone()).collect();
         let manager = Arc::new(TransferManager::new());
@@ -771,11 +778,17 @@ mod tests {
             .unwrap()
             .into_bytes();
         assert_eq!(body.as_ref(), b"saved job content");
-        assert!(prepare(&job, &profiles, &s3).await.unwrap().is_empty());
+        assert!(prepare(&job, &profiles, &s3, &Default::default())
+            .await
+            .unwrap()
+            .is_empty());
         // A later run sees files created after the job was saved.
         std::fs::write(local.join("later.txt"), b"later content").unwrap();
         assert_eq!(
-            prepare(&job, &profiles, &s3).await.unwrap()[0].key,
+            prepare(&job, &profiles, &s3, &Default::default())
+                .await
+                .unwrap()[0]
+                .key,
             "backup/later.txt"
         );
         client
@@ -970,7 +983,9 @@ mod tests {
         job.reserve(0).unwrap();
         std::fs::write(local.join("fresh.txt"), b"fresh").unwrap();
         std::fs::write(local.join("skip.tmp"), b"skip").unwrap();
-        let transfers = prepare(&job, &profiles, &s3).await.unwrap();
+        let transfers = prepare(&job, &profiles, &s3, &Default::default())
+            .await
+            .unwrap();
         assert_eq!(transfers.len(), 1);
         assert_eq!(transfers[0].key, "backup/fresh.txt");
         assert_eq!(transfers[0].bandwidth_limit, Some(65536));
@@ -991,13 +1006,15 @@ mod tests {
         let mut job = job(root.path());
         job.config.profile_id = profile.id.clone();
         job.reserve(0).unwrap();
-        assert!(prepare(&job, &profiles, &s3)
+        assert!(prepare(&job, &profiles, &s3, &Default::default())
             .await
             .unwrap_err()
             .to_string()
             .contains("Profile settings changed"));
         job.profile_identity = profile.cache_identity();
         job.config.local_path = root.path().join("missing").to_string_lossy().into();
-        assert!(prepare(&job, &profiles, &s3).await.is_err());
+        assert!(prepare(&job, &profiles, &s3, &Default::default())
+            .await
+            .is_err());
     }
 }

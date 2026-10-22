@@ -10,6 +10,10 @@ pub struct DownloadDestination {
     root: Arc<Dir>,
     relative_path: PathBuf,
     overwrite: bool,
+    /// When replacing: the file being replaced, by its full path, and the
+    /// identity it had when the user chose to replace it. The replacement
+    /// is refused if it has changed since.
+    replace_only_if: Option<(PathBuf, crate::fsutil::FileIdentity)>,
 }
 
 impl DownloadDestination {
@@ -32,7 +36,15 @@ impl DownloadDestination {
             root,
             relative_path,
             overwrite,
+            replace_only_if: None,
         })
+    }
+
+    /// Replaces the file at `path` only if it still has `identity`.
+    pub fn replacing(path: &Path, identity: crate::fsutil::FileIdentity) -> io::Result<Self> {
+        let mut destination = Self::from_path(path, true)?;
+        destination.replace_only_if = Some((path.to_path_buf(), identity));
+        Ok(destination)
     }
 
     pub fn from_path(path: &Path, overwrite: bool) -> io::Result<Self> {
@@ -80,6 +92,7 @@ impl DownloadDestination {
             temporary_name,
             final_name,
             overwrite: self.overwrite,
+            replace_only_if: self.replace_only_if.clone(),
         })
     }
 }
@@ -90,6 +103,7 @@ pub struct PendingDownload {
     temporary_name: String,
     final_name: OsString,
     overwrite: bool,
+    replace_only_if: Option<(PathBuf, crate::fsutil::FileIdentity)>,
 }
 
 impl PendingDownload {
@@ -117,6 +131,17 @@ impl PendingDownload {
             return Err(io::Error::other("Download has not finished writing"));
         }
         if self.overwrite {
+            if let Some((path, identity)) = &self.replace_only_if {
+                // Read through the folder the download writes into, so the
+                // file checked is the file replaced.
+                if crate::fsutil::FileIdentity::in_dir(&self.parent, &self.final_name)? != *identity
+                {
+                    return Err(io::Error::other(format!(
+                        "{} changed after it was chosen to be replaced; it was kept as it is.",
+                        path.display()
+                    )));
+                }
+            }
             self.parent
                 .rename(&self.temporary_name, &self.parent, &self.final_name)?;
         } else {
@@ -132,9 +157,10 @@ impl PendingDownload {
             {
                 let handle = self.parent.try_clone()?.into_std_file();
                 let path = winx::file::get_file_path(&handle)?;
-                tempfile::TempPath::from_path(path.join(&self.temporary_name))
-                    .persist_noclobber(path.join(&self.final_name))
-                    .map_err(|error| error.error)?;
+                crate::fsutil::rename_no_clobber(
+                    &path.join(&self.temporary_name),
+                    &path.join(&self.final_name),
+                )?;
             }
             #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
             self.parent

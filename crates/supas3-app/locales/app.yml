@@ -67,6 +67,9 @@ service.cos:
 service.obs:
   en: Huawei Cloud OBS
   zh-CN: 华为云 OBS
+service.idrive_e2:
+  en: IDrive e2
+  zh-CN: IDrive e2
 service.generic:
   en: Other S3-compatible service
   zh-CN: 其他 S3 兼容服务
@@ -113,6 +116,42 @@ form.session_token_help:
 form.session_token_keep:
   en: Leave empty to keep the saved token. It is replaced together with the secret key.
   zh-CN: 留空则保留已保存的令牌。更换 Secret Access Key 时令牌会一并替换。
+form.credentials:
+  en: Credentials
+  zh-CN: 凭据
+form.credentials_typed:
+  en: Access keys entered here
+  zh-CN: 在此输入访问密钥
+form.credentials_profile:
+  en: "AWS configuration: %{name}"
+  zh-CN: "本机 AWS 配置：%{name}"
+form.aws_config_help:
+  en: Profiles of this computer’s AWS configuration (~/.aws). Their keys stay there and are read when connecting.
+  zh-CN: 本机 AWS 配置（~/.aws）中的配置。密钥留在原处，连接时读取。
+form.aws_config_missing:
+  en: No AWS configuration was found on this computer (~/.aws/config or ~/.aws/credentials).
+  zh-CN: 本机没有找到 AWS 配置（~/.aws/config 或 ~/.aws/credentials）。
+form.aws_config_left_out:
+  en: "Not offered: %{profiles}."
+  zh-CN: "未列出：%{profiles}。"
+form.aws_profile_gone:
+  en: "The profile “%{name}” is no longer in this computer’s AWS configuration; connecting will fail."
+  zh-CN: "本机 AWS 配置中已没有“%{name}”，连接会失败。"
+form.aws_profile_unusable:
+  en: "The profile “%{name}” now %{why}. Writes through it are checked first, which is not atomic; choose another profile or typed keys."
+  zh-CN: "配置“%{name}”现在%{why}。经它写入时会先检查再写入，并非原子操作；请改选其他配置或输入访问密钥。"
+form.aws_profile_left_out:
+  en: "%{name} (%{why})"
+  zh-CN: "%{name}（%{why}）"
+form.list_separator:
+  en: "; "
+  zh-CN: "；"
+form.aws_profile_sso:
+  en: signs in with IAM Identity Center, which supaS3 does not support
+  zh-CN: 使用 IAM Identity Center 登录，supaS3 不支持
+form.aws_profile_endpoint:
+  en: sends requests to another endpoint; add that service with its own settings instead
+  zh-CN: 请求发往其他端点，请改为按该服务添加连接
 form.bucket:
   en: Bucket
   zh-CN: 存储桶
@@ -239,6 +278,91 @@ error.backend_failed:
   en: "The storage backend could not start: %{error}"
   zh-CN: "存储后端启动失败：%{error}"
 
+content_type.change:
+  en: Change Content-Type…
+  zh-CN: 修改内容类型…
+content_type.too_large:
+  en: Content-Type is changed here only for objects up to 5 GiB.
+  zh-CN: 只能修改不超过 5 GiB 的对象的内容类型。
+content_type.title:
+  en: "Content-Type of %{name}"
+  zh-CN: "%{name} 的内容类型"
+content_type.suggested:
+  en: "By its name:"
+  zh-CN: 按文件名建议：
+content_type.note:
+  en: The object is copied onto itself with the new type; its content, metadata, tags and permissions stay. Its modified time changes, and with versioning on this adds a version. If its content changed since it was shown, nothing is changed; a change made meanwhile to its other properties is not noticed.
+  zh-CN: 对象会以新的类型复制到原位置，内容、元数据、标签与访问权限不变；修改时间会更新，开启版本控制的桶里会多一个版本。对象内容在显示之后被改动过时不做修改；期间他人对其他属性的修改无法察觉。
+content_type.archived:
+  en: An archived object must be restored before its Content-Type can be changed.
+  zh-CN: 归档存储的对象需要先解冻，才能修改内容类型。
+content_type.changed:
+  en: The object’s content changed since it was shown. Nothing was changed; look at it again and retry.
+  zh-CN: 对象内容在显示之后已被改动，未做修改。请重新查看后再试。
+content_type.unchanged:
+  en: This is already the object’s Content-Type.
+  zh-CN: 对象已经是这个内容类型。
+content_type.save:
+  en: Change
+  zh-CN: 修改
+access.title:
+  en: Access
+  zh-CN: 访问权限
+access.private:
+  en: "Private: the object’s ACL grants no one else access. The bucket’s permissions or policy may still let others read it."
+  zh-CN: 私有：对象 ACL 未授权给其他人。Bucket 的权限或策略仍可能允许他人读取。
+access.public_read:
+  en: "Public read: anyone may read it."
+  zh-CN: 公开读取：任何人都可以读取。
+access.custom:
+  en: Custom grants, other than private or public read.
+  zh-CN: 自定义授权（既不是私有，也不是公开读取）。
+access.unsupported:
+  en: This service does not support object ACLs.
+  zh-CN: 此服务不支持对象 ACL。
+access.denied:
+  en: These credentials may not read this object’s ACL.
+  zh-CN: 当前凭据无权读取此对象的 ACL。
+access.unknown:
+  en: The object’s ACL could not be read.
+  zh-CN: 无法读取此对象的 ACL。
+access.read_only:
+  en: IDrive e2 refuses changes to object ACLs, so they are only shown here.
+  zh-CN: IDrive e2 不接受修改对象 ACL，这里只显示。
+access.make_private:
+  en: Make private
+  zh-CN: 设为私有
+access.make_public:
+  en: Make public
+  zh-CN: 设为公开读取
+access.public_title:
+  en: Make this object public?
+  zh-CN: 将此对象设为公开读取？
+access.private_title:
+  en: Make this object private?
+  zh-CN: 将此对象设为私有？
+access.public_body:
+  en: Anyone with its address will be able to read it, without credentials. Some buckets, for example ones that block public access, refuse or ignore this.
+  zh-CN: 任何知道地址的人都可以不带凭据读取它。部分 Bucket（例如开启了阻止公共访问的）会拒绝或忽略此设置。
+access.private_body:
+  en: The object’s ACL will grant no one but the owner; grants to others go. The bucket’s permissions or policy are not changed and may still let others read it.
+  zh-CN: 对象 ACL 将只授权给所有者，授予他人的权限会被移除。Bucket 的权限或策略不变，仍可能允许他人读取。
+access.custom_replaced:
+  en: Its current grants are replaced, including ones given to particular accounts.
+  zh-CN: 当前的授权会被全部替换，包括授予特定账户的授权。
+access.inherit_note:
+  en: An object that follows its bucket’s permissions (the default on Alibaba Cloud OSS) cannot be set back to that here.
+  zh-CN: 原来跟随 Bucket 权限的对象（阿里云 OSS 的默认值）修改后不能在这里改回跟随。
+access.changed_meanwhile:
+  en: Its access was changed by someone else meanwhile; nothing was changed. The panel shows it now.
+  zh-CN: 访问权限已被他人修改，未做更改。详情面板已显示最新状态。
+access.object_changed:
+  en: Its content changed since it was shown; nothing was changed. Look at it again first.
+  zh-CN: 对象内容在显示之后已被改动，未做更改。请先重新查看。
+access.failed:
+  en: "The access could not be changed: %{detail}"
+  zh-CN: "无法修改访问权限：%{detail}"
+
 preferences.language:
   en: Language
   zh-CN: 语言
@@ -254,6 +378,33 @@ preferences.light:
 preferences.dark:
   en: Dark
   zh-CN: 深色
+preferences.transfers:
+  en: Transfers…
+  zh-CN: 传输设置…
+transfers.title:
+  en: Transfers
+  zh-CN: 传输设置
+transfers.concurrency:
+  en: "Transfers running at once (%{min}–%{max})"
+  zh-CN: "同时进行的传输数（%{min}–%{max}）"
+transfers.bandwidth:
+  en: Speed limit of each transfer
+  zh-CN: 每个传输的速度上限
+transfers.unlimited:
+  en: Unlimited
+  zh-CN: 不限
+transfers.note:
+  en: The limit applies to each transfer on its own, and only to transfers added from now on; leave it empty for no limit. Transfers already added, waiting or retried keep the limit they were added with.
+  zh-CN: 速度上限按每个传输分别计算，只对之后添加的传输生效；留空表示不限。已经添加、正在等待或重试的传输沿用添加时的上限。
+transfers.save:
+  en: Save
+  zh-CN: 保存
+transfers.concurrency_invalid:
+  en: Enter a whole number from 1 to 20.
+  zh-CN: 请输入 1 到 20 之间的整数。
+transfers.bandwidth_invalid:
+  en: Enter a speed from 0.0625 to 1024 MiB/s, or leave it empty.
+  zh-CN: 请输入 0.0625 到 1024 之间的速度（MiB/s），或留空。
 preferences.not_saved:
   en: Couldn’t save this preference. It applies until supaS3 closes.
   zh-CN: 无法保存此偏好设置，仅在本次运行期间生效。
@@ -261,6 +412,12 @@ preferences.not_saved:
 action.copy_to_other:
   en: Copy to other side
   zh-CN: 复制到另一侧
+action.move_to_other:
+  en: Move to other side…
+  zh-CN: 移动到另一侧…
+action.move:
+  en: Move
+  zh-CN: 移动
 action.delete_ellipsis:
   en: Delete…
   zh-CN: 删除…
@@ -277,6 +434,9 @@ select.item:
 drag.items:
   en: "%{count} items"
   zh-CN: "%{count} 项"
+drag.move:
+  en: "Move %{what}"
+  zh-CN: "移动 %{what}"
 status.marked:
   en: "%{marked} of %{count} selected"
   zh-CN: "已选 %{marked} 项，共 %{count} 项"
@@ -284,9 +444,6 @@ status.marked:
 copy.nothing_selected:
   en: Select something to copy first.
   zh-CN: 请先选择要复制的内容。
-copy.local_to_local:
-  en: Both sides show folders on this computer. Open a storage location on one side to copy.
-  zh-CN: 两侧都是此电脑上的文件夹。请在一侧打开存储位置后再复制。
 copy.target_is_bucket_list:
   en: Open a bucket on the other side first; items can’t be copied into a list of buckets.
   zh-CN: 请先在另一侧打开一个存储桶，无法复制到存储桶列表中。
@@ -436,6 +593,18 @@ action.sync_ellipsis:
 view.loading:
   en: Loading…
   zh-CN: 正在加载…
+view.zoom_in:
+  en: Zoom in
+  zh-CN: 放大
+view.zoom_out:
+  en: Zoom out
+  zh-CN: 缩小
+view.zoom_fit:
+  en: Fit
+  zh-CN: 适应窗口
+view.zoom_actual:
+  en: Actual size
+  zh-CN: 实际大小
 view.unsupported:
   en: This kind of file can’t be shown here. Copy it to this computer to open it.
   zh-CN: 此类文件无法在这里显示。请复制到本机后打开。
@@ -694,12 +863,27 @@ hint.credentials:
 hint.denied:
   en: These credentials are not allowed to do this.
   zh-CN: 这组凭据没有执行此操作的权限。
+hint.oss_public_endpoint:
+  en: Alibaba Cloud refuses this bucket's data through the public endpoint. Accounts that started using OSS after 20 March 2025 must reach buckets in mainland China through a custom domain bound to the bucket, which supaS3 cannot use yet. Buckets outside mainland China are not affected.
+  zh-CN: 阿里云不允许经公网默认域名访问这个存储桶的数据。2025 年 3 月 20 日之后开通 OSS 的账户，访问中国内地的存储桶须使用绑定到存储桶的自定义域名，supaS3 目前还不支持这种方式。中国内地以外的存储桶不受影响。
 hint.no_bucket:
   en: The bucket does not exist on this endpoint.
   zh-CN: 该端点上不存在这个存储桶。
 menu.quit:
   en: Quit supaS3
   zh-CN: 退出 supaS3
+menu.file:
+  en: File
+  zh-CN: 文件
+menu.new_folder:
+  en: New Folder
+  zh-CN: 新建文件夹
+menu.rename:
+  en: Rename…
+  zh-CN: 重命名…
+menu.filter:
+  en: Filter Rows
+  zh-CN: 筛选
 menu.edit:
   en: Edit
   zh-CN: 编辑
@@ -721,6 +905,15 @@ menu.paste:
 menu.select_all:
   en: Select All
   zh-CN: 全选
+menu.view:
+  en: View
+  zh-CN: 显示
+menu.toggle_sidebar:
+  en: Collapse or Expand Sidebar
+  zh-CN: 收起或展开侧栏
+menu.toggle_details:
+  en: Show or Hide Details
+  zh-CN: 显示或隐藏详情
 menu.window:
   en: Window
   zh-CN: 窗口
@@ -772,9 +965,6 @@ sync.patterns_hint:
 action.properties_ellipsis:
   en: Properties…
   zh-CN: 属性…
-properties.title:
-  en: "Properties of “%{name}”"
-  zh-CN: "“%{name}”的属性"
 properties.key:
   en: Key
   zh-CN: 对象键
@@ -802,3 +992,322 @@ places.not_saved:
 status.more_failed_title:
   en: Couldn’t load more items
   zh-CN: 无法加载更多项目
+tasks.local_copy:
+  en: Copy on this computer
+  zh-CN: 本机复制
+tasks.move:
+  en: Move
+  zh-CN: 移动
+tasks.rename:
+  en: Rename
+  zh-CN: 重命名
+tasks.state_running:
+  en: Running
+  zh-CN: 进行中
+name.empty:
+  en: Enter a name.
+  zh-CN: 请输入名称。
+name.bad_character:
+  en: "The name can’t contain / \\ : * ? \" < > | or control characters."
+  zh-CN: "名称不能包含 / \\ : * ? \" < > | 或控制字符。"
+name.bad_ending:
+  en: The name can’t end with a dot or a space.
+  zh-CN: 名称不能以句点或空格结尾。
+name.reserved:
+  en: Windows reserves this name for a device (such as CON or COM1).
+  zh-CN: 这是 Windows 保留的设备名（例如 CON、COM1），不能使用。
+name.too_long:
+  en: The name is too long.
+  zh-CN: 名称太长。
+name.unchanged:
+  en: The name is the same as before.
+  zh-CN: 名称没有变化。
+name.exists:
+  en: "“%{name}” already exists here."
+  zh-CN: "这里已有“%{name}”。"
+action.rename_ellipsis:
+  en: Rename…
+  zh-CN: 重命名…
+action.new_folder_ellipsis:
+  en: New folder…
+  zh-CN: 新建文件夹…
+folder.new_title:
+  en: New folder
+  zh-CN: 新建文件夹
+folder.default_name:
+  en: New folder
+  zh-CN: 新建文件夹
+folder.create:
+  en: Create
+  zh-CN: 创建
+rename.title:
+  en: "Rename “%{name}”"
+  zh-CN: "重命名“%{name}”"
+rename.confirm:
+  en: Rename
+  zh-CN: 重命名
+rename.folder_started:
+  en: Renaming the folder; it runs in Transfers.
+  zh-CN: 正在重命名文件夹，进度见“传输”。
+rename.folder_note:
+  en: "A folder in storage is renamed by moving each object in it, one by one. It is not done in one step: if it stops, part of the folder is under the new name and part under the old."
+  zh-CN: "存储中的文件夹通过逐个移动其中的对象来重命名，不是一步完成：如果中途停止，一部分对象在新名称下，一部分仍在原名称下。"
+rename.too_many:
+  en: "This folder holds more than %{limit} objects, too many to rename here. Copy it to the new name, then delete the original."
+  zh-CN: "此文件夹包含超过 %{limit} 个对象，无法在这里重命名。请先复制到新名称，再删除原文件夹。"
+rename.stopped:
+  en: "Stopped at “%{key}”: %{error}. %{moved} objects were moved, %{left} were not. The object it stopped at may now be under both names."
+  zh-CN: "在“%{key}”处停止：%{error}。已移动 %{moved} 个对象，%{left} 个未处理。停止时的那个对象可能新旧名称下都存在。"
+delete.local_body:
+  en: The items go to the recycle bin, where they can be restored.
+  zh-CN: 这些项目会移到回收站，可以从那里恢复。
+delete.move_to_trash:
+  en: Move to Recycle Bin
+  zh-CN: 移到回收站
+delete.trashed:
+  en: "%{count} items moved to the recycle bin"
+  zh-CN: "已将 %{count} 个项目移到回收站"
+delete.trash_failed:
+  en: "Couldn’t move to the recycle bin; nothing was deleted for good. %{detail}"
+  zh-CN: "无法移到回收站，没有任何内容被永久删除。%{detail}"
+copy.local_exists:
+  en: "“%{path}” already exists; nothing there was replaced. The copy stopped there."
+  zh-CN: "“%{path}”已存在，未被替换。复制在此处停止。"
+delete.trash_title_one:
+  en: "Move “%{name}” to the recycle bin?"
+  zh-CN: "将“%{name}”移到回收站？"
+delete.trash_title_many:
+  en: "Move %{count} items to the recycle bin?"
+  zh-CN: "将 %{count} 个项目移到回收站？"
+sort.too_large:
+  en: This folder is too large to sort by this column, so it is shown by name.
+  zh-CN: 此文件夹太大，无法按该列排序，已改为按名称显示。
+filter.open:
+  en: Filter or search (Ctrl/Cmd+F)
+  zh-CN: 筛选或搜索（Ctrl/Cmd+F）
+filter.placeholder:
+  en: Filter by name
+  zh-CN: 按名称筛选
+filter.partial:
+  en: "%{shown} of %{loaded} loaded; more not loaded"
+  zh-CN: "已加载 %{loaded} 项中有 %{shown} 项，尚未全部加载"
+filter.complete:
+  en: "%{shown} of %{loaded} items"
+  zh-CN: "%{loaded} 项中有 %{shown} 项"
+filter.load_all:
+  en: Load all
+  zh-CN: 加载全部
+filter.search_below:
+  en: Search below
+  zh-CN: 搜索子文件夹
+filter.close:
+  en: Close the filter
+  zh-CN: 关闭筛选
+search.title:
+  en: "Search for “%{query}”"
+  zh-CN: "搜索“%{query}”"
+search.where:
+  en: "Names containing “%{query}” in “%{prefix}” and every folder below it"
+  zh-CN: "在“%{prefix}”及其所有子文件夹中，名称包含“%{query}”的对象"
+search.running:
+  en: Searching…
+  zh-CN: 正在搜索…
+search.complete:
+  en: "%{count} found among %{scanned} objects."
+  zh-CN: "在 %{scanned} 个对象中找到 %{count} 个。"
+search.truncated:
+  en: "%{count} found among the first %{scanned} objects; the search stopped at its limit, so there may be more."
+  zh-CN: "在前 %{scanned} 个对象中找到 %{count} 个；搜索已达上限，可能还有更多。"
+search.more:
+  en: "%{count} more not listed"
+  zh-CN: "另有 %{count} 个未列出"
+search.show_folder:
+  en: Show folder
+  zh-CN: 显示所在文件夹
+copy.replace_changed:
+  en: "“%{name}” changed after you chose to replace it, so it was kept as it is."
+  zh-CN: "“%{name}”在你选择替换之后又发生了变化，因此保留原样，未被替换。"
+copy.check_failed:
+  en: "Couldn’t check the target before copying; nothing was copied. %{detail}"
+  zh-CN: "复制前无法检查目标位置，未复制任何内容。%{detail}"
+conflict.title_one:
+  en: "“%{name}” already exists here"
+  zh-CN: "这里已有“%{name}”"
+conflict.title_many:
+  en: "%{count} items already exist here"
+  zh-CN: "这里已有 %{count} 个同名项目"
+conflict.body:
+  en: "These names are already taken at the target:"
+  zh-CN: "目标位置已有以下同名项目："
+conflict.more:
+  en: "and %{count} more"
+  zh-CN: "另有 %{count} 个"
+conflict.replace_note:
+  en: Replace checks just before writing that each one is still what was found now. That check is not atomic on this service, so a change made in the moment between can be overwritten. Folders are never replaced.
+  zh-CN: 替换会在写入前确认每一项仍是现在看到的样子。在此服务上这一检查不是原子的，恰好在其间发生的修改可能被覆盖。文件夹不会被替换。
+conflict.replace_note_atomic:
+  en: Replace only goes ahead for items that are still what was found now; the service enforces this. Folders are never replaced.
+  zh-CN: 只有仍是现在看到的样子的项目才会被替换，由服务端保证。文件夹不会被替换。
+conflict.skip:
+  en: Skip these
+  zh-CN: 跳过这些
+conflict.replace:
+  en: Replace
+  zh-CN: 替换
+conflict.keep_both:
+  en: Keep both
+  zh-CN: 保留两者
+conflict.left_out:
+  en: "Left out, because they can’t be handled that way: %{names}"
+  zh-CN: "以下项目无法按所选方式处理，已跳过：%{names}"
+
+move.title_one:
+  en: "Move “%{name}”?"
+  zh-CN: "移动“%{name}”？"
+move.title_many:
+  en: "Move %{count} items?"
+  zh-CN: "移动 %{count} 项？"
+move.to:
+  en: "To %{target}"
+  zh-CN: "移动到：%{target}"
+move.body:
+  en: Each item is copied first. Its original is removed only after the copy has been checked; files on this computer go to the recycle bin. Anything that cannot be checked keeps its original.
+  zh-CN: 每一项先复制，复制结果校验通过后才删除原件；本机文件会移到回收站。无法校验的项保留原件。
+move.body_across:
+  en: Data between the two connections passes through this computer.
+  zh-CN: 两个连接之间的数据经本机中转。
+move.started:
+  en: Moving in the background. Progress is in Tasks.
+  zh-CN: 正在后台移动，进度见“任务”。
+move.kept:
+  en: "Moved %{moved}; kept %{kept} originals: %{detail}"
+  zh-CN: "已移动 %{moved} 项；保留了 %{kept} 项原件：%{detail}"
+move.kept_more:
+  en: "; and %{count} more"
+  zh-CN: "；另有 %{count} 项"
+move.kept_copy_failed:
+  en: the copy failed
+  zh-CN: 复制失败
+move.kept_unverified:
+  en: the copy could not be checked
+  zh-CN: 无法校验复制结果
+move.kept_changed:
+  en: the original changed during the move
+  zh-CN: 原件在移动过程中被修改
+move.kept_delete_failed:
+  en: the original could not be removed
+  zh-CN: 无法删除原件
+move.kept_unsafe_name:
+  en: the name cannot be used on this computer
+  zh-CN: 该名称无法在本机使用
+move.kept_folder:
+  en: the folder still holds items that were not moved
+  zh-CN: 文件夹中仍有未移动的项
+rename.folder_object:
+  en: "“%{key}” ends in “/” but holds data, so it is not a plain folder. Nothing was renamed."
+  zh-CN: "“%{key}”以“/”结尾但含有数据，不是普通文件夹，未做任何改名。"
+conflict.names_taken:
+  en: New names could not be found for every item; the target keeps changing. Nothing was started.
+  zh-CN: 目标位置一直在变化，无法为每一项找到新名称，未开始任何操作。
+sidebar.collapse:
+  en: Collapse sidebar
+  zh-CN: 收起侧栏
+sidebar.expand:
+  en: Expand sidebar
+  zh-CN: 展开侧栏
+details.title:
+  en: Details
+  zh-CN: 详情
+details.hide:
+  en: Hide details
+  zh-CN: 隐藏详情
+details.nothing:
+  en: Select something to see its details.
+  zh-CN: 选择一项以查看详情。
+details.location:
+  en: Location
+  zh-CN: 位置
+details.loaded:
+  en: Rows loaded
+  zh-CN: 已加载条目
+details.selected:
+  en: Selected
+  zh-CN: 已选择
+details.unsized:
+  en: Without a size
+  zh-CN: 无大小信息
+details.bucket:
+  en: Bucket
+  zh-CN: 存储桶
+details.connection:
+  en: Connection
+  zh-CN: 连接
+details.endpoint:
+  en: Endpoint
+  zh-CN: 端点
+details.region:
+  en: Region
+  zh-CN: 区域
+details.name:
+  en: Name
+  zh-CN: 名称
+details.path:
+  en: Path
+  zh-CN: 路径
+details.download:
+  en: Download…
+  zh-CN: 下载…
+details.download_here:
+  en: Download Here
+  zh-CN: 下载到此处
+storage.journal_failed:
+  en: "The transfer list could not be saved (%{detail}). Transfers go on, but would not be listed after a restart. Check the free disk space."
+  zh-CN: "无法保存传输列表（%{detail}）。传输会继续，但重启后不会再列出。请检查磁盘剩余空间。"
+storage.saved_job_failed:
+  en: "A saved job's result could not be written (%{detail}); that job will not run on its schedule again until supaS3 restarts."
+  zh-CN: "无法写入已保存任务的结果（%{detail}）；在重启 supaS3 之前，该任务不会再按计划运行。"
+versions.delete:
+  en: Delete for good
+  zh-CN: 永久删除
+versions.delete_question:
+  en: Delete this version for good? It cannot be brought back.
+  zh-CN: 永久删除此版本？删除后无法恢复。
+versions.delete_data_note:
+  en: The object stays as it is now; only this older version goes.
+  zh-CN: 对象当前内容不变，只删除这个旧版本。
+versions.delete_marker_reappears:
+  en: This delete marker is what hides the object now. Deleting it makes the object appear again, as its previous version.
+  zh-CN: 当前正是这个删除标记让对象不可见。删除它后，对象会以上一个版本重新出现。
+versions.delete_marker_current:
+  en: This delete marker is the object's current state; there is no older data version loaded below it.
+  zh-CN: 这个删除标记是对象当前的状态；下面没有已加载的旧数据版本。
+versions.delete_marker_no_change:
+  en: This delete marker is not the current one; deleting it does not change whether the object is visible.
+  zh-CN: 这个删除标记不是当前版本；删除它不会改变对象当前是否可见。
+versions.deleted:
+  en: The version was deleted.
+  zh-CN: 已删除该版本。
+versions.download_queued:
+  en: "Downloading the version as “%{name}”."
+  zh-CN: "正在将该版本下载为“%{name}”。"
+view.too_large_to_save:
+  en: "The text is larger than %{limit} and is not saved; it could not be opened here again."
+  zh-CN: "文本超过 %{limit}，未保存；超过此大小后在这里无法再次打开。"
+leave.title:
+  en: "Unsaved edits in %{count} open files"
+  zh-CN: "%{count} 个打开的文件有未保存的修改"
+leave.body:
+  en: Save them before leaving, or discard the edits?
+  zh-CN: 离开前保存它们，还是放弃这些修改？
+leave.save_all:
+  en: Save all
+  zh-CN: 全部保存
+leave.save_failed:
+  en: Not everything could be saved, so nothing was closed. The edits are still open.
+  zh-CN: 有文件未能保存，因此没有关闭任何内容；修改仍然打开着。
+connection.unsaved_edits:
+  en: Files of this connection have unsaved edits. Save or close them first.
+  zh-CN: 此连接下有文件存在未保存的修改，请先保存或关闭它们。
+versions.unsafe_name:
+  en: "“%{name}” cannot be used as a file name on this computer, so this version was not downloaded."
+  zh-CN: "“%{name}”不能用作本机的文件名，因此没有下载这个版本。"

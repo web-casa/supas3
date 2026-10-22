@@ -1,33 +1,51 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The main window: connections on the side, two panes of tabs beside them.
 
+use crate::app_jobs::{AppJobs, JobContext, JobError, JobLabel};
 use crate::app_state::{AppBackend, Connections};
 use crate::backend::default_config_dir;
+use crate::conflicts::{conflicts, resolve, Choice, Existing};
 use crate::connection_form::{ConnectionForm, ConnectionFormEvent};
+use crate::content_type_view::{ContentTypeDialog, ContentTypeEvent};
+use crate::details_view::{ConnectionInfo, DetailsEvent, DetailsPanel};
 use crate::entries_table::RowAction;
+use crate::file_ops::{
+    check_local_name, check_object_name, folder_moves, stem_range, unique_name, FOLDER_RENAME_LIMIT,
+};
 use crate::i18n;
 use crate::listing::Entry;
+use crate::listing::EntryKind;
+use crate::local_copy;
 use crate::location::Location;
+use crate::name_dialog::{NameDialog, NameDialogEvent};
 use crate::object_actions::{
-    file_of, link_may_expire_early, plain_address_is_known, sync_pair, FileRef,
+    access_of, brief_error, file_of, link_may_expire_early, plain_address_is_known, sync_pair,
+    Access, FileRef, Grant, ObjectRef,
 };
 use crate::object_view::{ObjectView, ObjectViewEvent};
 use crate::pane::{Pane, PaneEvent};
 use crate::places::{full_name, short_name, Layout, PaneLayout, Places};
-use crate::properties_view::PropertiesView;
+use crate::search_view::{SearchView, SearchViewEvent};
 use crate::settings::{Appearance, Language, Settings};
 use crate::share_view::ShareView;
 use crate::sync_view::SyncView;
 use crate::task_center::{TaskCenter, TaskCenterEvent};
 use crate::tasks::EventQueue;
-use crate::transfer_plan::{plan, plan_deletion, plan_drop, Deletion, Plan};
+use crate::tasks::{TaskKind, TaskState};
+use crate::transfer_plan::{
+    plan, plan_deletion, plan_drop, plan_local_deletion, Deletion, LocalDeletion, LocalItem, Plan,
+    Replace,
+};
+use crate::transfers_view::{TransfersDialog, TransfersDialogEvent};
 use crate::versions_view::VersionsView;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::link::Link;
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
-use gpui_kit::component::sidebar::{Sidebar, SidebarGroup, SidebarMenu, SidebarMenuItem};
+use gpui_kit::component::sidebar::SidebarToggleButton;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     h_flex, v_flex, ActiveTheme as _, IconName, Sizable as _, StyledExt as _, Theme, ThemeMode,
     WindowExt as _,
@@ -35,6 +53,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rust_i18n::t;
+use std::path::PathBuf;
 use supas3_core::credentials::Profile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +73,10 @@ pub struct Workspace {
     left: Entity<Pane>,
     right: Entity<Pane>,
     task_center: Entity<TaskCenter>,
+    details: Entity<DetailsPanel>,
+    /// The sidebar takes keyboard focus; the cursor is the row it is on.
+    sidebar_focus: FocusHandle,
+    sidebar_cursor: usize,
     /// The pane that sidebar choices open in.
     active: Side,
     settings: Settings,
@@ -63,6 +86,18 @@ pub struct Workspace {
     notice: Option<String>,
     /// Places could not be saved; said once, not on every navigation.
     places_unsaved: bool,
+    /// Folder renames running as jobs, by job id: where from and where to.
+    pending_renames: std::collections::HashMap<String, (Location, Location)>,
+    /// Leaving waits for these saves to finish.
+    leaving: Option<(Leave, std::collections::HashSet<EntityId>)>,
+    /// The window the workspace is in.
+    window: AnyWindowHandle,
+    /// Which storage failures have been reported: the journal, saved jobs.
+    storage_warned: [bool; 2],
+    /// What the backend could not write, shown until the app restarts.
+    storage_notice: Option<String>,
+    /// Moves still running; the panes are reloaded when each ends.
+    pending_moves: std::collections::HashSet<String>,
     /// Counts connection reloads, so only the latest answer is applied.
     reload_generation: u64,
     _subscriptions: Vec<Subscription>,
@@ -71,6 +106,113 @@ pub struct Workspace {
 /// The folder a local pane starts in.
 fn home() -> Location {
     Location::Local(dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")))
+}
+
+/// Renames a folder in a bucket by moving each object under it, one at a
+/// time: each object is copied, then its original deleted, before the next.
+/// Runs on a job thread.
+fn rename_folder(
+    requests: &crate::backend::Requests,
+    job: &JobContext,
+    profile_id: &str,
+    bucket: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), JobError> {
+    let keys = requests
+        .wait(requests.list_keys(profile_id.into(), bucket.into(), from.into()))
+        .map_err(JobError::Failed)?;
+    if keys.len() > FOLDER_RENAME_LIMIT {
+        return Err(JobError::Failed(
+            t!("rename.too_many", limit = FOLDER_RENAME_LIMIT).into_owned(),
+        ));
+    }
+    // A key ending in `/` that holds data is not a folder marker; renaming
+    // would turn it into an empty one, so nothing is moved.
+    if let Some(odd) = keys.iter().find(|k| k.key.ends_with('/') && k.size > 0) {
+        return Err(JobError::Failed(
+            t!("rename.folder_object", key = odd.key.as_str()).into_owned(),
+        ));
+    }
+    let etags: std::collections::HashMap<String, String> = keys
+        .iter()
+        .map(|k| (k.key.clone(), k.etag.clone().unwrap_or_default()))
+        .collect();
+    let keys: Vec<String> = keys.into_iter().map(|listed| listed.key).collect();
+    let moves = folder_moves(&keys, from, to);
+    let total = moves.len() as u64;
+    job.progress(0, total);
+    for (done, (old_key, new_key)) in moves.iter().enumerate() {
+        if job.cancelled() {
+            return Err(JobError::Cancelled);
+        }
+        // Folder markers are empty objects; the backend's move treats a key
+        // ending in `/` as a whole folder, so they are recreated instead.
+        let moved = if old_key.ends_with('/') {
+            requests.wait(requests.move_folder_marker(
+                profile_id.into(),
+                bucket.into(),
+                old_key.clone(),
+                new_key.clone(),
+                etags.get(old_key).cloned().unwrap_or_default(),
+            ))
+        } else {
+            requests.wait(requests.move_object(
+                profile_id.into(),
+                bucket.into(),
+                old_key.clone(),
+                new_key.clone(),
+            ))
+        };
+        if let Err(error) = moved {
+            return Err(JobError::Failed(
+                t!(
+                    "rename.stopped",
+                    key = old_key.as_str(),
+                    error = crate::error_details::summary(&error),
+                    moved = done,
+                    left = moves.len() - done
+                )
+                .into_owned(),
+            ));
+        }
+        job.progress(done as u64 + 1, total);
+    }
+    Ok(())
+}
+
+actions!(supas3, [FocusNextRegion, FocusPreviousRegion]);
+
+/// How the app is being left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leave {
+    Quit,
+    CloseWindow,
+}
+
+/// The connection of the object a file view shows, if it shows one.
+fn editor_profile(view: &Entity<ObjectView>, cx: &App) -> Option<String> {
+    match view.read(cx).file() {
+        FileRef::Remote(object) => Some(object.profile_id.clone()),
+        FileRef::Local(_) => None,
+    }
+}
+
+/// What the menu and shortcuts ask of the active pane.
+#[derive(Debug, Clone, Copy)]
+pub enum PaneCommand {
+    NewFolder,
+    Rename,
+    Filter,
+}
+
+/// One row of the sidebar.
+#[derive(Clone)]
+enum SidebarRow {
+    Home,
+    Favorite(Location),
+    Recent(Location),
+    Connection(Box<Profile>),
 }
 
 /// Where a connection opens: its default bucket when it has one, otherwise
@@ -142,7 +284,11 @@ impl Workspace {
             )
         });
         let task_center = cx.new(|cx| TaskCenter::new(events, cx));
+        let details = cx.new(|_| DetailsPanel::new());
         let subscriptions = vec![
+            cx.subscribe_in(&details, window, |workspace, _, event, window, cx| {
+                workspace.on_details_event(event, window, cx);
+            }),
             cx.subscribe_in(&left, window, |workspace, _, event, window, cx| {
                 workspace.on_pane_event(Side::Left, event, window, cx);
             }),
@@ -150,11 +296,45 @@ impl Workspace {
                 workspace.on_pane_event(Side::Right, event, window, cx);
             }),
             // A finished transfer may have changed what a pane shows.
-            cx.subscribe(&task_center, |workspace, _, _: &TaskCenterEvent, cx| {
-                for pane in [workspace.left.clone(), workspace.right.clone()] {
-                    pane.update(cx, |pane, cx| pane.location_changed(None, false, cx));
-                }
-            }),
+            cx.subscribe(
+                &task_center,
+                |workspace, _, event: &TaskCenterEvent, cx| match event {
+                    TaskCenterEvent::TransfersFinished => {
+                        for pane in [workspace.left.clone(), workspace.right.clone()] {
+                            pane.update(cx, |pane, cx| pane.location_changed(None, false, cx));
+                        }
+                    }
+                    TaskCenterEvent::StorageFailed(errors) => {
+                        workspace.storage_failed(errors, cx);
+                    }
+                    TaskCenterEvent::Ended(ended) => {
+                        let moved = ended
+                            .iter()
+                            .filter(|(id, _)| workspace.pending_moves.remove(id))
+                            .count();
+                        if moved > 0 {
+                            for pane in [workspace.left.clone(), workspace.right.clone()] {
+                                pane.update(cx, |pane, cx| pane.location_changed(None, false, cx));
+                            }
+                        }
+                        for (id, state) in ended {
+                            if let Some((from, to)) = workspace.pending_renames.remove(id) {
+                                // Only a completed rename moves the places; a
+                                // partial one leaves the old folder in place.
+                                if *state == TaskState::Completed {
+                                    workspace.relocate(&from, &to, cx);
+                                }
+                                // Whatever the outcome, objects may have moved.
+                                for pane in [workspace.left.clone(), workspace.right.clone()] {
+                                    pane.update(cx, |pane, cx| {
+                                        pane.location_changed(None, false, cx);
+                                    });
+                                }
+                            }
+                        }
+                    }
+                },
+            ),
             cx.observe(&connections, |_, _, cx| cx.notify()),
             // Places are small; they are written whenever they change.
             cx.observe(&places, |workspace, places, cx| {
@@ -181,6 +361,9 @@ impl Workspace {
             left,
             right,
             task_center,
+            details,
+            sidebar_focus: cx.focus_handle(),
+            sidebar_cursor: 0,
             active: if layout.left_active {
                 Side::Left
             } else {
@@ -192,10 +375,39 @@ impl Workspace {
                 .map(|error| t!("error.backend_failed", error = error).into_owned()),
             reload_generation: 0,
             places_unsaved: false,
+            pending_renames: Default::default(),
+            pending_moves: Default::default(),
+            storage_warned: [false; 2],
+            leaving: None,
+            window: window.window_handle(),
+            storage_notice: None,
             _subscriptions: subscriptions,
         };
         workspace.apply_appearance(window, cx);
         workspace.reload_connections(true, cx);
+        // Closing the window from its title bar asks about unsaved edits too.
+        let this = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            let unsaved = this
+                .read_with(cx, |workspace, cx| {
+                    !workspace.unsaved_editors(cx).is_empty()
+                })
+                .unwrap_or(false);
+            if unsaved {
+                let this = this.clone();
+                window.defer(cx, move |window, cx| {
+                    let _ = this.update(cx, |workspace, cx| {
+                        workspace.leave(Leave::CloseWindow, window, cx);
+                    });
+                });
+            }
+            !unsaved
+        });
+        // The keyboard starts in the active pane.
+        let first = workspace.pane(workspace.active).clone();
+        window.defer(cx, move |window, cx| {
+            first.update(cx, |pane, cx| pane.focus(window, cx));
+        });
         workspace
     }
 
@@ -253,6 +465,8 @@ impl Workspace {
                                 .right
                                 .update(cx, |pane, cx| pane.open(location, cx));
                         }
+                        // A connection's name or endpoint may have changed.
+                        workspace.refresh_details(cx);
                     }
                     Err(error) => {
                         workspace.notice =
@@ -263,6 +477,347 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// Searches a location and below, and shows what was found.
+    fn show_search(
+        &mut self,
+        side: Side,
+        location: Location,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.new(|cx| SearchView::new(location, query.clone(), cx));
+        cx.subscribe_in(&view, window, move |workspace, _, event, window, cx| {
+            window.close_dialog(cx);
+            match event {
+                SearchViewEvent::Reveal(folder) => {
+                    workspace.activate(side, cx);
+                    workspace
+                        .pane(side)
+                        .clone()
+                        .update(cx, |pane, cx| pane.open(folder.clone(), cx));
+                }
+                SearchViewEvent::Open(folder, entry) => {
+                    workspace.show_file(RowAction::Open, folder, entry, window, cx);
+                }
+            }
+        })
+        .detach();
+        let title: SharedString = t!("search.title", query = query.as_str())
+            .into_owned()
+            .into();
+        let width = rems(46.).to_pixels(window.rem_size());
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title(title.clone()).width(width).child(view.clone())
+        });
+    }
+
+    /// Asks for a name and creates a folder in `location`.
+    fn show_new_folder(
+        &mut self,
+        side: Side,
+        location: Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let taken = self.pane(side).read(cx).loaded_names(cx);
+        let initial = unique_name(&t!("folder.default_name"), true, |name| {
+            taken.iter().any(|taken| taken == name)
+        });
+        let check = if matches!(location, Location::Local(_)) {
+            check_local_name
+        } else {
+            check_object_name
+        };
+        let range = 0..initial.len();
+        let dialog = cx.new(|cx| {
+            NameDialog::new(
+                &initial,
+                range,
+                None,
+                check,
+                taken,
+                t!("folder.create").into_owned().into(),
+                window,
+                cx,
+            )
+        });
+        cx.subscribe_in(&dialog, window, move |_, dialog, event, window, cx| {
+            let NameDialogEvent::Submitted(name) = event;
+            let Some(requests) = AppBackend::requests(cx) else {
+                let message = t!("error.backend_stopped").into_owned();
+                dialog.update(cx, |dialog, cx| dialog.failed(message, cx));
+                return;
+            };
+            let (dialog, location, name) = (dialog.clone(), location.clone(), name.clone());
+            cx.spawn_in(window, async move |workspace, cx| {
+                let result = requests.create_folder(location.clone(), name).await;
+                let _ = workspace.update_in(cx, |workspace, window, cx| match result {
+                    Ok(()) => {
+                        window.close_dialog(cx);
+                        workspace.pane(side).clone().update(cx, |pane, cx| {
+                            pane.location_changed(Some(&location), true, cx);
+                        });
+                    }
+                    Err(error) => dialog.update(cx, |dialog, cx| dialog.failed(error, cx)),
+                });
+            })
+            .detach();
+        })
+        .detach();
+        let title: SharedString = t!("folder.new_title").into_owned().into();
+        let width = rems(28.).to_pixels(window.rem_size());
+        window.open_dialog(cx, move |modal, _, cx| {
+            let busy = dialog.read(cx).is_busy();
+            modal
+                .title(title.clone())
+                .width(width)
+                .keyboard(!busy)
+                .overlay_closable(!busy)
+                .close_button(!busy)
+                .on_ok(|_, _, _| false)
+                .child(dialog.clone())
+        });
+    }
+
+    /// Asks for a new name for one file or folder and renames it.
+    fn show_rename(
+        &mut self,
+        side: Side,
+        source: Location,
+        entry: Entry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(source, Location::Buckets { .. }) {
+            return;
+        }
+        let is_folder = entry.kind == EntryKind::Folder;
+        let taken = self.pane(side).read(cx).loaded_names(cx);
+        let check = if matches!(source, Location::Local(_)) {
+            check_local_name
+        } else {
+            check_object_name
+        };
+        let range = stem_range(&entry.name, is_folder);
+        let remote_folder = is_folder && matches!(source, Location::Objects { .. });
+        let dialog = cx.new(|cx| {
+            NameDialog::new(
+                &entry.name,
+                range,
+                Some(entry.name.clone()),
+                check,
+                taken,
+                t!("rename.confirm").into_owned().into(),
+                window,
+                cx,
+            )
+        });
+        let title: SharedString = t!("rename.title", name = entry.name.as_str())
+            .into_owned()
+            .into();
+        cx.subscribe_in(
+            &dialog,
+            window,
+            move |workspace, dialog, event, window, cx| {
+                let NameDialogEvent::Submitted(name) = event;
+                workspace.rename(
+                    side,
+                    &source,
+                    &entry,
+                    name.clone(),
+                    dialog.clone(),
+                    window,
+                    cx,
+                );
+            },
+        )
+        .detach();
+        let note: Option<SharedString> =
+            remote_folder.then(|| t!("rename.folder_note").into_owned().into());
+        let width = rems(30.).to_pixels(window.rem_size());
+        window.open_dialog(cx, move |modal, _, cx| {
+            let busy = dialog.read(cx).is_busy();
+            let muted = cx.theme().muted_foreground;
+            modal
+                .title(title.clone())
+                .width(width)
+                .keyboard(!busy)
+                .overlay_closable(!busy)
+                .close_button(!busy)
+                .on_ok(|_, _, _| false)
+                .when_some(note.clone(), |this, note| {
+                    this.child(div().pb_2().text_xs().text_color(muted).child(note))
+                })
+                .child(dialog.clone())
+        });
+    }
+
+    /// Carries out a rename the user confirmed.
+    #[allow(clippy::too_many_arguments)]
+    fn rename(
+        &mut self,
+        side: Side,
+        source: &Location,
+        entry: &Entry,
+        name: String,
+        dialog: Entity<NameDialog>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(requests) = AppBackend::requests(cx) else {
+            let message = t!("error.backend_stopped").into_owned();
+            dialog.update(cx, |dialog, cx| dialog.failed(message, cx));
+            return;
+        };
+        let is_folder = entry.kind == EntryKind::Folder;
+        match source {
+            Location::Local(folder) => {
+                let (from, to) = (folder.join(&entry.name), folder.join(&name));
+                let source = source.clone();
+                cx.spawn_in(window, async move |workspace, cx| {
+                    let result = requests.rename_local(from.clone(), to.clone()).await;
+                    let _ = workspace.update_in(cx, |workspace, window, cx| match result {
+                        Ok(()) => {
+                            window.close_dialog(cx);
+                            if is_folder {
+                                workspace.relocate(
+                                    &Location::Local(from),
+                                    &Location::Local(to),
+                                    cx,
+                                );
+                            }
+                            workspace.pane(side).clone().update(cx, |pane, cx| {
+                                pane.location_changed(Some(&source), true, cx);
+                            });
+                        }
+                        Err(error) => dialog.update(cx, |dialog, cx| dialog.failed(error, cx)),
+                    });
+                })
+                .detach();
+            }
+            Location::Objects {
+                profile_id,
+                bucket,
+                prefix,
+            } if !is_folder => {
+                let (profile_id, bucket) = (profile_id.clone(), bucket.clone());
+                let (from, to) = (format!("{prefix}{}", entry.name), format!("{prefix}{name}"));
+                let source = source.clone();
+                cx.spawn_in(window, async move |workspace, cx| {
+                    let result = requests.move_object(profile_id, bucket, from, to).await;
+                    let _ = workspace.update_in(cx, |workspace, window, cx| match result {
+                        Ok(()) => {
+                            window.close_dialog(cx);
+                            workspace.pane(side).clone().update(cx, |pane, cx| {
+                                pane.location_changed(Some(&source), true, cx);
+                            });
+                        }
+                        Err(error) => dialog.update(cx, |dialog, cx| dialog.failed(error, cx)),
+                    });
+                })
+                .detach();
+            }
+            Location::Objects {
+                profile_id,
+                bucket,
+                prefix,
+            } => {
+                // A folder in storage: move every object under it, as a job.
+                let old_prefix = entry
+                    .prefix
+                    .clone()
+                    .unwrap_or_else(|| format!("{prefix}{}/", entry.name));
+                let new_prefix = format!("{prefix}{name}/");
+                let from = Location::objects(profile_id, bucket, &old_prefix);
+                let to = Location::objects(profile_id, bucket, &new_prefix);
+                let label = JobLabel {
+                    kind: TaskKind::Rename,
+                    name: format!("{} → {name}", entry.name),
+                    source: format!("s3://{bucket}/{old_prefix}"),
+                    target: format!("s3://{bucket}/{new_prefix}"),
+                };
+                let (profile_id, bucket) = (profile_id.clone(), bucket.clone());
+                let here = source.clone();
+                cx.spawn_in(window, async move |workspace, cx| {
+                    // The rows shown may not include a folder of the new
+                    // name further down; renaming into it would merge the
+                    // two, so the bucket itself is asked.
+                    let taken = requests
+                        .existing(here, vec![(name.clone(), true)])
+                        .await
+                        .map(|found| !found.is_empty());
+                    let _ = workspace.update_in(cx, |workspace, window, cx| match taken {
+                        Ok(false) => {
+                            let id = cx.global::<AppJobs>().start(label, 0, move |job| {
+                                rename_folder(
+                                    &requests,
+                                    job,
+                                    &profile_id,
+                                    &bucket,
+                                    &old_prefix,
+                                    &new_prefix,
+                                )
+                            });
+                            workspace.pending_renames.insert(id, (from, to));
+                            window.close_dialog(cx);
+                            Self::notify(
+                                NotificationType::Info,
+                                t!("rename.folder_started").into_owned(),
+                                window,
+                                cx,
+                            );
+                        }
+                        Ok(true) => dialog.update(cx, |dialog, cx| {
+                            dialog.failed(t!("name.exists", name = name.as_str()).into_owned(), cx);
+                        }),
+                        Err(error) => dialog.update(cx, |dialog, cx| dialog.failed(error, cx)),
+                    });
+                })
+                .detach();
+            }
+            // Buckets are not renamed; the dialog is not offered for them.
+            Location::Buckets { .. } => window.close_dialog(cx),
+        }
+    }
+
+    /// Says, once for each kind, that the backend could not write to disk.
+    fn storage_failed(&mut self, errors: &[crate::tasks::StorageError], cx: &mut Context<Self>) {
+        use crate::tasks::StorageError;
+        for error in errors {
+            let (kind, message) = match error {
+                StorageError::Journal(detail) => (
+                    0,
+                    t!("storage.journal_failed", detail = detail.as_str()).into_owned(),
+                ),
+                StorageError::SavedJob(detail) => (
+                    1,
+                    t!("storage.saved_job_failed", detail = detail.as_str()).into_owned(),
+                ),
+            };
+            if self.storage_warned[kind] {
+                continue;
+            }
+            self.storage_warned[kind] = true;
+            self.storage_notice = Some(match self.storage_notice.take() {
+                Some(earlier) => format!("{earlier} {message}"),
+                None => message,
+            });
+        }
+        cx.notify();
+    }
+
+    /// Moves open tabs, favorites and recent places into a renamed folder.
+    fn relocate(&mut self, from: &Location, to: &Location, cx: &mut Context<Self>) {
+        for pane in [self.left.clone(), self.right.clone()] {
+            pane.update(cx, |pane, cx| pane.relocate(from, to, cx));
+        }
+        self.places.update(cx, |places, cx| {
+            places.relocate(from, to);
+            cx.notify();
+        });
     }
 
     /// Records where the panes are, and the place just opened as recent.
@@ -348,7 +903,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let changed = self.activate(side, cx);
+        // A pane whose tabs moved on their own, as after a rename elsewhere,
+        // does not become the active one.
+        let changed = !matches!(event, PaneEvent::Moved | PaneEvent::SelectionChanged)
+            && self.activate(side, cx);
+        if changed || (side == self.active && matches!(event, PaneEvent::SelectionChanged)) {
+            self.refresh_details(cx);
+        }
         match event {
             PaneEvent::Activated => {
                 if changed {
@@ -363,11 +924,21 @@ impl Workspace {
                 let target = self.pane(target_side).read(cx).location().clone();
                 self.start_copy(plan(&taken.source, &taken.entries, &target), window, cx);
             }
-            PaneEvent::EntriesDropped(dragged) => {
+            PaneEvent::MoveRequested(taken) => {
+                let target = self.pane(Self::other(side)).read(cx).location().clone();
+                let planned = plan(&taken.source, &taken.entries, &target);
+                self.start_move(planned, &taken.source, window, cx);
+            }
+            PaneEvent::EntriesDropped(dragged, moving) => {
                 let target = self.pane(side).read(cx).location().clone();
                 // Dropping rows back where they came from does nothing.
                 if dragged.source != target {
-                    self.start_copy(plan(&dragged.source, &dragged.entries, &target), window, cx);
+                    let planned = plan(&dragged.source, &dragged.entries, &target);
+                    if *moving {
+                        self.start_move(planned, &dragged.source, window, cx);
+                    } else {
+                        self.start_copy(planned, window, cx);
+                    }
                 }
             }
             PaneEvent::FilesDropped(paths) => {
@@ -381,6 +952,18 @@ impl Workspace {
             PaneEvent::DeleteRequested(taken) => {
                 self.confirm_delete_rows(&taken.source, &taken.entries, window, cx);
             }
+            PaneEvent::SearchRequested(location, query) => {
+                self.show_search(side, location.clone(), query.clone(), window, cx);
+            }
+            PaneEvent::Notice(message) => {
+                Self::notify(NotificationType::Info, message.clone(), window, cx);
+            }
+            PaneEvent::NewFolderRequested(location) => {
+                self.show_new_folder(side, location.clone(), window, cx);
+            }
+            PaneEvent::RowActionRequested(RowAction::Rename, source, entry) => {
+                self.show_rename(side, source.clone(), entry.clone(), window, cx);
+            }
             PaneEvent::RowActionRequested(RowAction::Sync, source, entry) => {
                 self.show_sync(side, source, Some(&entry.name), window, cx);
             }
@@ -388,6 +971,7 @@ impl Workspace {
                 self.show_file(*action, source, entry, window, cx);
             }
             PaneEvent::SyncRequested(source) => self.show_sync(side, source, None, window, cx),
+            PaneEvent::SelectionChanged => {}
         }
     }
 
@@ -504,7 +1088,551 @@ impl Workspace {
         });
     }
 
+    /// Copies files on this computer as a job of the application's own.
+    fn start_local_copy(&mut self, items: Vec<LocalItem>, folder: PathBuf, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = items.iter().map(|item| item.path.clone()).collect();
+        let items: Vec<local_copy::CopyItem> = items
+            .into_iter()
+            .map(|item| local_copy::CopyItem {
+                from: item.path,
+                name: item.name,
+                replace: match item.replace {
+                    Some(Replace::File(identity)) => Some(identity),
+                    _ => None,
+                },
+            })
+            .collect();
+        let name = match paths.as_slice() {
+            [only] => only
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            many => t!("drag.items", count = many.len()).into_owned(),
+        };
+        let label = JobLabel {
+            kind: TaskKind::LocalCopy,
+            name,
+            source: paths
+                .first()
+                .and_then(|path| path.parent())
+                .map(|parent| parent.display().to_string())
+                .unwrap_or_default(),
+            target: folder.display().to_string(),
+        };
+        cx.global::<AppJobs>().start(label, 0, move |job| {
+            let total = local_copy::total_size(&paths)
+                .map_err(|error| JobError::Failed(error.to_string()))?;
+            job.progress(0, total);
+            local_copy::copy_into(
+                &items,
+                &folder,
+                |done| job.progress(done, total),
+                || job.cancelled(),
+            )
+            .map_err(|error| match error {
+                local_copy::CopyError::Cancelled => JobError::Cancelled,
+                local_copy::CopyError::Exists(path) => JobError::Failed(
+                    t!("copy.local_exists", path = path.display().to_string()).into_owned(),
+                ),
+                local_copy::CopyError::Changed(path) => JobError::Failed(
+                    t!("copy.replace_changed", name = path.display().to_string()).into_owned(),
+                ),
+                other => JobError::Failed(other.to_string()),
+            })
+        });
+    }
+
     fn run_copy(&mut self, planned: Plan, window: &mut Window, cx: &mut Context<Self>) {
+        self.check_targets(planned, None, window, cx);
+    }
+
+    /// Checks the target for names the copy or move would use, asks what to
+    /// do about any it finds, then carries it out. `moving` names the source
+    /// of a move.
+    fn check_targets(
+        &mut self,
+        planned: Plan,
+        moving: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(requests) = AppBackend::requests(cx) else {
+            let message = t!("error.backend_stopped").into_owned();
+            Self::notify(NotificationType::Error, message, window, cx);
+            return;
+        };
+        let (target, names) = (planned.target(), planned.target_names());
+        cx.spawn_in(window, async move |workspace, cx| {
+            let profile_id = target.profile_id().map(str::to_string);
+            let found = requests.existing(target, names).await;
+            // Whether the service itself refuses a replacement of a changed
+            // object, read from the client the backend builds.
+            let atomic = match (&found, profile_id) {
+                (Ok(found), Some(profile_id)) if !found.is_empty() => requests
+                    .write_traits(profile_id)
+                    .await
+                    .is_ok_and(|traits| traits.refuses_changed_saves),
+                _ => false,
+            };
+            let _ = workspace.update_in(cx, |workspace, window, cx| match found {
+                Err(error) => {
+                    let message = t!("copy.check_failed", detail = error).into_owned();
+                    Self::notify(NotificationType::Error, message, window, cx);
+                }
+                Ok(found) if conflicts(&planned, &found).is_empty() => match moving {
+                    Some(source) => workspace.run_move_now(planned, source, window, cx),
+                    None => workspace.run_copy_now(planned, window, cx),
+                },
+                Ok(found) => {
+                    workspace.ask_about_conflicts(planned, found, atomic, moving, window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Asks whether to skip, replace or keep both for names already taken.
+    /// A move offers no replacing: it would delete two things at once.
+    fn ask_about_conflicts(
+        &mut self,
+        planned: Plan,
+        found: Vec<Existing>,
+        atomic: bool,
+        moving: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let taken: Vec<String> = conflicts(&planned, &found)
+            .iter()
+            .map(|found| found.name.clone())
+            .collect();
+        let title: SharedString = match taken.as_slice() {
+            [only] => t!("conflict.title_one", name = only.as_str())
+                .into_owned()
+                .into(),
+            many => t!("conflict.title_many", count = many.len())
+                .into_owned()
+                .into(),
+        };
+        let listed: SharedString = {
+            let mut shown: Vec<String> = taken.iter().take(8).cloned().collect();
+            if taken.len() > 8 {
+                shown.push(t!("conflict.more", count = taken.len() - 8).into_owned());
+            }
+            shown.join("\n").into()
+        };
+        let note: SharedString = if atomic {
+            t!("conflict.replace_note_atomic").into_owned().into()
+        } else {
+            t!("conflict.replace_note").into_owned().into()
+        };
+        let workspace = cx.weak_entity();
+        let width = rems(32.).to_pixels(window.rem_size());
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            let choose = |choice: Choice| {
+                let (workspace, planned, found) =
+                    (workspace.clone(), planned.clone(), found.clone());
+                let moving = moving.clone();
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    window.close_dialog(cx);
+                    let (planned, found, moving) = (planned.clone(), found.clone(), moving.clone());
+                    let _ = workspace.update(cx, |workspace, cx| {
+                        workspace.apply_choice(planned, found, choice, moving, window, cx);
+                    });
+                }
+            };
+            dialog
+                .title(title.clone())
+                .width(width)
+                // The choice matters; Enter alone does not make it.
+                .on_ok(|_, _, _| false)
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(div().text_sm().child(t!("conflict.body").into_owned()))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(muted)
+                                .whitespace_normal()
+                                .child(listed.clone()),
+                        )
+                        .when(moving.is_none(), |this| {
+                            this.child(div().text_xs().text_color(muted).child(note.clone()))
+                        }),
+                )
+                .footer(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("conflict-cancel")
+                                .ghost()
+                                .label(t!("action.cancel").into_owned())
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .when(moving.is_none(), |this| {
+                            this.child(
+                                Button::new("conflict-replace")
+                                    .danger()
+                                    .label(t!("conflict.replace").into_owned())
+                                    .on_click(choose(Choice::Replace)),
+                            )
+                        })
+                        .child(
+                            Button::new("conflict-both")
+                                .outline()
+                                .label(t!("conflict.keep_both").into_owned())
+                                .on_click(choose(Choice::KeepBoth)),
+                        )
+                        .child(
+                            Button::new("conflict-skip")
+                                .primary()
+                                .label(t!("conflict.skip").into_owned())
+                                .on_click(choose(Choice::Skip)),
+                        ),
+                )
+        });
+    }
+
+    /// Carries out the user's choice about names already taken. New names
+    /// for "keep both" are checked at the target too, and chosen again if
+    /// one of them is taken by something not seen before.
+    fn apply_choice(
+        &mut self,
+        planned: Plan,
+        mut found: Vec<Existing>,
+        choice: Choice,
+        moving: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(requests) = AppBackend::requests(cx) else {
+            let message = t!("error.backend_stopped").into_owned();
+            Self::notify(NotificationType::Error, message, window, cx);
+            return;
+        };
+        cx.spawn_in(window, async move |workspace, cx| {
+            let (mut plan, mut left_out) = resolve(planned.clone(), &found, choice);
+            let mut settled = choice != Choice::KeepBoth;
+            for _ in 0..5 {
+                if settled {
+                    break;
+                }
+                match requests.existing(plan.target(), plan.target_names()).await {
+                    Ok(more) if conflicts(&plan, &more).is_empty() => settled = true,
+                    Ok(more) => {
+                        found.extend(more);
+                        (plan, left_out) = resolve(planned.clone(), &found, choice);
+                    }
+                    Err(error) => {
+                        let _ = workspace.update_in(cx, |_, window, cx| {
+                            let message = t!("copy.check_failed", detail = error).into_owned();
+                            Self::notify(NotificationType::Error, message, window, cx);
+                        });
+                        return;
+                    }
+                }
+            }
+            let _ = workspace.update_in(cx, |workspace, window, cx| {
+                if !settled {
+                    let message = t!("conflict.names_taken").into_owned();
+                    Self::notify(NotificationType::Error, message, window, cx);
+                    return;
+                }
+                if !left_out.is_empty() {
+                    let message = t!("conflict.left_out", names = left_out.join(", ")).into_owned();
+                    Self::notify(NotificationType::Info, message, window, cx);
+                }
+                if plan.is_empty() {
+                    return;
+                }
+                match moving {
+                    Some(source) => workspace.run_move_now(plan, source, window, cx),
+                    None => workspace.run_copy_now(plan, window, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Files open in tabs that hold unsaved edits or a save in flight.
+    fn unsaved_editors(&self, cx: &App) -> Vec<(String, Entity<ObjectView>)> {
+        [&self.left, &self.right]
+            .into_iter()
+            .flat_map(|pane| pane.read(cx).editors())
+            .filter(|(_, view)| view.read(cx).holds_work(cx))
+            .collect()
+    }
+
+    /// Quits or closes the window, asking first what to do with unsaved
+    /// edits: save them all, discard them, or stay.
+    pub fn leave(&mut self, how: Leave, window: &mut Window, cx: &mut Context<Self>) {
+        let unsaved = self.unsaved_editors(cx);
+        if unsaved.is_empty() {
+            Self::leave_now(how, window, cx);
+            return;
+        }
+        let names: SharedString = unsaved
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
+        // Saving all is offered only when every one of them can be saved.
+        let savable = unsaved.iter().all(|(_, view)| {
+            let view = view.read(cx);
+            view.is_editable() && !view.is_saving()
+        });
+        let title: SharedString = t!("leave.title", count = unsaved.len()).into_owned().into();
+        let workspace = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            let (save_workspace, discard_workspace) = (workspace.clone(), workspace.clone());
+            let views: Vec<Entity<ObjectView>> =
+                unsaved.iter().map(|(_, view)| view.clone()).collect();
+            dialog
+                .title(title.clone())
+                .on_ok(|_, _, _| false)
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(div().text_sm().child(t!("leave.body").into_owned()))
+                        .child(div().text_sm().text_color(muted).child(names.clone())),
+                )
+                .footer(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("leave-cancel")
+                                .ghost()
+                                .label(t!("action.cancel").into_owned())
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("leave-discard")
+                                .danger()
+                                .label(t!("view.discard").into_owned())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let _ = discard_workspace.update(cx, |_, cx| {
+                                        Self::leave_now(how, window, cx);
+                                    });
+                                }),
+                        )
+                        .when(savable, |this| {
+                            this.child(
+                                Button::new("leave-save")
+                                    .primary()
+                                    .label(t!("leave.save_all").into_owned())
+                                    .on_click(move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        let views = views.clone();
+                                        let _ = save_workspace.update(cx, |workspace, cx| {
+                                            workspace.save_all_then(how, views, cx);
+                                        });
+                                    }),
+                            )
+                        }),
+                )
+        });
+    }
+
+    fn leave_now(how: Leave, window: &mut Window, cx: &mut App) {
+        match how {
+            Leave::Quit => crate::quit(cx),
+            Leave::CloseWindow => window.remove_window(),
+        }
+    }
+
+    /// Saves every view, then leaves once all have been saved.
+    fn save_all_then(
+        &mut self,
+        how: Leave,
+        views: Vec<Entity<ObjectView>>,
+        cx: &mut Context<Self>,
+    ) {
+        let pending: std::collections::HashSet<EntityId> = views
+            .iter()
+            .filter(|view| view.read(cx).is_dirty(cx))
+            .map(|view| view.entity_id())
+            .collect();
+        self.leaving = Some((how, pending));
+        for view in views {
+            view.update(cx, |view, cx| view.save(cx));
+        }
+        // Nothing was left to save.
+        self.saved_while_leaving(EntityId::from(0u64), cx);
+    }
+
+    /// One save finished; leave when it was the last one waited for.
+    fn saved_while_leaving(&mut self, id: EntityId, cx: &mut Context<Self>) {
+        let Some((how, pending)) = &mut self.leaving else {
+            return;
+        };
+        pending.remove(&id);
+        if !pending.is_empty() {
+            return;
+        }
+        let how = *how;
+        self.leaving = None;
+        // Asked again rather than left at once: something may have been
+        // edited while the saves ran.
+        let handle = self.window;
+        let this = cx.entity();
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                this.update(cx, |workspace, cx| workspace.leave(how, window, cx));
+            });
+        });
+    }
+
+    /// A save failed while leaving: stay, with the edits shown.
+    fn save_failed_while_leaving(&mut self, cx: &mut Context<Self>) {
+        if self.leaving.take().is_none() {
+            return;
+        }
+        let handle = self.window;
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                let message = t!("leave.save_failed").into_owned();
+                Self::notify(NotificationType::Error, message, window, cx);
+            });
+        });
+    }
+
+    /// Confirms a move, which removes each source once its copy is checked.
+    fn start_move(
+        &mut self,
+        planned: Result<Plan, crate::transfer_plan::Refusal>,
+        source: &Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let planned = match planned {
+            Ok(planned) => planned,
+            Err(refusal) => {
+                let message = t!(refusal.message_key()).into_owned();
+                Self::notify(NotificationType::Info, message, window, cx);
+                return;
+            }
+        };
+        let source = self.describe(source, cx);
+        let target = self.describe(&planned.target(), cx);
+        let names = planned.target_names();
+        let title: SharedString = match names.as_slice() {
+            [(only, _)] => t!("move.title_one", name = only.as_str()),
+            many => t!("move.title_many", count = many.len()),
+        }
+        .into_owned()
+        .into();
+        let mut body = t!("move.body").into_owned();
+        if matches!(planned, Plan::CopyAcross { .. }) {
+            body.push(' ');
+            body.push_str(&t!("move.body_across"));
+        }
+        let body: SharedString = body.into();
+        let destination: SharedString = t!("move.to", target = target).into_owned().into();
+        let workspace = cx.weak_entity();
+        let width = rems(30.).to_pixels(window.rem_size());
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            let (workspace, planned, source) = (workspace.clone(), planned.clone(), source.clone());
+            dialog
+                .title(title.clone())
+                .width(width)
+                // Moving removes the sources; Enter alone does not start it.
+                .on_ok(|_, _, _| false)
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .whitespace_normal()
+                                .child(destination.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(muted)
+                                .whitespace_normal()
+                                .child(body.clone()),
+                        ),
+                )
+                .footer(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("cancel-move")
+                                .outline()
+                                .label(t!("action.cancel").into_owned())
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("confirm-move")
+                                .primary()
+                                .label(t!("action.move").into_owned())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let (planned, source) = (planned.clone(), source.clone());
+                                    let _ = workspace.update(cx, |workspace, cx| {
+                                        workspace.check_targets(planned, Some(source), window, cx);
+                                    });
+                                }),
+                        ),
+                )
+        });
+    }
+
+    /// Runs a move as a job of the application's own; the panes are
+    /// reloaded when it ends.
+    fn run_move_now(
+        &mut self,
+        planned: Plan,
+        source: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(requests) = AppBackend::requests(cx) else {
+            let message = t!("error.backend_stopped").into_owned();
+            Self::notify(NotificationType::Error, message, window, cx);
+            return;
+        };
+        let names = planned.target_names();
+        let label = JobLabel {
+            kind: TaskKind::Move,
+            name: match names.as_slice() {
+                [(only, _)] => only.clone(),
+                many => t!("drag.items", count = many.len()).into_owned(),
+            },
+            source,
+            target: self.describe(&planned.target(), cx),
+        };
+        let id = cx.global::<AppJobs>().start(label, 0, move |job| {
+            match crate::moves::run(&planned, &requests, job) {
+                Ok(report) if report.kept.is_empty() => Ok(()),
+                Ok(report) => Err(JobError::Failed(crate::moves::describe(&report))),
+                Err(crate::moves::Stopped::Cancelled(_)) => Err(JobError::Cancelled),
+            }
+        });
+        self.pending_moves.insert(id);
+        Self::notify(
+            NotificationType::Info,
+            t!("move.started").into_owned(),
+            window,
+            cx,
+        );
+    }
+
+    fn run_copy_now(&mut self, planned: Plan, window: &mut Window, cx: &mut Context<Self>) {
+        if let Plan::CopyLocal { items, folder } = planned {
+            self.start_local_copy(items, folder, cx);
+            return;
+        }
         let Some(requests) = AppBackend::requests(cx) else {
             let message = t!("error.backend_stopped").into_owned();
             Self::notify(NotificationType::Error, message, window, cx);
@@ -560,6 +1688,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let location = location.clone();
+        if let Some(deletion) = plan_local_deletion(&location, rows) {
+            self.confirm_local_deletion(deletion, location, window, cx);
+            return;
+        }
         let deletion = match plan_deletion(&location, rows) {
             Ok(deletion) => deletion,
             Err(refusal) => {
@@ -614,6 +1746,95 @@ impl Workspace {
         });
     }
 
+    /// Asks before moving files on this computer to the recycle bin.
+    fn confirm_local_deletion(
+        &mut self,
+        deletion: LocalDeletion,
+        location: Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title: SharedString = match deletion.names.as_slice() {
+            [only] => t!("delete.trash_title_one", name = only)
+                .into_owned()
+                .into(),
+            many => t!("delete.trash_title_many", count = many.len())
+                .into_owned()
+                .into(),
+        };
+        let body: SharedString = t!("delete.local_body").into_owned().into();
+        let workspace = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (workspace, deletion, location) =
+                (workspace.clone(), deletion.clone(), location.clone());
+            dialog
+                .title(title.clone())
+                .child(body.clone())
+                .on_ok(|_, _, _| false)
+                .footer(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("cancel-trash")
+                                .outline()
+                                .label(t!("action.cancel").into_owned())
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("confirm-trash")
+                                .danger()
+                                .label(t!("delete.move_to_trash").into_owned())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let (paths, location) =
+                                        (deletion.paths.clone(), location.clone());
+                                    let _ = workspace.update(cx, |workspace, cx| {
+                                        workspace.run_trash(paths, location, window, cx);
+                                    });
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn run_trash(
+        &mut self,
+        paths: Vec<PathBuf>,
+        location: Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(requests) = AppBackend::requests(cx) else {
+            return;
+        };
+        cx.spawn_in(window, async move |workspace, cx| {
+            let result = requests.trash_local(paths).await;
+            let _ = workspace.update_in(cx, |workspace, window, cx| {
+                for pane in [workspace.left.clone(), workspace.right.clone()] {
+                    pane.update(cx, |pane, cx| {
+                        pane.location_changed(Some(&location), true, cx)
+                    });
+                }
+                match result {
+                    Ok(count) => Self::notify(
+                        NotificationType::Success,
+                        t!("delete.trashed", count = count).into_owned(),
+                        window,
+                        cx,
+                    ),
+                    Err(error) => Self::notify(
+                        NotificationType::Error,
+                        t!("delete.trash_failed", detail = error).into_owned(),
+                        window,
+                        cx,
+                    ),
+                }
+            });
+        })
+        .detach();
+    }
+
     fn run_delete(
         &mut self,
         deletion: Deletion,
@@ -660,6 +1881,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if action == RowAction::Properties {
+            self.show_details_of(source, entry, window, cx);
+            return;
+        }
         let Some(file) = file_of(source, entry) else {
             return;
         };
@@ -671,15 +1896,6 @@ impl Workspace {
             }
             return;
         };
-        if action == RowAction::Properties {
-            let view = cx.new(|cx| PropertiesView::new(object, cx));
-            let title: SharedString = t!("properties.title", name = name).into_owned().into();
-            let width = rems(36.).to_pixels(window.rem_size());
-            window.open_dialog(cx, move |dialog, _, _| {
-                dialog.title(title.clone()).width(width).child(view.clone())
-            });
-            return;
-        }
         if action == RowAction::Versions {
             let view = cx.new(|cx| VersionsView::new(object, cx));
             let title: SharedString = t!("versions.title", name = name).into_owned().into();
@@ -738,18 +1954,42 @@ impl Workspace {
     ) {
         let name: SharedString = entry.name.clone().into();
         let width = rems(46.).to_pixels(window.rem_size());
-        let view = cx.new(|cx| ObjectView::new(file, &entry.name, entry.size, guarded, window, cx));
+        // Text opens in a tab of the pane it was opened from; images and
+        // notes in a dialog.
+        let in_tab = matches!(
+            crate::object_actions::opening(&entry.name, entry.size),
+            crate::object_actions::Opening::Text
+        );
+        let view = cx
+            .new(|cx| ObjectView::new(file, &entry.name, entry.size, guarded, in_tab, window, cx));
         let changed = source.clone();
-        cx.subscribe(&view, move |workspace, _, event, cx| match event {
+        cx.subscribe(&view, move |workspace, view, event, cx| match event {
             ObjectViewEvent::Saved => {
                 for pane in [workspace.left.clone(), workspace.right.clone()] {
                     pane.update(cx, |pane, cx| {
                         pane.location_changed(Some(&changed), false, cx)
                     });
                 }
+                workspace.saved_while_leaving(view.entity_id(), cx);
             }
+            ObjectViewEvent::SaveFailed => workspace.save_failed_while_leaving(cx),
+            ObjectViewEvent::CloseRequested => {}
         })
         .detach();
+        if in_tab {
+            let side = if self.left.read(cx).location() == source {
+                Side::Left
+            } else if self.right.read(cx).location() == source {
+                Side::Right
+            } else {
+                self.active
+            };
+            self.activate(side, cx);
+            self.pane(side).clone().update(cx, |pane, cx| {
+                pane.open_editor(entry.name.clone(), view, window, cx);
+            });
+            return;
+        }
         window.open_dialog(cx, move |dialog, _, cx| {
             // Unsaved edits and a save in flight are not lost to a stray
             // Escape, Enter or click; the view's own Close button asks first.
@@ -809,6 +2049,433 @@ impl Workspace {
     }
 
     /// Says what this application is, which version, and under what terms.
+    /// The connection behind a location, as the details panel shows it.
+    fn connection_info(&self, location: &Location, cx: &App) -> Option<ConnectionInfo> {
+        let profile = self
+            .connections
+            .read(cx)
+            .get(location.profile_id()?)?
+            .clone();
+        let endpoint = match &profile.credential_type {
+            supas3_core::credentials::CredentialType::CustomEndpoint { endpoint_url, .. } => {
+                Some(endpoint_url.clone())
+            }
+            _ => None,
+        };
+        Some(ConnectionInfo {
+            idrive_e2: profile.compat.provider == supas3_core::credentials::Provider::IdriveE2,
+            name: profile.name,
+            endpoint,
+            region: profile.region,
+        })
+    }
+
+    /// Shows what the active pane has selected in the details panel, when
+    /// the panel is open.
+    fn refresh_details(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.details_open {
+            return;
+        }
+        let (source, subject) = self.pane(self.active).read(cx).details_subject(cx);
+        let connection = self.connection_info(&source, cx);
+        self.details.update(cx, |details, cx| {
+            details.show(source, subject, connection, cx);
+        });
+    }
+
+    /// Opens the details panel on one row.
+    fn show_details_of(
+        &mut self,
+        source: &Location,
+        entry: &Entry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.settings.details_open {
+            self.store_settings(|settings| settings.details_open = true, window, cx);
+        }
+        let subject = crate::details::subject(source, std::slice::from_ref(entry), 0);
+        let connection = self.connection_info(source, cx);
+        let source = source.clone();
+        self.details.update(cx, |details, cx| {
+            details.show(source, subject, connection, cx);
+        });
+    }
+
+    /// Shows or hides the details panel.
+    pub fn toggle_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.store_settings(
+            |settings| settings.details_open = !settings.details_open,
+            window,
+            cx,
+        );
+        self.refresh_details(cx);
+    }
+
+    fn on_details_event(
+        &mut self,
+        event: &DetailsEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            DetailsEvent::Close => {
+                self.store_settings(|settings| settings.details_open = false, window, cx);
+            }
+            DetailsEvent::Row(action, source, entry) => {
+                self.show_file(*action, source, entry, window, cx);
+            }
+            DetailsEvent::Download(source, entry) => {
+                self.download(source.clone(), entry.clone(), window, cx);
+            }
+            DetailsEvent::ChangeContentType {
+                object,
+                name,
+                current,
+                etag,
+            } => {
+                let (object, etag) = (object.clone(), etag.clone());
+                self.show_content_type(object, name, current.clone(), etag, window, cx);
+            }
+            DetailsEvent::ChangeAccess {
+                object,
+                to,
+                current,
+                etag,
+            } => {
+                let (object, etag) = (object.clone(), etag.clone());
+                self.confirm_access(object, *to, *current, etag, window, cx);
+            }
+        }
+    }
+
+    /// An object was changed from the details panel: shows it anew, and
+    /// the listings of its folder.
+    fn object_changed(&mut self, object: &ObjectRef, cx: &mut Context<Self>) {
+        self.details.update(cx, |details, cx| details.reload(cx));
+        let prefix = object.key.rfind('/').map_or("", |end| &object.key[..=end]);
+        let folder = Location::objects(&object.profile_id, &object.bucket, prefix);
+        for pane in [self.left.clone(), self.right.clone()] {
+            pane.update(cx, |pane, cx| {
+                pane.location_changed(Some(&folder), false, cx)
+            });
+        }
+    }
+
+    /// Asks for a new Content-Type and changes it, only on the content
+    /// the panel showed.
+    fn show_content_type(
+        &mut self,
+        object: ObjectRef,
+        name: &str,
+        current: Option<String>,
+        etag: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dialog = cx.new(|cx| ContentTypeDialog::new(name, current, window, cx));
+        cx.subscribe_in(&dialog, window, move |_, dialog, event, window, cx| {
+            let ContentTypeEvent::Submitted(content_type) = event;
+            let Some(requests) = AppBackend::requests(cx) else {
+                let message = t!("error.backend_stopped").into_owned();
+                dialog.update(cx, |dialog, cx| dialog.failed(message, cx));
+                return;
+            };
+            let (dialog, object, content_type, etag) = (
+                dialog.clone(),
+                object.clone(),
+                content_type.clone(),
+                etag.clone(),
+            );
+            cx.spawn_in(window, async move |workspace, cx| {
+                let result = requests
+                    .set_content_type(object.clone(), content_type, etag)
+                    .await
+                    .map_err(|error| {
+                        // The two refusals made before anything is written.
+                        if error.contains("changed since it was shown") {
+                            t!("content_type.changed").into_owned()
+                        } else if error.contains("only for objects up to 5 GiB") {
+                            t!("content_type.too_large").into_owned()
+                        } else {
+                            error
+                        }
+                    });
+                let _ = workspace.update_in(cx, |workspace, window, cx| match result {
+                    Ok(()) => {
+                        window.close_dialog(cx);
+                        workspace.object_changed(&object, cx);
+                    }
+                    Err(error) => dialog.update(cx, |dialog, cx| dialog.failed(error, cx)),
+                });
+            })
+            .detach();
+        })
+        .detach();
+        let title: SharedString = t!("content_type.title", name = name).into_owned().into();
+        let width = rems(30.).to_pixels(window.rem_size());
+        window.open_dialog(cx, move |modal, _, cx| {
+            let busy = dialog.read(cx).is_busy();
+            modal
+                .title(title.clone())
+                .width(width)
+                .keyboard(!busy)
+                .overlay_closable(!busy)
+                .close_button(!busy)
+                .on_ok(|_, _, _| false)
+                .child(dialog.clone())
+        });
+    }
+
+    /// Confirms giving an object a new ACL, saying what it means, then
+    /// makes the change.
+    fn confirm_access(
+        &mut self,
+        object: ObjectRef,
+        to: Access,
+        current: Access,
+        etag: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = cx.weak_entity();
+        let (title, confirm) = match to {
+            Access::PublicRead => (t!("access.public_title"), t!("access.make_public")),
+            _ => (t!("access.private_title"), t!("access.make_private")),
+        };
+        let mut lines = vec![t!(if to == Access::PublicRead {
+            "access.public_body"
+        } else {
+            "access.private_body"
+        })
+        .into_owned()];
+        if current == Access::Custom {
+            lines.push(t!("access.custom_replaced").into_owned());
+        }
+        lines.push(t!("access.inherit_note").into_owned());
+        let (title, confirm): (SharedString, SharedString) =
+            (title.into_owned().into(), confirm.into_owned().into());
+        let address = object.display();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let (workspace, object, etag) = (workspace.clone(), object.clone(), etag.clone());
+            let muted = cx.theme().muted_foreground;
+            dialog
+                .title(title.clone())
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(div().text_xs().text_color(muted).child(address.clone()))
+                        .children(lines.iter().map(|line| div().text_sm().child(line.clone()))),
+                )
+                .footer(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("cancel-access")
+                                .outline()
+                                .label(t!("action.cancel").into_owned())
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("confirm-access")
+                                .primary()
+                                .label(confirm.clone())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let (object, etag) = (object.clone(), etag.clone());
+                                    let _ = workspace.update(cx, |workspace, cx| {
+                                        workspace.set_access(object, to, current, etag, window, cx);
+                                    });
+                                }),
+                        ),
+                )
+        });
+    }
+
+    /// Gives an object a new ACL, if it still has the ACL and the content
+    /// the panel showed. The check and the change are separate requests.
+    fn set_access(
+        &mut self,
+        object: ObjectRef,
+        to: Access,
+        current: Access,
+        etag: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(requests) = AppBackend::requests(cx) else {
+            let message = t!("error.backend_stopped").into_owned();
+            Self::notify(NotificationType::Error, message, window, cx);
+            return;
+        };
+        let idrive_e2 = self
+            .connections
+            .read(cx)
+            .get(&object.profile_id)
+            .is_some_and(|profile| {
+                profile.compat.provider == supas3_core::credentials::Provider::IdriveE2
+            });
+        self.details
+            .update(cx, |details, cx| details.access_changing(cx));
+        cx.spawn_in(window, async move |workspace, cx| {
+            let result = async {
+                let now = requests.object_permissions(object.clone()).await?;
+                let grants: Vec<Grant> = now
+                    .grants
+                    .iter()
+                    .map(|grant| Grant {
+                        grantee_type: grant.grantee_type.as_deref(),
+                        id: grant.id.as_deref(),
+                        uri: grant.uri.as_deref(),
+                        permission: grant.permission.as_deref(),
+                    })
+                    .collect();
+                if access_of(now.owner_id.as_deref(), &grants, idrive_e2) != current {
+                    return Err(t!("access.changed_meanwhile").into_owned());
+                }
+                if let Some(etag) = etag {
+                    let shown = requests.object_properties(object.clone()).await?.e_tag;
+                    if shown.as_deref() != Some(etag.as_str()) {
+                        return Err(t!("access.object_changed").into_owned());
+                    }
+                }
+                requests.set_object_access(object.clone(), to).await
+            }
+            .await;
+            let _ = workspace.update_in(cx, |workspace, window, cx| {
+                if let Err(error) = result {
+                    let message = t!("access.failed", detail = brief_error(&error)).into_owned();
+                    Self::notify(NotificationType::Error, message, window, cx);
+                }
+                workspace.object_changed(&object, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Downloads one row: into the other pane when it shows a folder on
+    /// this computer, otherwise into a folder the user picks.
+    fn download(
+        &mut self,
+        source: Location,
+        entry: Entry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let other = self
+            .pane(Self::other(self.active))
+            .read(cx)
+            .location()
+            .clone();
+        if let Location::Local(_) = other {
+            self.start_copy(
+                plan(&source, std::slice::from_ref(&entry), &other),
+                window,
+                cx,
+            );
+            return;
+        }
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(t!("details.download_here").into_owned().into()),
+        });
+        cx.spawn_in(window, async move |workspace, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else {
+                return;
+            };
+            let Some(folder) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = workspace.update_in(cx, |workspace, window, cx| {
+                let target = Location::Local(folder);
+                workspace.start_copy(
+                    plan(&source, std::slice::from_ref(&entry), &target),
+                    window,
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
+    /// Shows the sidebar as icons only, or in full.
+    pub fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.store_settings(
+            |settings| settings.sidebar_collapsed = !settings.sidebar_collapsed,
+            window,
+            cx,
+        );
+    }
+
+    /// Changes a preference that only affects the layout and saves it.
+    /// Unlike [`Self::change_settings`], the tables are left as they are, so
+    /// their column widths stay.
+    fn store_settings(
+        &mut self,
+        change: impl FnOnce(&mut Settings),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        change(&mut self.settings);
+        let saved = default_config_dir()
+            .map_err(|error| error.to_string())
+            .and_then(|dir| self.settings.save(&dir).map_err(|error| error.to_string()));
+        if let Err(error) = saved {
+            log::warn!("could not save interface preferences: {error}");
+            window.push_notification(
+                (
+                    NotificationType::Warning,
+                    SharedString::from(t!("preferences.not_saved").into_owned()),
+                ),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// Asks for the transfer limits, applies them and saves them.
+    fn show_transfer_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.settings.transfers;
+        let dialog = cx.new(|cx| TransfersDialog::new(current, window, cx));
+        cx.subscribe_in(&dialog, window, |_, dialog, event, window, cx| {
+            let TransfersDialogEvent::Submitted(limits) = *event;
+            let Some(requests) = AppBackend::requests(cx) else {
+                let message = t!("error.backend_stopped").into_owned();
+                dialog.update(cx, |dialog, cx| dialog.failed(message, cx));
+                return;
+            };
+            let dialog = dialog.clone();
+            cx.spawn_in(window, async move |workspace, cx| {
+                let result = requests.set_transfer_limits(limits).await;
+                let _ = workspace.update_in(cx, |workspace, window, cx| match result {
+                    Ok(()) => {
+                        window.close_dialog(cx);
+                        workspace.store_settings(|s| s.transfers = limits, window, cx);
+                    }
+                    Err(error) => dialog.update(cx, |dialog, cx| dialog.failed(error, cx)),
+                });
+            })
+            .detach();
+        })
+        .detach();
+        let title: SharedString = t!("transfers.title").into_owned().into();
+        let width = rems(30.).to_pixels(window.rem_size());
+        window.open_dialog(cx, move |modal, _, cx| {
+            let busy = dialog.read(cx).is_busy();
+            modal
+                .title(title.clone())
+                .width(width)
+                .keyboard(!busy)
+                .overlay_closable(!busy)
+                .close_button(!busy)
+                .on_ok(|_, _, _| false)
+                .child(dialog.clone())
+        });
+    }
+
     pub fn show_about(window: &mut Window, cx: &mut App) {
         const SOURCE: &str = env!("CARGO_PKG_REPOSITORY");
         const UPSTREAM: &str = "https://github.com/rgcsekaraa/brows3";
@@ -950,6 +2617,16 @@ impl Workspace {
     }
 
     fn confirm_delete(&mut self, profile: Profile, window: &mut Window, cx: &mut Context<Self>) {
+        // Edits to its objects would have nowhere to be saved.
+        let unsaved = self
+            .unsaved_editors(cx)
+            .into_iter()
+            .any(|(_, view)| editor_profile(&view, cx) == Some(profile.id.clone()));
+        if unsaved {
+            let message = t!("connection.unsaved_edits").into_owned();
+            Self::notify(NotificationType::Info, message, window, cx);
+            return;
+        }
         let workspace = cx.weak_entity();
         let title: SharedString = t!("connection.delete_title", name = profile.name)
             .into_owned()
@@ -996,7 +2673,19 @@ impl Workspace {
                 Ok(()) => {
                     // Tabs showing the removed connection have nothing to show.
                     for pane in [workspace.left.clone(), workspace.right.clone()] {
-                        pane.update(cx, |pane, cx| pane.leave_profile(&profile_id, &home(), cx));
+                        pane.update(cx, |pane, cx| {
+                            pane.leave_profile(&profile_id, &home(), cx);
+                            // Files edited meanwhile stay open with their
+                            // text; only the others go.
+                            pane.drop_editors(
+                                |view, cx| {
+                                    matches!(view.file(), FileRef::Remote(object)
+                                        if object.profile_id == profile_id)
+                                        && !view.holds_work(cx)
+                                },
+                                cx,
+                            );
+                        });
                     }
                     workspace.places.update(cx, |places, cx| {
                         places.forget_profile(&profile_id);
@@ -1053,160 +2742,477 @@ impl Workspace {
         cx.refresh_windows();
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_location = self.pane(self.active).read(cx).location().clone();
-        let connections = self.connections.read(cx).profiles().to_vec();
-        let workspace = cx.weak_entity();
-        let settings = self.settings;
-
-        let this_computer = SidebarMenuItem::new(t!("location.home").into_owned())
-            .icon(IconName::HardDrive)
-            .active(matches!(active_location, Location::Local(_)))
-            .on_click(cx.listener(|workspace, _, _, cx| workspace.open_in_active(home(), cx)));
-
-        let connection_items = connections.into_iter().map(|profile| {
-            let is_active = active_location.profile_id() == Some(profile.id.as_str());
-            let open = profile.clone();
-            let menu_profile = profile.clone();
-            let menu_workspace = workspace.clone();
-            SidebarMenuItem::new(profile.name.clone())
-                .icon(IconName::Globe)
-                .active(is_active)
-                .on_click(cx.listener(move |workspace, _, _, cx| {
-                    workspace.open_in_active(start_of(&open), cx);
-                }))
-                .suffix(move |_, _| {
-                    let profile = menu_profile.clone();
-                    let workspace = menu_workspace.clone();
-                    Button::new(SharedString::from(format!("actions-{}", profile.id)))
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Ellipsis)
-                        .tooltip(t!("connection.actions", name = profile.name).into_owned())
-                        .dropdown_menu(move |menu, _, _| {
-                            let (edit_profile, delete_profile) = (profile.clone(), profile.clone());
-                            let (edit_workspace, delete_workspace) =
-                                (workspace.clone(), workspace.clone());
-                            menu.item(
-                                PopupMenuItem::new(t!("connection.edit").into_owned()).on_click(
-                                    move |_, window, cx| {
-                                        let profile = edit_profile.clone();
-                                        let _ = edit_workspace.update(cx, |workspace, cx| {
-                                            workspace.show_form(Some(profile), window, cx);
-                                        });
-                                    },
-                                ),
-                            )
-                            .separator()
-                            .item(
-                                PopupMenuItem::new(t!("connection.delete").into_owned()).on_click(
-                                    move |_, window, cx| {
-                                        let profile = delete_profile.clone();
-                                        let _ = delete_workspace.update(cx, |workspace, cx| {
-                                            workspace.confirm_delete(profile, window, cx);
-                                        });
-                                    },
-                                ),
-                            )
-                        })
-                })
+    /// Runs a command of the menu or a shortcut on the active pane. Nothing
+    /// happens behind an open dialog.
+    pub fn pane_command(
+        &mut self,
+        command: PaneCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let pane = self.pane(self.active).clone();
+        pane.update(cx, |pane, cx| match command {
+            PaneCommand::NewFolder => pane.new_folder(cx),
+            PaneCommand::Rename => pane.rename_selected(cx),
+            PaneCommand::Filter => pane.open_filter(window, cx),
         });
-        let connection_items: Vec<_> = connection_items.collect();
-        let has_connections = !self.connections.read(cx).profiles().is_empty();
+    }
 
-        let place_item = |location: &Location, favorite: bool, cx: &mut Context<Self>| {
+    /// Tab and Shift+Tab move the keyboard between the sidebar and the two
+    /// panes.
+    fn focus_region(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // 0 is the sidebar, 1 the left pane, 2 the right pane.
+        let current = if self.sidebar_focus.contains_focused(window, cx) {
+            Some(0)
+        } else if self.left.read(cx).contains_focus(window, cx) {
+            Some(1)
+        } else if self.right.read(cx).contains_focus(window, cx) {
+            Some(2)
+        } else {
+            None
+        };
+        let next = match (current, backwards) {
+            (None, false) => 0,
+            (None, true) => 2,
+            (Some(at), false) => (at + 1) % 3,
+            (Some(at), true) => (at + 2) % 3,
+        };
+        match next {
+            0 => window.focus(&self.sidebar_focus, cx),
+            side => {
+                let side = if side == 1 { Side::Left } else { Side::Right };
+                if self.activate(side, cx) {
+                    self.remember_layout(side, cx);
+                    self.refresh_details(cx);
+                }
+                self.pane(side)
+                    .clone()
+                    .update(cx, |pane, cx| pane.focus(window, cx));
+            }
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// The sidebar's rows, in the order the keyboard moves through them.
+    fn sidebar_rows(&self, cx: &App) -> Vec<SidebarRow> {
+        let places = self.places.read(cx);
+        let mut rows = vec![SidebarRow::Home];
+        rows.extend(places.favorites.iter().cloned().map(SidebarRow::Favorite));
+        // Favorites are already one click away; recent lists the others.
+        rows.extend(
+            places
+                .recent
+                .iter()
+                .filter(|location| !places.favorites.contains(location))
+                .take(5)
+                .cloned()
+                .map(SidebarRow::Recent),
+        );
+        rows.extend(
+            self.connections
+                .read(cx)
+                .profiles()
+                .iter()
+                .cloned()
+                .map(|profile| SidebarRow::Connection(Box::new(profile))),
+        );
+        rows
+    }
+
+    /// A row's label, icon and the full name of what it opens.
+    fn sidebar_row_text(&self, row: &SidebarRow, cx: &App) -> (String, IconName, String) {
+        let place = |location: &Location, icon: IconName| {
             let connection = location
                 .profile_id()
                 .map(|id| self.connections.read(cx).name_of(id))
                 .unwrap_or_default();
-            let target = location.clone();
-            let item = SidebarMenuItem::new(short_name(location, &connection))
-                .icon(if favorite {
-                    IconName::Star
-                } else {
-                    match location {
-                        Location::Local(_) => IconName::Folder,
-                        _ => IconName::Globe,
-                    }
-                })
-                .active(*location == active_location)
-                .on_click(cx.listener(move |workspace, _, _, cx| {
-                    workspace.open_in_active(target.clone(), cx);
-                }));
-            let full: SharedString = full_name(location, &connection).into();
-            let places = self.places.clone();
-            let removed = location.clone();
-            // The full place and removal are in the item's context menu, so
-            // nothing inside the row competes with opening it.
-            item.accessibility_label(full.clone())
-                .context_menu(move |menu, _, _| {
-                    let (places, removed) = (places.clone(), removed.clone());
-                    let menu = menu.label(full.clone());
-                    if favorite {
-                        menu.separator().item(
-                            PopupMenuItem::new(t!("places.remove_favorite").into_owned()).on_click(
-                                move |_, _, cx| {
-                                    let removed = removed.clone();
-                                    places.update(cx, |places, cx| {
-                                        places.toggle_favorite(&removed);
-                                        cx.notify();
+            (
+                short_name(location, &connection),
+                icon,
+                full_name(location, &connection),
+            )
+        };
+        match row {
+            SidebarRow::Home => {
+                let label = t!("location.home").into_owned();
+                (label.clone(), IconName::HardDrive, label)
+            }
+            SidebarRow::Favorite(location) => place(location, IconName::Star),
+            SidebarRow::Recent(location) => place(
+                location,
+                match location {
+                    Location::Local(_) => IconName::Folder,
+                    _ => IconName::Globe,
+                },
+            ),
+            SidebarRow::Connection(profile) => {
+                (profile.name.clone(), IconName::Globe, profile.name.clone())
+            }
+        }
+    }
+
+    fn open_sidebar_row(&mut self, row: &SidebarRow, cx: &mut Context<Self>) {
+        let location = match row {
+            SidebarRow::Home => home(),
+            SidebarRow::Favorite(location) | SidebarRow::Recent(location) => location.clone(),
+            SidebarRow::Connection(profile) => start_of(profile),
+        };
+        self.open_in_active(location, cx);
+    }
+
+    /// Up and Down move through the rows, Home and End go to either end,
+    /// Enter or Space opens one, and Shift+F10 or the Menu key lists what
+    /// can be done with it.
+    fn on_sidebar_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rows = self.sidebar_rows(cx);
+        if rows.is_empty() {
+            return;
+        }
+        let last = rows.len() - 1;
+        let keystroke = &event.keystroke;
+        let plain = !keystroke.modifiers.modified();
+        let cursor = self.sidebar_cursor.min(last);
+        match keystroke.key.as_str() {
+            "down" if plain => self.sidebar_cursor = (cursor + 1).min(last),
+            "up" if plain => self.sidebar_cursor = cursor.saturating_sub(1),
+            "home" if plain => self.sidebar_cursor = 0,
+            "end" if plain => self.sidebar_cursor = last,
+            "enter" | "space" if plain => {
+                let row = rows[cursor].clone();
+                self.open_sidebar_row(&row, cx);
+            }
+            "f10" if keystroke.modifiers.shift => {
+                self.show_sidebar_row_actions(rows[cursor].clone(), window, cx);
+            }
+            "menu" | "contextmenu" => {
+                self.show_sidebar_row_actions(rows[cursor].clone(), window, cx);
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// What can be done with a row, for the keyboard: the same choices as
+    /// its context menu, as buttons.
+    fn show_sidebar_row_actions(
+        &mut self,
+        row: SidebarRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (_, _, full) = self.sidebar_row_text(&row, cx);
+        let title: SharedString = full.into();
+        let workspace = cx.weak_entity();
+        let places = self.places.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let open = {
+                let (workspace, row) = (workspace.clone(), row.clone());
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    window.close_dialog(cx);
+                    let _ =
+                        workspace.update(cx, |workspace, cx| workspace.open_sidebar_row(&row, cx));
+                }
+            };
+            let mut buttons = v_flex().gap_2().child(
+                Button::new("row-open")
+                    .primary()
+                    .w_full()
+                    .label(t!("action.open").into_owned())
+                    .on_click(open),
+            );
+            match &row {
+                SidebarRow::Connection(profile) => {
+                    let (edit, delete) = ((**profile).clone(), (**profile).clone());
+                    let (edit_workspace, delete_workspace) = (workspace.clone(), workspace.clone());
+                    buttons = buttons
+                        .child(
+                            Button::new("row-edit")
+                                .outline()
+                                .w_full()
+                                .label(t!("connection.edit").into_owned())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let profile = edit.clone();
+                                    let _ = edit_workspace.update(cx, |workspace, cx| {
+                                        workspace.show_form(Some(profile), window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("row-delete")
+                                .outline()
+                                .w_full()
+                                .label(t!("connection.delete").into_owned())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let profile = delete.clone();
+                                    let _ = delete_workspace.update(cx, |workspace, cx| {
+                                        workspace.confirm_delete(profile, window, cx);
+                                    });
+                                }),
+                        );
+                }
+                SidebarRow::Favorite(location) => {
+                    let (places, removed) = (places.clone(), location.clone());
+                    buttons = buttons.child(
+                        Button::new("row-unfavorite")
+                            .outline()
+                            .w_full()
+                            .label(t!("places.remove_favorite").into_owned())
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                places.update(cx, |places, cx| {
+                                    places.toggle_favorite(&removed);
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+                SidebarRow::Home | SidebarRow::Recent(_) => {}
+            }
+            dialog.title(title.clone()).child(buttons)
+        });
+    }
+
+    /// One row of the sidebar.
+    fn render_sidebar_row(
+        &self,
+        index: usize,
+        row: &SidebarRow,
+        active_location: &Location,
+        keyboard_here: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let collapsed = self.settings.sidebar_collapsed;
+        let (label, icon, full) = self.sidebar_row_text(row, cx);
+        let active = match row {
+            SidebarRow::Home => matches!(active_location, Location::Local(_)),
+            SidebarRow::Favorite(location) | SidebarRow::Recent(location) => {
+                location == active_location
+            }
+            SidebarRow::Connection(profile) => {
+                active_location.profile_id() == Some(profile.id.as_str())
+            }
+        };
+        let theme = cx.theme();
+        let (accent, accent_text, ring) = (
+            theme.sidebar_accent,
+            theme.sidebar_accent_foreground,
+            theme.ring,
+        );
+        let clicked = row.clone();
+        let tooltip: SharedString = full.clone().into();
+        let mut element = h_flex()
+            .id(("sidebar-row", index))
+            .h_8()
+            .px_2()
+            .gap_2()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(if keyboard_here {
+                ring
+            } else {
+                theme.transparent
+            })
+            .when(collapsed, |this| this.justify_center())
+            .when(active, |this| this.bg(accent).text_color(accent_text))
+            .hover(move |style| style.bg(accent))
+            .cursor_pointer()
+            .child(
+                gpui_kit::component::Icon::new(icon)
+                    .size_4()
+                    .flex_shrink_0(),
+            )
+            .when(!collapsed, |this| {
+                this.child(div().flex_1().min_w_0().truncate().text_sm().child(label))
+            })
+            .when(collapsed, |this| {
+                this.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            })
+            .on_click(cx.listener(move |workspace, _, _, cx| {
+                workspace.sidebar_cursor = index;
+                workspace.open_sidebar_row(&clicked, cx);
+            }));
+        if let (SidebarRow::Connection(profile), false) = (row, collapsed) {
+            let profile = (**profile).clone();
+            let workspace = cx.weak_entity();
+            element = element.child(
+                Button::new(SharedString::from(format!("actions-{}", profile.id)))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Ellipsis)
+                    .tooltip(t!("connection.actions", name = profile.name).into_owned())
+                    .dropdown_menu(move |menu, _, _| {
+                        let (edit_profile, delete_profile) = (profile.clone(), profile.clone());
+                        let (edit_workspace, delete_workspace) =
+                            (workspace.clone(), workspace.clone());
+                        menu.item(
+                            PopupMenuItem::new(t!("connection.edit").into_owned()).on_click(
+                                move |_, window, cx| {
+                                    let profile = edit_profile.clone();
+                                    let _ = edit_workspace.update(cx, |workspace, cx| {
+                                        workspace.show_form(Some(profile), window, cx);
                                     });
                                 },
                             ),
                         )
-                    } else {
-                        menu
-                    }
-                })
-        };
-        let (favorites, recent) = {
-            let places = self.places.read(cx);
-            (places.favorites.clone(), places.recent.clone())
-        };
-        let favorite_items: Vec<_> = favorites
-            .iter()
-            .map(|location| place_item(location, true, cx))
-            .collect();
-        // Favorites are already one click away; recent lists the others.
-        let recent_items: Vec<_> = recent
-            .iter()
-            .filter(|location| !favorites.contains(location))
-            .take(5)
-            .map(|location| place_item(location, false, cx))
-            .collect();
+                        .separator()
+                        .item(
+                            PopupMenuItem::new(t!("connection.delete").into_owned()).on_click(
+                                move |_, window, cx| {
+                                    let profile = delete_profile.clone();
+                                    let _ = delete_workspace.update(cx, |workspace, cx| {
+                                        workspace.confirm_delete(profile, window, cx);
+                                    });
+                                },
+                            ),
+                        )
+                    }),
+            );
+        }
+        // The full place and removal are in the row's context menu, so
+        // nothing inside the row competes with opening it.
+        match row {
+            SidebarRow::Favorite(location) | SidebarRow::Recent(location) => {
+                let favorite = matches!(row, SidebarRow::Favorite(_));
+                let (places, removed) = (self.places.clone(), location.clone());
+                let full: SharedString = full.into();
+                element
+                    .context_menu(move |menu, _, _| {
+                        let (places, removed) = (places.clone(), removed.clone());
+                        let menu = menu.label(full.clone());
+                        if favorite {
+                            menu.separator().item(
+                                PopupMenuItem::new(t!("places.remove_favorite").into_owned())
+                                    .on_click(move |_, _, cx| {
+                                        let removed = removed.clone();
+                                        places.update(cx, |places, cx| {
+                                            places.toggle_favorite(&removed);
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                        } else {
+                            menu
+                        }
+                    })
+                    .into_any_element()
+            }
+            _ => element.into_any_element(),
+        }
+    }
 
-        Sidebar::new("sidebar")
-            .header(div().px_2().py_1().font_semibold().child("supaS3"))
+    fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_location = self.pane(self.active).read(cx).location().clone();
+        let settings = self.settings;
+        let collapsed = settings.sidebar_collapsed;
+        let workspace = cx.weak_entity();
+        let rows = self.sidebar_rows(cx);
+        let keyboard = self.sidebar_focus.is_focused(window);
+        let cursor = self.sidebar_cursor.min(rows.len().saturating_sub(1));
+        let muted = cx.theme().muted_foreground;
+        let group = |label: String| {
+            div()
+                .px_2()
+                .pt_3()
+                .pb_1()
+                .text_xs()
+                .text_color(muted)
+                .child(label)
+        };
+        let mut list = v_flex()
+            .id("sidebar-rows")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_2()
+            .gap_0p5();
+        let mut previous: Option<&'static str> = None;
+        for (index, row) in rows.iter().enumerate() {
+            let heading = match row {
+                SidebarRow::Home => "sidebar.places",
+                SidebarRow::Favorite(_) => "sidebar.favorites",
+                SidebarRow::Recent(_) => "sidebar.recent",
+                SidebarRow::Connection(_) => "sidebar.connections",
+            };
+            if previous != Some(heading) {
+                if heading == "sidebar.connections" || previous.is_none() || !collapsed {
+                    list = list.child(if collapsed {
+                        div().h_2().into_any_element()
+                    } else {
+                        group(t!(heading).into_owned()).into_any_element()
+                    });
+                }
+                previous = Some(heading);
+            }
+            let here = keyboard && index == cursor;
+            list = list.child(self.render_sidebar_row(index, row, &active_location, here, cx));
+        }
+        if !rows
+            .iter()
+            .any(|row| matches!(row, SidebarRow::Connection(_)))
+            && !collapsed
+        {
+            list = list.child(group(t!("sidebar.connections").into_owned()));
+        }
+        let has_connections = !self.connections.read(cx).profiles().is_empty();
+        let toggle_label = if collapsed {
+            t!("sidebar.expand").into_owned()
+        } else {
+            t!("sidebar.collapse").into_owned()
+        };
+        let toggle = SidebarToggleButton::new()
+            .collapsed(collapsed)
+            .accessibility_label(toggle_label)
+            .on_click(cx.listener(|workspace, _, window, cx| workspace.toggle_sidebar(window, cx)));
+        let theme = cx.theme();
+        v_flex()
+            .id("sidebar")
+            .track_focus(&self.sidebar_focus)
+            .key_context("Sidebar")
+            .on_key_down(cx.listener(Self::on_sidebar_key))
+            .h_full()
+            .flex_shrink_0()
+            .w(if collapsed { px(48.) } else { px(240.) })
+            .bg(theme.sidebar)
+            .text_color(theme.sidebar_foreground)
+            .border_r_1()
+            .border_color(theme.sidebar_border)
+            .py_2()
             .child(
-                SidebarGroup::new(t!("sidebar.places").into_owned())
-                    .child(SidebarMenu::new().child(this_computer)),
+                h_flex()
+                    .px_2()
+                    .pb_1()
+                    .when(collapsed, |this| this.justify_center())
+                    .when(!collapsed, |this| this.justify_between())
+                    .when(!collapsed, |this| {
+                        this.child(div().px_2().py_1().font_semibold().child("supaS3"))
+                    })
+                    .child(toggle),
             )
-            .when(!favorite_items.is_empty(), |this| {
-                this.child(
-                    SidebarGroup::new(t!("sidebar.favorites").into_owned())
-                        .child(SidebarMenu::new().children(favorite_items)),
-                )
-            })
-            .when(!recent_items.is_empty(), |this| {
-                this.child(
-                    SidebarGroup::new(t!("sidebar.recent").into_owned())
-                        .child(SidebarMenu::new().children(recent_items)),
-                )
-            })
+            .child(list)
             .child(
-                SidebarGroup::new(t!("sidebar.connections").into_owned())
-                    .child(SidebarMenu::new().children(connection_items)),
-            )
-            .footer(
                 v_flex()
+                    .px_2()
+                    .pt_2()
                     .w_full()
                     .gap_2()
-                    .when(!has_connections, |this| {
+                    .when(!has_connections && !collapsed, |this| {
                         this.child(
                             div()
                                 .px_2()
                                 .text_sm()
-                                .text_color(cx.theme().muted_foreground)
+                                .text_color(muted)
                                 .child(t!("sidebar.no_connections").into_owned()),
                         )
                     })
@@ -1214,86 +3220,96 @@ impl Workspace {
                         Button::new("add-connection")
                             .w_full()
                             .icon(IconName::Plus)
-                            .label(t!("sidebar.add_connection").into_owned())
+                            .when(!collapsed, |this| {
+                                this.label(t!("sidebar.add_connection").into_owned())
+                            })
+                            .when(collapsed, |this| {
+                                this.tooltip(t!("sidebar.add_connection").into_owned())
+                            })
                             .on_click(cx.listener(|workspace, _, window, cx| {
                                 workspace.show_form(None, window, cx);
                             })),
                     )
-                    .child(
-                        Button::new("preferences")
-                            .w_full()
-                            .ghost()
-                            .icon(IconName::Settings)
-                            .label(t!("sidebar.preferences").into_owned())
-                            .dropdown_menu(move |menu, _, _| {
-                                let pick = |workspace: &WeakEntity<Workspace>,
-                                            change: fn(&mut Settings)| {
-                                    let workspace = workspace.clone();
-                                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                                        let _ = workspace.update(cx, |workspace, cx| {
-                                            workspace.change_settings(change, window, cx);
-                                        });
-                                    }
-                                };
-                                menu.label(t!("preferences.language").into_owned())
-                                    .item(
-                                        PopupMenuItem::new(
-                                            t!("preferences.follow_system").into_owned(),
-                                        )
-                                        .checked(settings.language == Language::System)
-                                        .on_click(pick(&workspace, |s| {
-                                            s.language = Language::System
-                                        })),
-                                    )
-                                    .item(
-                                        PopupMenuItem::new("English")
-                                            .checked(settings.language == Language::English)
-                                            .on_click(pick(&workspace, |s| {
-                                                s.language = Language::English
-                                            })),
-                                    )
-                                    .item(
-                                        PopupMenuItem::new("简体中文")
-                                            .checked(
-                                                settings.language == Language::SimplifiedChinese,
-                                            )
-                                            .on_click(pick(&workspace, |s| {
-                                                s.language = Language::SimplifiedChinese
-                                            })),
-                                    )
-                                    .separator()
-                                    .label(t!("preferences.appearance").into_owned())
-                                    .item(
-                                        PopupMenuItem::new(
-                                            t!("preferences.follow_system").into_owned(),
-                                        )
-                                        .checked(settings.appearance == Appearance::System)
-                                        .on_click(pick(&workspace, |s| {
-                                            s.appearance = Appearance::System
-                                        })),
-                                    )
-                                    .item(
-                                        PopupMenuItem::new(t!("preferences.light").into_owned())
-                                            .checked(settings.appearance == Appearance::Light)
-                                            .on_click(pick(&workspace, |s| {
-                                                s.appearance = Appearance::Light
-                                            })),
-                                    )
-                                    .item(
-                                        PopupMenuItem::new(t!("preferences.dark").into_owned())
-                                            .checked(settings.appearance == Appearance::Dark)
-                                            .on_click(pick(&workspace, |s| {
-                                                s.appearance = Appearance::Dark
-                                            })),
-                                    )
-                                    .separator()
-                                    .item(
-                                        PopupMenuItem::new(t!("about.menu").into_owned())
-                                            .on_click(|_, window, cx| Self::show_about(window, cx)),
-                                    )
-                            }),
-                    ),
+                    .child(self.preferences_button(workspace, settings, collapsed)),
             )
+    }
+
+    fn preferences_button(
+        &self,
+        workspace: WeakEntity<Self>,
+        settings: Settings,
+        collapsed: bool,
+    ) -> impl IntoElement {
+        Button::new("preferences")
+            .w_full()
+            .ghost()
+            .icon(IconName::Settings)
+            .when(!collapsed, |this| {
+                this.label(t!("sidebar.preferences").into_owned())
+            })
+            .when(collapsed, |this| {
+                this.tooltip(t!("sidebar.preferences").into_owned())
+            })
+            .dropdown_menu(move |menu, _, _| {
+                let pick = |workspace: &WeakEntity<Workspace>, change: fn(&mut Settings)| {
+                    let workspace = workspace.clone();
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        let _ = workspace.update(cx, |workspace, cx| {
+                            workspace.change_settings(change, window, cx);
+                        });
+                    }
+                };
+                menu.label(t!("preferences.language").into_owned())
+                    .item(
+                        PopupMenuItem::new(t!("preferences.follow_system").into_owned())
+                            .checked(settings.language == Language::System)
+                            .on_click(pick(&workspace, |s| s.language = Language::System)),
+                    )
+                    .item(
+                        PopupMenuItem::new("English")
+                            .checked(settings.language == Language::English)
+                            .on_click(pick(&workspace, |s| s.language = Language::English)),
+                    )
+                    .item(
+                        PopupMenuItem::new("简体中文")
+                            .checked(settings.language == Language::SimplifiedChinese)
+                            .on_click(pick(&workspace, |s| {
+                                s.language = Language::SimplifiedChinese
+                            })),
+                    )
+                    .separator()
+                    .label(t!("preferences.appearance").into_owned())
+                    .item(
+                        PopupMenuItem::new(t!("preferences.follow_system").into_owned())
+                            .checked(settings.appearance == Appearance::System)
+                            .on_click(pick(&workspace, |s| s.appearance = Appearance::System)),
+                    )
+                    .item(
+                        PopupMenuItem::new(t!("preferences.light").into_owned())
+                            .checked(settings.appearance == Appearance::Light)
+                            .on_click(pick(&workspace, |s| s.appearance = Appearance::Light)),
+                    )
+                    .item(
+                        PopupMenuItem::new(t!("preferences.dark").into_owned())
+                            .checked(settings.appearance == Appearance::Dark)
+                            .on_click(pick(&workspace, |s| s.appearance = Appearance::Dark)),
+                    )
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(t!("preferences.transfers").into_owned()).on_click({
+                            let workspace = workspace.clone();
+                            move |_, window, cx| {
+                                let _ = workspace.update(cx, |workspace, cx| {
+                                    workspace.show_transfer_settings(window, cx)
+                                });
+                            }
+                        }),
+                    )
+                    .item(
+                        PopupMenuItem::new(t!("about.menu").into_owned())
+                            .on_click(|_, window, cx| Self::show_about(window, cx)),
+                    )
+            })
     }
 
     fn render_pane(&self, side: Side, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1330,12 +3346,28 @@ impl Render for Workspace {
         window.on_next_frame(|_, _| report_first_frame());
         // Narrower than this, a pane's navigation bar no longer fits.
         let min_pane = rems(18.).to_pixels(window.rem_size());
+        let details_open = self.settings.details_open;
+        let details_width = rems(20.).to_pixels(window.rem_size());
+        let (min_details, max_details) = (
+            rems(15.).to_pixels(window.rem_size()),
+            rems(36.).to_pixels(window.rem_size()),
+        );
         h_flex()
             .items_stretch()
             .size_full()
+            // Tab is bound here, closer than the window's own Tab.
+            .key_context("Workspace")
+            .on_action(cx.listener(|workspace, _: &FocusNextRegion, window, cx| {
+                workspace.focus_region(false, window, cx);
+            }))
+            .on_action(
+                cx.listener(|workspace, _: &FocusPreviousRegion, window, cx| {
+                    workspace.focus_region(true, window, cx);
+                }),
+            )
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(self.render_sidebar(cx))
+            .child(self.render_sidebar(window, cx))
             .child(
                 v_flex()
                     .flex_1()
@@ -1352,22 +3384,52 @@ impl Render for Workspace {
                                 .child(notice),
                         )
                     })
+                    .when_some(self.storage_notice.clone(), |this, notice| {
+                        this.child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(cx.theme().border)
+                                .text_sm()
+                                .text_color(cx.theme().danger)
+                                .child(notice),
+                        )
+                    })
                     .child(
                         div().flex_1().min_h_0().child(
-                            h_resizable("panes")
-                                .child(
+                            // Panel sizes are kept per arrangement, so the
+                            // panes do not inherit the details panel's width.
+                            h_resizable(if details_open {
+                                "panes-details"
+                            } else {
+                                "panes"
+                            })
+                            .child(
+                                resizable_panel()
+                                    .size_range(min_pane..Pixels::MAX)
+                                    .child(self.render_pane(Side::Left, cx)),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size_range(min_pane..Pixels::MAX)
+                                    .child(self.render_pane(Side::Right, cx)),
+                            )
+                            .when(details_open, |this| {
+                                this.child(
                                     resizable_panel()
-                                        .size_range(min_pane..Pixels::MAX)
-                                        .child(self.render_pane(Side::Left, cx)),
+                                        .size(details_width)
+                                        .size_range(min_details..max_details)
+                                        .child(self.details.clone()),
                                 )
-                                .child(
-                                    resizable_panel()
-                                        .size_range(min_pane..Pixels::MAX)
-                                        .child(self.render_pane(Side::Right, cx)),
-                                ),
+                            }),
                         ),
                     )
                     .child(self.task_center.clone()),
             )
     }
 }
+
+#[cfg(test)]
+#[path = "workspace_tests.rs"]
+mod tests;

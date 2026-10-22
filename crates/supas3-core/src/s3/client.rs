@@ -41,6 +41,18 @@ fn has_configured_endpoint(sdk_config: &aws_config::SdkConfig) -> bool {
     sdk_config.endpoint_url().is_some() || service_endpoint.is_some()
 }
 
+/// The write guard of a client sent to a custom endpoint. An endpoint set
+/// in the environment or the AWS configuration rather than in the
+/// connection belongs to a service nothing is known about, and may change
+/// after the connection was made: its conditional headers are not trusted,
+/// and every write is checked first.
+fn write_guard(profile: &Profile) -> crate::credentials::WriteGuard {
+    match profile.credential_type {
+        CredentialType::CustomEndpoint { .. } => profile.compat.write_guard,
+        _ => crate::credentials::WriteGuard::CheckFirst,
+    }
+}
+
 fn build_s3_config(sdk_config: &aws_config::SdkConfig, profile: &Profile) -> aws_sdk_s3::Config {
     let mut builder = aws_sdk_s3::config::Builder::from(sdk_config);
 
@@ -63,9 +75,9 @@ fn build_s3_config(sdk_config: &aws_config::SdkConfig, profile: &Profile) -> aws
             .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
             // Marks the client as a custom endpoint and adapts conditional
             // write headers to what the service accepts.
-            .interceptor(super::guard::WriteGuardInterceptor::new(
-                profile.compat.write_guard,
-            ));
+            .interceptor(super::guard::WriteGuardInterceptor::new(write_guard(
+                profile,
+            )));
         if profile.compat.list_version == crate::credentials::ListVersion::V1 {
             builder = builder.interceptor(super::listing::ListVersionMarker);
         }
@@ -568,6 +580,13 @@ mod tests {
                 .starts_with("http://localhost:9100/test-bucket/folder/file.txt?"),
             "unexpected presigned URI: {}",
             request.uri()
+        );
+
+        // Nothing is known about such an endpoint: writes are checked first,
+        // whatever the profile's own compatibility settings say.
+        assert_eq!(
+            crate::s3::guard::Protection::of(&client),
+            crate::s3::guard::Protection::Custom(crate::credentials::WriteGuard::CheckFirst)
         );
     }
 

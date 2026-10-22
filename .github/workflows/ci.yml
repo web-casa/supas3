@@ -272,9 +272,18 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $known = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Get-Command ISCC.exe -ErrorAction SilentlyContinue) -and -not (Test-Path $known)) {
-            choco install innosetup --no-progress -y
+          # package.ps1 needs 6.5 or later; install or upgrade when the
+          # runner has none or an older one.
+          $versions = @(
+            @(Get-Command ISCC.exe -All -ErrorAction SilentlyContinue | ForEach-Object Source)
+            "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe"
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) } |
+            ForEach-Object { [version](((Get-Item $_).VersionInfo.ProductVersion) -replace '[^0-9.].*$', '') }
+          $newest = $versions | Sort-Object -Descending | Select-Object -First 1
+          Write-Host "Inno Setup on the runner: $newest"
+          if (-not $newest -or $newest -lt [version]'6.5.0') {
+            choco upgrade innosetup --no-progress -y
             if ($LASTEXITCODE -ne 0) { throw "could not install Inno Setup" }
           }
           $arch = if ('${{ matrix.target }}' -like 'aarch64-*') { 'arm64' } else { 'x64' }

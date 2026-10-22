@@ -1223,6 +1223,249 @@ async fn run(t: &Target, env: &HashMap<String, String>, run_id: &str) {
 /// Fills `supas3-demo/` with folders and `count` small objects, so the
 /// interface has something to browse and page through. Existing objects with
 /// the same keys are replaced; nothing else in the bucket is touched.
+/// Write conditions and ACLs on one target, in detail: what an object's ACL
+/// says, which headers a HEAD returns, and whether `If-None-Match: *` and
+/// `If-Match` are honoured by PutObject, CopyObject and
+/// CompleteMultipartUpload, on a new and on an existing key.
+async fn conditions(t: &Target, env: &HashMap<String, String>, run_id: &str) {
+    let rep = Report(&t.name);
+    let c = client(t, env, false).await;
+    let base = format!("supas3-probe/{run_id}/cond/");
+    let key = |name: &str| format!("{base}{name}");
+    let put = |k: String, body: &'static str| {
+        c.put_object()
+            .bucket(&t.bucket)
+            .key(k)
+            .body(ByteStream::from_static(body.as_bytes()))
+    };
+
+    let first = put(key("a.txt"), "first").send().await;
+    rep.row("put a.txt", outcome(&first));
+    let etag = first
+        .as_ref()
+        .ok()
+        .and_then(|o| o.e_tag().map(str::to_string));
+    rep.row("put ETag", format!("{etag:?}"));
+
+    // What a HEAD says about encryption and checksums.
+    let head = c
+        .head_object()
+        .bucket(&t.bucket)
+        .key(key("a.txt"))
+        .send()
+        .await;
+    match &head {
+        Ok(h) => {
+            rep.row("head ETag", format!("{:?}", h.e_tag()));
+            rep.row("head SSE", format!("{:?}", h.server_side_encryption()));
+            rep.row(
+                "head SSE-KMS key",
+                format!("{:?}", h.ssekms_key_id().map(|k| k.len())),
+            );
+            rep.row("head content-length", format!("{:?}", h.content_length()));
+            rep.row("head checksum crc32", format!("{:?}", h.checksum_crc32()));
+        }
+        Err(_) => rep.row("head", outcome(&head)),
+    }
+
+    // The ACL as the SDK reads it.
+    let parsed = c
+        .get_object_acl()
+        .bucket(&t.bucket)
+        .key(key("a.txt"))
+        .send()
+        .await;
+    match &parsed {
+        Ok(o) => {
+            rep.row(
+                "acl owner id",
+                format!(
+                    "{:?}",
+                    o.owner().and_then(|o| o.id()).map(|id| if id.is_empty() {
+                        "empty"
+                    } else {
+                        "present"
+                    })
+                ),
+            );
+            for g in o.grants() {
+                rep.row(
+                    "acl grant",
+                    format!(
+                        "id={} email={:?} name={} type={:?} uri={:?} perm={:?}",
+                        g.grantee().and_then(|g| g.id()).is_some(),
+                        g.grantee().and_then(|g| g.email_address()),
+                        g.grantee().and_then(|g| g.display_name()).is_some(),
+                        g.grantee().map(|g| g.r#type().as_str().to_string()),
+                        g.grantee().and_then(|g| g.uri()),
+                        g.permission().map(|p| p.as_str().to_string())
+                    ),
+                );
+            }
+        }
+        Err(_) => rep.row("acl parsed", outcome(&parsed)),
+    }
+
+    // PutObject.
+    let r = put(key("a.txt"), "second").if_none_match("*").send().await;
+    rep.expect_412("put If-None-Match on existing", &r);
+    let r = put(key("new.txt"), "new").if_none_match("*").send().await;
+    rep.row("put If-None-Match on new", outcome(&r));
+    let r = put(key("a.txt"), "third")
+        .set_if_match(etag.clone())
+        .send()
+        .await;
+    rep.row("put If-Match current ETag", outcome(&r));
+    let etag = match &r {
+        Ok(o) => o.e_tag().map(str::to_string),
+        Err(_) => etag,
+    };
+    let r = put(key("a.txt"), "fourth")
+        .if_match("\"00000000000000000000000000000000\"")
+        .send()
+        .await;
+    rep.expect_412("put If-Match wrong ETag", &r);
+
+    // CopyObject.
+    let source = format!("{}/{}", t.bucket, enc(&key("new.txt")));
+    let r = c
+        .copy_object()
+        .bucket(&t.bucket)
+        .key(key("a.txt"))
+        .copy_source(&source)
+        .if_none_match("*")
+        .send()
+        .await;
+    rep.expect_412("copy If-None-Match on existing", &r);
+    let r = c
+        .copy_object()
+        .bucket(&t.bucket)
+        .key(key("copied.txt"))
+        .copy_source(&source)
+        .if_none_match("*")
+        .send()
+        .await;
+    rep.row("copy If-None-Match on new", outcome(&r));
+    let r = c
+        .copy_object()
+        .bucket(&t.bucket)
+        .key(key("a.txt"))
+        .copy_source(&source)
+        .if_match("\"00000000000000000000000000000000\"")
+        .send()
+        .await;
+    rep.expect_412("copy If-Match wrong ETag", &r);
+    let r = c
+        .copy_object()
+        .bucket(&t.bucket)
+        .key(key("a.txt"))
+        .copy_source(&source)
+        .set_if_match(
+            // The copies before may have rewritten it; ask for its ETag now.
+            c.head_object()
+                .bucket(&t.bucket)
+                .key(key("a.txt"))
+                .send()
+                .await
+                .ok()
+                .and_then(|h| h.e_tag().map(str::to_string))
+                .or(etag.clone()),
+        )
+        .send()
+        .await;
+    rep.row("copy If-Match current ETag", outcome(&r));
+
+    // CompleteMultipartUpload, one part.
+    for (target, label) in [("a.txt", "existing"), ("multi.txt", "new")] {
+        let created = c
+            .create_multipart_upload()
+            .bucket(&t.bucket)
+            .key(key(target))
+            .send()
+            .await;
+        let Some(upload) = created
+            .as_ref()
+            .ok()
+            .and_then(|o| o.upload_id().map(str::to_string))
+        else {
+            rep.row("multipart create", outcome(&created));
+            continue;
+        };
+        let part = c
+            .upload_part()
+            .bucket(&t.bucket)
+            .key(key(target))
+            .upload_id(&upload)
+            .part_number(1)
+            .body(ByteStream::from_static(b"part"))
+            .send()
+            .await;
+        let part_etag = part
+            .as_ref()
+            .ok()
+            .and_then(|o| o.e_tag().map(str::to_string));
+        let done = c
+            .complete_multipart_upload()
+            .bucket(&t.bucket)
+            .key(key(target))
+            .upload_id(&upload)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .part_number(1)
+                            .set_e_tag(part_etag)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .if_none_match("*")
+            .send()
+            .await;
+        if label == "existing" {
+            rep.expect_412("complete If-None-Match on existing", &done);
+        } else {
+            rep.row("complete If-None-Match on new", outcome(&done));
+        }
+        if done.is_err() {
+            let _ = c
+                .abort_multipart_upload()
+                .bucket(&t.bucket)
+                .key(key(target))
+                .upload_id(&upload)
+                .send()
+                .await;
+        }
+    }
+
+    // User metadata survives a HEAD.
+    let r = put(key("meta.txt"), "meta")
+        .metadata("supas3-sha256", "abc")
+        .send()
+        .await;
+    rep.row("put with metadata", outcome(&r));
+    let h = c
+        .head_object()
+        .bucket(&t.bucket)
+        .key(key("meta.txt"))
+        .send()
+        .await;
+    rep.row(
+        "head metadata",
+        format!("{:?}", h.as_ref().ok().and_then(|h| h.metadata().cloned())),
+    );
+
+    // Clean up.
+    for name in ["a.txt", "new.txt", "copied.txt", "multi.txt", "meta.txt"] {
+        let _ = c
+            .delete_object()
+            .bucket(&t.bucket)
+            .key(key(name))
+            .send()
+            .await;
+    }
+}
+
 async fn seed(t: &Target, env: &HashMap<String, String>, count: usize) {
     let rep = Report(&t.name);
     let c = client(t, env, false).await;
@@ -1274,6 +1517,8 @@ async fn main() {
     let mut only: Vec<String> = std::env::args().skip(1).collect();
     let second = only.iter().any(|a| a == "--round2");
     only.retain(|a| a != "--round2");
+    let detailed = only.iter().any(|a| a == "--conditions");
+    only.retain(|a| a != "--conditions");
     // `--seed N target...` writes demo data instead of probing.
     let seed_count = only.iter().position(|a| a == "--seed").map(|index| {
         only.remove(index);
@@ -1293,6 +1538,8 @@ async fn main() {
         if only.is_empty() || only.contains(&t.name) {
             if let Some(count) = seed_count {
                 seed(t, &env, count).await;
+            } else if detailed {
+                conditions(t, &env, &run_id).await
             } else if second {
                 round2(t, &env, &run_id).await
             } else {

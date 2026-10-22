@@ -20,6 +20,8 @@ const TAB_LIMIT: usize = 12;
 pub struct PaneLayout {
     pub tabs: Vec<Location>,
     pub active: usize,
+    /// Each tab's sort, in the same order; missing ones are name ascending.
+    pub sorts: Vec<crate::listing::Sort>,
 }
 
 impl PaneLayout {
@@ -31,7 +33,14 @@ impl PaneLayout {
             tabs.push(fallback.clone());
         }
         let active = self.active.min(tabs.len() - 1);
-        PaneLayout { tabs, active }
+        let mut sorts: Vec<crate::listing::Sort> =
+            self.sorts.iter().take(tabs.len()).copied().collect();
+        sorts.resize(tabs.len(), Default::default());
+        PaneLayout {
+            tabs,
+            active,
+            sorts,
+        }
     }
 }
 
@@ -143,13 +152,88 @@ impl Places {
         if let Some(layout) = &mut self.layout {
             for pane in [&mut layout.left, &mut layout.right] {
                 let active = pane.tabs.get(pane.active).cloned();
-                pane.tabs.retain(keep);
+                let kept: Vec<(Location, crate::listing::Sort)> = pane
+                    .tabs
+                    .iter()
+                    .cloned()
+                    .zip(
+                        pane.sorts
+                            .iter()
+                            .copied()
+                            .chain(std::iter::repeat(Default::default())),
+                    )
+                    .filter(|(tab, _)| keep(tab))
+                    .collect();
+                pane.tabs = kept.iter().map(|(tab, _)| tab.clone()).collect();
+                pane.sorts = kept.iter().map(|(_, sort)| *sort).collect();
                 pane.active = active
                     .and_then(|active| pane.tabs.iter().position(|tab| *tab == active))
                     .unwrap_or(0);
             }
         }
     }
+}
+
+/// Where `location` is after the folder `from` was renamed to `to`, if it
+/// was inside it (or was it).
+pub fn relocated(location: &Location, from: &Location, to: &Location) -> Option<Location> {
+    match (location, from, to) {
+        (Location::Local(path), Location::Local(old), Location::Local(new)) => path
+            .strip_prefix(old)
+            .ok()
+            .map(|rest| Location::Local(new.join(rest))),
+        (
+            Location::Objects {
+                profile_id,
+                bucket,
+                prefix,
+            },
+            Location::Objects {
+                profile_id: old_profile,
+                bucket: old_bucket,
+                prefix: old_prefix,
+            },
+            Location::Objects {
+                prefix: new_prefix, ..
+            },
+        ) if profile_id == old_profile && bucket == old_bucket => prefix
+            .strip_prefix(old_prefix.as_str())
+            .map(|rest| Location::objects(profile_id, bucket, &format!("{new_prefix}{rest}"))),
+        _ => None,
+    }
+}
+
+impl Places {
+    /// Updates favorites, recent places and the saved layout after a folder
+    /// was renamed.
+    pub fn relocate(&mut self, from: &Location, to: &Location) {
+        let fix = |location: &mut Location| {
+            if let Some(moved) = relocated(location, from, to) {
+                *location = moved;
+            }
+        };
+        self.favorites.iter_mut().for_each(fix);
+        self.recent.iter_mut().for_each(fix);
+        if let Some(layout) = &mut self.layout {
+            layout.left.tabs.iter_mut().for_each(fix);
+            layout.right.tabs.iter_mut().for_each(fix);
+        }
+        keep_first(&mut self.favorites);
+        keep_first(&mut self.recent);
+    }
+}
+
+/// Removes every repeat of a place, keeping where it first appears.
+fn keep_first(places: &mut Vec<Location>) {
+    let mut seen: Vec<Location> = Vec::new();
+    places.retain(|place| {
+        if seen.contains(place) {
+            false
+        } else {
+            seen.push(place.clone());
+            true
+        }
+    });
 }
 
 /// A short name for a place in the sidebar: the last folder, or the bucket.
@@ -197,6 +281,19 @@ mod tests {
     }
 
     #[test]
+    fn a_rename_leaves_each_place_once() {
+        let local = |path: &str| Location::Local(std::path::PathBuf::from(path));
+        let mut places = Places {
+            favorites: vec![local("/a/old"), local("/b"), local("/a/new")],
+            recent: vec![local("/a/new"), local("/c"), local("/a/old")],
+            ..Default::default()
+        };
+        places.relocate(&local("/a/old"), &local("/a/new"));
+        assert_eq!(places.favorites, [local("/a/new"), local("/b")]);
+        assert_eq!(places.recent, [local("/a/new"), local("/c")]);
+    }
+
+    #[test]
     fn places_are_saved_and_read_back() {
         let dir = test_dir("roundtrip");
         let mut places = Places::default();
@@ -206,6 +303,7 @@ mod tests {
             left: PaneLayout {
                 tabs: vec![local("/data"), Location::objects("p", "bucket", "")],
                 active: 1,
+                ..Default::default()
             },
             right: PaneLayout::default(),
             left_active: true,
@@ -279,10 +377,12 @@ mod tests {
             left: PaneLayout {
                 tabs: vec![gone.clone(), kept.clone()],
                 active: 1,
+                ..Default::default()
             },
             right: PaneLayout {
                 tabs: vec![gone.clone()],
                 active: 0,
+                ..Default::default()
             },
             left_active: false,
         });
@@ -304,10 +404,41 @@ mod tests {
         let many = PaneLayout {
             tabs: (0..30).map(|i| local(&format!("/d{i}"))).collect(),
             active: 25,
+            ..Default::default()
         }
         .usable(&home);
         assert_eq!(many.tabs.len(), TAB_LIMIT);
         assert_eq!(many.active, TAB_LIMIT - 1);
+    }
+
+    #[test]
+    fn places_inside_a_renamed_folder_follow_it() {
+        let from = Location::objects("p", "b", "docs/");
+        let to = Location::objects("p", "b", "papers/");
+        assert_eq!(
+            relocated(&Location::objects("p", "b", "docs/2024/"), &from, &to),
+            Some(Location::objects("p", "b", "papers/2024/"))
+        );
+        assert_eq!(
+            relocated(&Location::objects("p", "b", "docsx/"), &from, &to),
+            None
+        );
+        assert_eq!(
+            relocated(&Location::objects("q", "b", "docs/"), &from, &to),
+            None
+        );
+        assert_eq!(
+            relocated(
+                &local("/data/site/css"),
+                &local("/data/site"),
+                &local("/data/www")
+            ),
+            Some(local("/data/www/css"))
+        );
+        let mut places = Places::default();
+        places.toggle_favorite(&Location::objects("p", "b", "docs/a/"));
+        places.relocate(&from, &to);
+        assert_eq!(places.favorites, [Location::objects("p", "b", "papers/a/")]);
     }
 
     #[test]

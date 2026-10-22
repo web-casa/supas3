@@ -9,6 +9,7 @@
 pub mod commands;
 pub mod credentials;
 pub mod error;
+pub mod fsutil;
 pub mod host;
 pub mod s3;
 pub mod transfer;

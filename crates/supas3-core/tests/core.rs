@@ -143,12 +143,23 @@ async fn dropping_without_shutdown_still_releases_the_saved_jobs_lock() {
         let core = Core::init(options).await.unwrap();
         drop(core);
     }
-    // The aborted scheduler task releases its state once it is next polled.
-    tokio::task::yield_now().await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let (options, _events) = options(dir.path());
-    let core = Core::init(options).await.unwrap();
+    // The aborted scheduler task releases its state once it is next polled,
+    // which on a busy machine can take a while; allow up to five seconds.
+    let mut reopened = None;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (options, _events) = options(dir.path());
+        match Core::init(options).await {
+            Ok(core) => {
+                reopened = Some(core);
+                break;
+            }
+            Err(error) if error.to_string().contains("already open") => continue,
+            Err(error) => panic!("{error}"),
+        }
+    }
+    let core = reopened.expect("the lock was not released within five seconds");
 
     assert!(jobs::list_saved_jobs(core.jobs()).await.unwrap().is_empty());
 }
@@ -354,6 +365,7 @@ async fn real_bucket_upload_overwrite_protection_listing_and_batch_delete() {
         Ok("oss") => Provider::Oss,
         Ok("cos") => Provider::Cos,
         Ok("obs") => Provider::Obs,
+        Ok("e2") => Provider::IdriveE2,
         _ => Provider::Generic,
     };
     let size_mib: usize = std::env::var("SUPAS3_SMOKE_SIZE_MIB")

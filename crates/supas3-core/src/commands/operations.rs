@@ -138,10 +138,16 @@ fn map_acl_error<E: aws_sdk_s3::error::ProvideErrorMetadata>(
     error: aws_sdk_s3::error::SdkError<E>,
 ) -> crate::error::AppError {
     let error_string = s3_error_message(&error);
-    if let Some((_, message)) = classify_acl_error(&error_string) {
-        crate::error::AppError::S3Error(message.to_string())
-    } else {
-        crate::error::AppError::S3Error(error_string)
+    match classify_acl_error(&error_string) {
+        // A refusal is not always about the credentials: the service's own
+        // words say why, for example that the bucket blocks public access.
+        Some(("access_denied", _)) => crate::error::AppError::S3Error(format!(
+            "The service refused the change: {error_string}"
+        )),
+        Some((_, message)) => {
+            crate::error::AppError::S3Error(format!("{message} ({error_string})"))
+        }
+        None => crate::error::AppError::S3Error(error_string),
     }
 }
 
@@ -207,11 +213,11 @@ pub(crate) fn copy_acl_headers(
 ) -> Result<CopyAclHeaders> {
     let mut headers = CopyAclHeaders::default();
     for grant in output.grants() {
-        let Some(grantee) = grant.grantee() else {
-            continue;
-        };
-        let Some(permission) = grant.permission() else {
-            continue;
+        // A grant that cannot be read whole cannot be kept whole.
+        let (Some(grantee), Some(permission)) = (grant.grantee(), grant.permission()) else {
+            return Err(crate::error::AppError::InvalidContent(
+                "Object ACL has a grant without a grantee or permission".to_string(),
+            ));
         };
         let header = acl_grantee_header(grantee)?;
 
@@ -229,6 +235,31 @@ pub(crate) fn copy_acl_headers(
         }
     }
     Ok(headers)
+}
+
+/// The ACL a copy or a rewrite has to carry over. With `owner_without_id`
+/// (IDrive e2), a single FULL_CONTROL grant to a canonical user without an
+/// ID is that service's default ACL for new objects (measured: the owner's
+/// ID is reported empty) and is not carried over: it names no one
+/// who could be written back. Anything else is carried over grant by grant,
+/// and an ACL that cannot be read whole is refused.
+pub(crate) fn acl_to_preserve(
+    output: &aws_sdk_s3::operation::get_object_acl::GetObjectAclOutput,
+    owner_without_id: bool,
+) -> Result<Option<CopyAclHeaders>> {
+    if let ([grant], true) = (output.grants(), owner_without_id) {
+        let default = grant.permission() == Some(&Permission::FullControl)
+            && grant.grantee().is_some_and(|grantee| {
+                grantee.r#type() == &aws_sdk_s3::types::Type::CanonicalUser
+                    && grantee.id().is_none_or(str::is_empty)
+                    && grantee.uri().is_none()
+                    && grantee.email_address().is_none()
+            });
+        if default {
+            return Ok(None);
+        }
+    }
+    copy_acl_headers(output).map(Some)
 }
 
 fn copy_source(bucket_name: &str, key: &str, version_id: Option<&str>) -> String {
@@ -268,6 +299,7 @@ async fn multipart_copy_content_type(
         content_type,
         head,
         acl_headers,
+        None,
     )
     .await
 }
@@ -278,6 +310,7 @@ async fn multipart_copy_object(
     content_type: &str,
     head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
     acl_headers: Option<&CopyAclHeaders>,
+    destination_etag: Option<&str>,
 ) -> Result<()> {
     let (source_client, source_bucket, source_key) = source;
     let (client, bucket_name, key) = destination;
@@ -427,19 +460,21 @@ async fn multipart_copy_object(
             );
         }
 
-        if source_bucket != bucket_name || source_key != key {
+        let elsewhere = source_bucket != bucket_name || source_key != key;
+        if elsewhere {
             crate::s3::guard::before_write(
                 client,
                 bucket_name,
                 key,
-                None,
+                destination_etag,
                 crate::s3::guard::Operation::CompleteMultipart,
             )
             .await?;
         }
         client
             .complete_multipart_upload()
-            .set_if_none_match((source_bucket != bucket_name || source_key != key).then(|| "*".to_string()))
+            .set_if_none_match((elsewhere && destination_etag.is_none()).then(|| "*".to_string()))
+            .set_if_match(destination_etag.filter(|_| elsewhere).map(str::to_owned))
             .bucket(bucket_name)
             .key(key)
             .upload_id(guard.upload_id())
@@ -871,6 +906,51 @@ pub async fn copy_object(
     .await
 }
 
+/// Copies one object within a connection over an existing target, which is
+/// replaced only while it still has `expected_etag`.
+#[allow(clippy::too_many_arguments)]
+pub async fn copy_object_replacing(
+    source_bucket: String,
+    source_key: String,
+    destination_bucket: String,
+    destination_key: String,
+    expected_etag: String,
+    expected_profile_id: String,
+    profile_state: State<'_, ProfileState>,
+    s3_state: State<'_, S3State>,
+) -> Result<()> {
+    if source_key.ends_with('/') || destination_key.ends_with('/') {
+        return Err(crate::error::AppError::ConfigError(
+            "Only files can replace existing objects.".into(),
+        ));
+    }
+    if expected_etag.is_empty() {
+        return Err(crate::error::AppError::ConfigError(
+            "The object to replace has no ETag; it cannot be replaced safely.".into(),
+        ));
+    }
+    let profile = profile_state
+        .read()
+        .await
+        .get_active_profile()
+        .await?
+        .ok_or_else(|| crate::error::AppError::ProfileNotFound("No active profile".into()))?;
+    validate_operation_profile(Some(&expected_profile_id), &profile.id)?;
+    copy_single_object_over(
+        &source_bucket,
+        None,
+        &source_key,
+        &destination_bucket,
+        None,
+        &destination_key,
+        Some(&expected_etag),
+        &profile,
+        s3_state.inner(),
+    )
+    .await
+    .map(|_| ())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn copy_object_with_profile(
     source_bucket: String,
@@ -995,6 +1075,35 @@ async fn copy_single_object(
     active_profile: &crate::credentials::Profile,
     s3_state: &S3State,
 ) -> Result<String> {
+    copy_single_object_over(
+        source_bucket,
+        source_region,
+        source_key,
+        destination_bucket,
+        destination_region,
+        destination_key,
+        None,
+        active_profile,
+        s3_state,
+    )
+    .await
+}
+
+/// Copies a single object. With `destination_etag`, an existing target is
+/// replaced, but only while it still has that ETag; without, a target that
+/// exists is never overwritten.
+#[allow(clippy::too_many_arguments)]
+async fn copy_single_object_over(
+    source_bucket: &str,
+    source_region: Option<String>,
+    source_key: &str,
+    destination_bucket: &str,
+    destination_region: Option<String>,
+    destination_key: &str,
+    destination_etag: Option<&str>,
+    active_profile: &crate::credentials::Profile,
+    s3_state: &S3State,
+) -> Result<String> {
     // Check cache for bucket region first
     let destination_region = {
         let s3_manager = s3_state.read().await;
@@ -1050,7 +1159,10 @@ async fn copy_single_object(
         .send()
         .await
     {
-        Ok(output) => Some(copy_acl_headers(&output)?),
+        Ok(output) => acl_to_preserve(
+            &output,
+            crate::s3::guard::owner_grant_without_id_is_default(&source_client),
+        )?,
         Err(error)
             if matches!(
                 classify_acl_error(&s3_error_message(&error)),
@@ -1070,6 +1182,7 @@ async fn copy_single_object(
         (&client, destination_bucket, destination_key),
         &head,
         acl.as_ref(),
+        destination_etag,
     )
     .await?;
 
@@ -1086,6 +1199,7 @@ async fn copy_object_from_head(
     destination: (&Client, &str, &str),
     head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
     acl: Option<&CopyAclHeaders>,
+    destination_etag: Option<&str>,
 ) -> Result<()> {
     let size = head
         .content_length()
@@ -1100,6 +1214,7 @@ async fn copy_object_from_head(
             head.content_type().unwrap_or("application/octet-stream"),
             head,
             acl,
+            destination_etag,
         )
         .await
     } else {
@@ -1107,7 +1222,7 @@ async fn copy_object_from_head(
             destination.0,
             destination.1,
             destination.2,
-            None,
+            destination_etag,
             crate::s3::guard::Operation::Copy,
         )
         .await?;
@@ -1115,7 +1230,8 @@ async fn copy_object_from_head(
             let mut request = destination
                 .0
                 .copy_object()
-                .if_none_match("*")
+                .set_if_none_match(destination_etag.is_none().then(|| "*".to_string()))
+                .set_if_match(destination_etag.map(str::to_owned))
                 .bucket(destination.1)
                 .key(destination.2)
                 .copy_source(copy_source(source.1, source.2, head.version_id()))
@@ -1575,7 +1691,12 @@ async fn move_object_with_profile(
     }
 }
 
-async fn delete_copied_source(client: &Client, bucket: &str, key: &str, etag: &str) -> Result<()> {
+pub(crate) async fn delete_copied_source(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    etag: &str,
+) -> Result<()> {
     crate::s3::guard::before_write(
         client,
         bucket,
@@ -1635,7 +1756,10 @@ pub(super) async fn save_object_text(
         .send()
         .await
     {
-        Ok(output) => Some(copy_acl_headers(&output)?),
+        Ok(output) => acl_to_preserve(
+            &output,
+            crate::s3::guard::owner_grant_without_id_is_default(client),
+        )?,
         Err(error)
             if matches!(
                 classify_acl_error(&s3_error_message(&error)),
@@ -1699,7 +1823,9 @@ pub(super) async fn save_object_text(
             .set_content_disposition(head.content_disposition.clone())
             .set_content_encoding(head.content_encoding.clone())
             .set_content_language(head.content_language.clone())
-            .set_metadata(head.metadata.clone())
+            .set_metadata(crate::transfer::sync_state::without_hash(
+                head.metadata.clone(),
+            ))
             .set_website_redirect_location(head.website_redirect_location.clone())
             .set_storage_class(head.storage_class.clone())
             .set_server_side_encryption(head.server_side_encryption.clone())
@@ -1745,11 +1871,15 @@ pub(super) async fn save_object_text(
     })
 }
 
+/// `expected_etag`, when given, is the object as the user saw it: the
+/// change is made only to that content, and only by a single copy.
+#[allow(clippy::too_many_arguments)]
 pub async fn set_object_content_type(
     bucket_name: String,
     bucket_region: Option<String>,
     key: String,
     content_type: String,
+    expected_etag: Option<String>,
     expected_profile_id: String,
     profile_state: State<'_, ProfileState>,
     s3_state: State<'_, S3State>,
@@ -1787,9 +1917,19 @@ pub async fn set_object_content_type(
         .head_object()
         .bucket(&bucket_name)
         .key(&key)
+        .set_if_match(expected_etag.clone())
         .send()
         .await
-        .map_err(|error| crate::error::AppError::S3Error(error.to_string()))?;
+        .map_err(|error| {
+            if expected_etag.is_some() && error.raw_response().map(|r| r.status().as_u16()) == Some(412) {
+                crate::error::AppError::S3Error(
+                    "The object changed since it was shown. Refresh and try again; nothing was changed."
+                        .to_string(),
+                )
+            } else {
+                crate::error::AppError::S3Error(error.to_string())
+            }
+        })?;
 
     if head.content_type() == Some(content_type.as_str()) {
         return Ok(());
@@ -1829,7 +1969,10 @@ pub async fn set_object_content_type(
         .send()
         .await
     {
-        Ok(output) => Some(copy_acl_headers(&output)?),
+        Ok(output) => acl_to_preserve(
+            &output,
+            crate::s3::guard::owner_grant_without_id_is_default(&client),
+        )?,
         Err(error) => {
             let error_string = s3_error_message(&error);
             if matches!(classify_acl_error(&error_string), Some(("unsupported", _))) {
@@ -1843,6 +1986,13 @@ pub async fn set_object_content_type(
     };
 
     let copy_source = copy_source(&bucket_name, &key, head.version_id());
+    if object_size > MAX_SINGLE_COPY_SIZE && expected_etag.is_some() {
+        // A multipart copy is completed without a condition, so a change
+        // made just before could be overwritten.
+        return Err(crate::error::AppError::ConfigError(
+            "Content-Type is changed here only for objects up to 5 GiB.".to_string(),
+        ));
+    }
     if object_size > MAX_SINGLE_COPY_SIZE {
         multipart_copy_content_type(
             &client,
@@ -1868,7 +2018,7 @@ pub async fn set_object_content_type(
             .content_type(&content_type)
             .metadata_directive(MetadataDirective::Replace)
             .tagging_directive(TaggingDirective::Copy)
-            .set_copy_source_if_match(head.e_tag.clone())
+            .set_copy_source_if_match(expected_etag.clone().or_else(|| head.e_tag.clone()))
             .set_cache_control(head.cache_control.clone())
             .set_content_disposition(head.content_disposition.clone())
             .set_content_encoding(head.content_encoding.clone())
@@ -1937,6 +2087,10 @@ pub struct ObjectMetadata {
     pub e_tag: Option<String>,
     pub storage_class: Option<String>,
     pub user_metadata: std::collections::HashMap<String, String>,
+    /// Server-side encryption as the service reports it, such as `aws:kms`.
+    /// With KMS the ETag is not the content's MD5.
+    #[serde(default)]
+    pub server_side_encryption: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -2287,6 +2441,9 @@ pub async fn get_object_metadata(
         e_tag: output.e_tag,
         storage_class: output.storage_class.map(|s| s.as_str().to_string()),
         user_metadata: user_metadata.into_iter().collect(),
+        server_side_encryption: output
+            .server_side_encryption
+            .map(|s| s.as_str().to_string()),
     })
 }
 
@@ -2299,6 +2456,64 @@ mod tests {
     use crate::credentials::{CredentialType, Profile};
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{Tag, Tagging};
+
+    #[test]
+    fn e2s_owner_grant_without_an_id_is_its_default_acl() {
+        use super::acl_to_preserve;
+        use aws_sdk_s3::operation::get_object_acl::GetObjectAclOutput;
+        use aws_sdk_s3::types::{Grant, Grantee, Owner, Permission, Type};
+        let grant = |id: Option<&str>, permission: Permission| {
+            let mut grantee = Grantee::builder().r#type(Type::CanonicalUser);
+            if let Some(id) = id {
+                grantee = grantee.id(id);
+            }
+            Grant::builder()
+                .permission(permission)
+                .grantee(grantee.build().unwrap())
+                .build()
+        };
+        let acl = |grants: Vec<Grant>| {
+            GetObjectAclOutput::builder()
+                .owner(Owner::builder().id("owner").build())
+                .set_grants(Some(grants))
+                .build()
+        };
+        // The owner's grant, by ID, is carried over as it always was.
+        let own = acl(vec![grant(Some("owner"), Permission::FullControl)]);
+        assert!(acl_to_preserve(&own, false).unwrap().is_some());
+        // e2: the owner's grant without an ID is the default there only.
+        let e2 = acl(vec![grant(None, Permission::FullControl)]);
+        assert!(acl_to_preserve(&e2, true).unwrap().is_none());
+        assert!(acl_to_preserve(&e2, false).is_err());
+        // Another grant beside it is carried over, or refused if unreadable.
+        let shared = acl(vec![
+            grant(Some("owner"), Permission::FullControl),
+            grant(Some("friend"), Permission::Read),
+        ]);
+        assert!(acl_to_preserve(&shared, true).unwrap().is_some());
+        let with_e2_owner = acl(vec![
+            grant(None, Permission::FullControl),
+            grant(Some("friend"), Permission::Read),
+        ]);
+        assert!(acl_to_preserve(&with_e2_owner, true).is_err());
+        // A grant with no permission is malformed.
+        let malformed = acl(vec![
+            grant(Some("owner"), Permission::FullControl),
+            Grant::builder()
+                .grantee(
+                    Grantee::builder()
+                        .r#type(Type::CanonicalUser)
+                        .id("x")
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        ]);
+        assert!(acl_to_preserve(&malformed, true).is_err());
+        // Someone else's single grant is not the default.
+        let other = acl(vec![grant(Some("someone"), Permission::FullControl)]);
+        assert!(acl_to_preserve(&other, false).unwrap().is_some());
+    }
 
     #[test]
     fn copy_source_encodes_keys_and_pins_versioned_objects() {
@@ -2832,6 +3047,7 @@ mod large_copy_tests {
             (&client, "dest", "file"),
             &head(10),
             Some(&acl),
+            None,
         )
         .await
         .unwrap();
@@ -2876,6 +3092,7 @@ mod large_copy_tests {
             (&client, "source", "original.txt"),
             (&client, "destination", "renamed.txt"),
             &head(LARGE_SIZE),
+            None,
             None,
         )
         .await
@@ -2923,9 +3140,10 @@ mod large_copy_tests {
             (&client, "destination", "renamed.txt"),
             &head(LARGE_SIZE),
             None,
+            None,
         )
         .await
-        .is_err());
+        .is_err(),);
         let requests = server.await.unwrap();
         assert_eq!(requests.len(), 4);
         assert!(requests[3].starts_with("DELETE /destination/renamed.txt?"));
@@ -2944,6 +3162,7 @@ mod large_copy_tests {
             (&client, "source", "original.txt"),
             (&client, "destination", "renamed.txt"),
             &head(LARGE_SIZE - 1),
+            None,
             None,
         )
         .await

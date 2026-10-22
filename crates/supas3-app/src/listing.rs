@@ -80,6 +80,11 @@ impl Default for Listing {
 }
 
 impl Listing {
+    /// The generation of the latest request.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// How many rows have been loaded.
     pub fn count(&self) -> usize {
         self.count
@@ -157,6 +162,83 @@ pub fn display_order(left: &Entry, right: &Entry) -> Ordering {
         .then_with(|| left.name.cmp(&right.name))
 }
 
+/// The column a tab is sorted by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortField {
+    #[default]
+    Name,
+    Size,
+    Modified,
+}
+
+/// How a tab's rows are ordered. Folders always come first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Sort {
+    pub field: SortField,
+    pub descending: bool,
+}
+
+impl Sort {
+    /// What to ask the storage backend for. `None` is its ordinary order,
+    /// name ascending, read a page at a time; anything else makes it read
+    /// the whole folder first.
+    pub fn backend(self) -> Option<(&'static str, &'static str)> {
+        let direction = if self.descending { "desc" } else { "asc" };
+        match (self.field, self.descending) {
+            (SortField::Name, false) => None,
+            (SortField::Name, true) => Some(("name", direction)),
+            (SortField::Size, _) => Some(("size", direction)),
+            (SortField::Modified, _) => Some(("date", direction)),
+        }
+    }
+}
+
+/// Orders rows that are all loaded at once (a folder on this computer).
+pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
+    entries.sort_by(|left, right| {
+        let by_field = match sort.field {
+            SortField::Name => display_order(left, right),
+            SortField::Size => left
+                .size
+                .cmp(&right.size)
+                .then_with(|| display_order(left, right)),
+            SortField::Modified => left
+                .modified
+                .cmp(&right.modified)
+                .then_with(|| display_order(left, right)),
+        };
+        let by_field = if sort.descending {
+            by_field.reverse()
+        } else {
+            by_field
+        };
+        right
+            .opens_a_location()
+            .cmp(&left.opens_a_location())
+            .then(by_field)
+    });
+}
+
+/// Whether a row's name contains the filter text, ignoring case. An empty
+/// filter keeps every row.
+pub fn matches_filter(entry: &Entry, filter: &str) -> bool {
+    filter.is_empty() || entry.name.to_lowercase().contains(&filter.to_lowercase())
+}
+
+/// Whether a page request failed because the backend no longer holds the
+/// listing it was paging through; the tab then starts over.
+pub fn is_expired_listing(error: &str) -> bool {
+    error.contains("This listing has changed")
+}
+
+/// Whether a sorted listing was refused because the folder is too large to
+/// read whole; the tab then falls back to name order.
+pub fn is_too_large_to_sort(error: &str) -> bool {
+    error.contains("safety limit for complete-result sorting")
+}
+
 /// A size as people read it: binary units, one decimal below ten.
 pub fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
@@ -189,6 +271,46 @@ pub fn format_modified(timestamp: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn folders_stay_first_whatever_the_order() {
+        use super::{sort_entries, Entry, EntryKind, Sort, SortField};
+        let row = |name: &str, kind, size| Entry {
+            name: name.into(),
+            kind,
+            size,
+            modified: None,
+            prefix: None,
+        };
+        let mut rows = vec![
+            row("b.txt", EntryKind::File, Some(5)),
+            row("z", EntryKind::Folder, None),
+            row("a.txt", EntryKind::File, Some(9)),
+            row("y", EntryKind::Folder, None),
+        ];
+        sort_entries(
+            &mut rows,
+            Sort {
+                field: SortField::Size,
+                descending: true,
+            },
+        );
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["z", "y", "a.txt", "b.txt"]);
+        sort_entries(&mut rows, Sort::default());
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["y", "z", "a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn only_name_ascending_pages_without_reading_everything() {
+        use super::{Sort, SortField};
+        assert_eq!(Sort::default().backend(), None);
+        let by = |field, descending| Sort { field, descending }.backend();
+        assert_eq!(by(SortField::Name, true), Some(("name", "desc")));
+        assert_eq!(by(SortField::Modified, false), Some(("date", "asc")));
+        assert_eq!(by(SortField::Size, true), Some(("size", "desc")));
+    }
+
     use super::{
         display_order, format_modified, format_size, Entry, EntryKind, Listing, LoadState, Page,
     };

@@ -10,15 +10,17 @@ pub enum Service {
     Oss,
     Cos,
     Obs,
+    IdriveE2,
     Generic,
 }
 
 impl Service {
-    pub const ALL: [Service; 5] = [
+    pub const ALL: [Service; 6] = [
         Service::Aws,
         Service::Oss,
         Service::Cos,
         Service::Obs,
+        Service::IdriveE2,
         Service::Generic,
     ];
 
@@ -29,6 +31,7 @@ impl Service {
             Self::Oss => "service.oss",
             Self::Cos => "service.cos",
             Self::Obs => "service.obs",
+            Self::IdriveE2 => "service.idrive_e2",
             Self::Generic => "service.generic",
         }
     }
@@ -39,6 +42,7 @@ impl Service {
             Self::Oss => Some(Provider::Oss),
             Self::Cos => Some(Provider::Cos),
             Self::Obs => Some(Provider::Obs),
+            Self::IdriveE2 => Some(Provider::IdriveE2),
             Self::Generic => Some(Provider::Generic),
         }
     }
@@ -58,6 +62,7 @@ impl Service {
             Self::Oss => Some(format!("oss-{region}.aliyuncs.com")),
             Self::Cos => Some(format!("cos.{region}.myqcloud.com")),
             Self::Obs => Some(format!("obs.{region}.myhuaweicloud.com")),
+            Self::IdriveE2 => Some(format!("s3.{region}.idrivee2.com")),
             Self::Aws | Self::Generic => None,
         }
     }
@@ -69,6 +74,7 @@ impl Service {
             Self::Oss => "cn-hangzhou",
             Self::Cos => "ap-guangzhou",
             Self::Obs => "cn-north-4",
+            Self::IdriveE2 => "us-west-1",
             Self::Generic => "us-east-1",
         }
     }
@@ -79,6 +85,7 @@ impl Service {
             (CredentialType::CustomEndpoint { .. }, Provider::Oss) => Self::Oss,
             (CredentialType::CustomEndpoint { .. }, Provider::Cos) => Self::Cos,
             (CredentialType::CustomEndpoint { .. }, Provider::Obs) => Self::Obs,
+            (CredentialType::CustomEndpoint { .. }, Provider::IdriveE2) => Self::IdriveE2,
             (CredentialType::CustomEndpoint { .. }, Provider::Generic) => Self::Generic,
             _ => Self::Aws,
         }
@@ -97,6 +104,9 @@ pub fn error_hint_key(error: &str) -> Option<&'static str> {
         "invalid access key",
     ]) {
         Some("hint.credentials")
+    } else if has(&["publicendpointforbidden"]) {
+        // Before the general "forbidden": this one has a known cause.
+        Some("hint.oss_public_endpoint")
     } else if has(&["nosuchbucket"]) {
         Some("hint.no_bucket")
     } else if has(&["accessdenied", "access denied", "forbidden"]) {
@@ -161,6 +171,9 @@ pub struct Draft {
     pub session_token: String,
     /// Optional bucket to open directly, for credentials that cannot list buckets.
     pub bucket: String,
+    /// For AWS: the profile of this computer's AWS configuration to connect
+    /// with, instead of keys typed here.
+    pub aws_profile: Option<String>,
 }
 
 impl Draft {
@@ -174,6 +187,7 @@ impl Draft {
             secret_key: String::new(),
             session_token: String::new(),
             bucket: String::new(),
+            aws_profile: None,
         }
     }
 
@@ -198,7 +212,20 @@ impl Draft {
             secret_key: String::new(),
             session_token: String::new(),
             bucket: profile.compat.default_bucket.clone().unwrap_or_default(),
+            aws_profile: match &profile.credential_type {
+                CredentialType::SharedConfig { profile_name } => Some(
+                    profile_name
+                        .clone()
+                        .unwrap_or_else(|| "default".to_string()),
+                ),
+                _ => None,
+            },
         }
+    }
+
+    /// Whether the connection uses a profile of the AWS configuration.
+    pub fn uses_aws_profile(&self) -> bool {
+        self.service == Service::Aws && self.aws_profile.is_some()
     }
 
     /// The endpoint that will be used: the typed one, else the service's
@@ -225,11 +252,16 @@ impl Draft {
         if self.service != Service::Aws && self.effective_endpoint().is_none() {
             problems.push(Problem::EndpointMissing);
         }
-        if self.access_key.trim().is_empty() {
-            problems.push(Problem::AccessKeyMissing);
-        }
-        if self.secret_key.is_empty() && !editing {
-            problems.push(Problem::SecretKeyMissing);
+        // Keys in the AWS configuration are the SDK's to read.
+        if !self.uses_aws_profile() {
+            if self.access_key.trim().is_empty() {
+                problems.push(Problem::AccessKeyMissing);
+            }
+            // An edit may leave the secret empty to keep the stored one; a
+            // connection that had none is told so when saving.
+            if self.secret_key.is_empty() && !editing {
+                problems.push(Problem::SecretKeyMissing);
+            }
         }
         let bucket = self.bucket.trim();
         if !bucket.is_empty() {
@@ -256,6 +288,9 @@ impl Draft {
         let secret_access_key = self.secret_key.clone();
         let region = self.region.trim();
         let credential_type = match self.service {
+            Service::Aws if self.aws_profile.is_some() => CredentialType::SharedConfig {
+                profile_name: self.aws_profile.clone(),
+            },
             Service::Aws => CredentialType::Manual {
                 access_key_id,
                 secret_access_key,
@@ -336,6 +371,10 @@ mod tests {
         assert_eq!(
             super::error_hint_key("NoSuchBucket: The bucket does not exist"),
             Some("hint.no_bucket")
+        );
+        assert_eq!(
+            super::error_hint_key("service error: PublicEndpointForbidden"),
+            Some("hint.oss_public_endpoint")
         );
         assert_eq!(super::error_hint_key("something else"), None);
     }
@@ -543,6 +582,44 @@ mod tests {
             draft.to_profile(None).session_token.as_deref(),
             Some("token")
         );
+    }
+
+    #[test]
+    fn an_aws_profile_connects_without_keys_and_stays_one_when_edited() {
+        let draft = Draft {
+            name: "work".into(),
+            region: "eu-west-1".into(),
+            aws_profile: Some("work".into()),
+            ..Draft::new(Service::Aws)
+        };
+        assert!(draft.problems(false).is_empty());
+        let profile = draft.to_profile(None);
+        assert!(matches!(
+            &profile.credential_type,
+            CredentialType::SharedConfig { profile_name } if profile_name.as_deref() == Some("work")
+        ));
+        assert_eq!(
+            profile.compat,
+            supas3_core::credentials::Compatibility::default()
+        );
+        let again = Draft::from_profile(&profile);
+        assert_eq!(again.aws_profile.as_deref(), Some("work"));
+        assert!(again.uses_aws_profile());
+        assert!(again.problems(true).is_empty());
+
+        // Only AWS connects through the AWS configuration.
+        let elsewhere = Draft {
+            service: Service::Oss,
+            region: "cn-hangzhou".into(),
+            ..draft.clone()
+        };
+        assert!(elsewhere
+            .problems(false)
+            .contains(&Problem::AccessKeyMissing));
+        assert!(matches!(
+            elsewhere.to_profile(None).credential_type,
+            CredentialType::CustomEndpoint { .. }
+        ));
     }
 
     #[test]

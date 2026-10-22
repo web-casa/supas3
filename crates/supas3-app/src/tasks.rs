@@ -12,6 +12,21 @@ pub enum TaskKind {
     Download,
     /// Storage to storage, relayed through a temporary file on this computer.
     Copy,
+    /// Files copied from one place on this computer to another.
+    LocalCopy,
+    /// Items moved: copied, checked, then removed from where they were.
+    Move,
+    /// A folder renamed by moving everything in it.
+    Rename,
+}
+
+/// Who runs a task, and so who is asked to cancel or forget it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskOrigin {
+    /// A transfer the storage backend runs and journals.
+    Transfer,
+    /// Work the application runs itself; it does not survive a restart.
+    App,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +93,8 @@ pub struct Task {
     /// earlier run has lost what it needs for that (where a download was
     /// going, or the source of a copy), so it has to be started afresh.
     pub retryable: bool,
-    created_at: i64,
+    pub origin: TaskOrigin,
+    pub created_at: i64,
 }
 
 impl Task {
@@ -116,6 +132,7 @@ impl Task {
             group: job.parent_group_id.clone(),
             group_name: job.group_name.clone(),
             retryable: !restored || can_be_retried(job),
+            origin: TaskOrigin::Transfer,
             created_at: job.created_at,
         }
     }
@@ -183,6 +200,10 @@ const MEMORY_LIMIT: usize = 4096;
 #[derive(Debug, Default)]
 pub struct Tasks {
     by_id: HashMap<String, Task>,
+    /// Tasks that reached an end since the last `take_ended`, with how they
+    /// ended. Work that waits on a task (a move deletes its source only once
+    /// the copy completed) reads this instead of the event queue.
+    ended: Vec<(String, TaskState)>,
     /// Updates for transfers that have not been announced yet.
     early: HashMap<String, TransferEvent>,
     /// Transfers the user removed, so a late announcement does not bring
@@ -194,6 +215,7 @@ impl Tasks {
     /// Brings the list in line with the backend's own list. Transfers the
     /// backend no longer has are dropped; a task that has already ended here
     /// is not put back into an earlier state by an older snapshot.
+    /// Tasks the application runs itself are kept as they are.
     pub fn merge_snapshot(&mut self, jobs: &[TransferJob]) {
         let mut merged = HashMap::with_capacity(jobs.len());
         for job in jobs {
@@ -201,16 +223,58 @@ impl Tasks {
                 continue;
             }
             let mut task = Task::from_job(job, true);
-            if let Some(known) = self.by_id.get(&job.id) {
-                if !known.state.is_active() && task.state.is_active() {
-                    task.state = known.state.clone();
-                    task.processed = known.processed;
+            let known_ended = match self.by_id.get(&job.id) {
+                Some(known) => {
+                    if !known.state.is_active() && task.state.is_active() {
+                        task.state = known.state.clone();
+                        task.processed = known.processed;
+                    }
+                    !known.state.is_active()
                 }
+                None => false,
+            };
+            // An end the events never reported, for example after they
+            // overflowed, is still announced.
+            if !known_ended && !task.state.is_active() {
+                self.ended.push((task.id.clone(), task.state.clone()));
             }
             merged.insert(job.id.clone(), task);
         }
+        // Work the application runs is not in the backend's list, and a
+        // transfer queued after the list was read is not in it yet.
+        for (id, task) in self.by_id.drain() {
+            if task.origin == TaskOrigin::App
+                || (task.state.is_active() && !merged.contains_key(&id))
+            {
+                merged.insert(id, task);
+            }
+        }
         self.by_id = merged;
         self.apply_early();
+    }
+
+    /// Records the latest state of a task the application runs. The same
+    /// rule as for transfers applies: once ended it stays ended.
+    pub fn upsert_app(&mut self, task: Task) {
+        if self.removed.contains(&task.id) {
+            return;
+        }
+        let was_active = self
+            .by_id
+            .get(&task.id)
+            .is_none_or(|known| known.state.is_active());
+        if !was_active {
+            return;
+        }
+        if !task.state.is_active() {
+            self.ended.push((task.id.clone(), task.state.clone()));
+        }
+        self.by_id.insert(task.id.clone(), task);
+    }
+
+    /// Tasks that ended since the last call, with how they ended.
+    pub fn take_ended(&mut self) -> Vec<(String, TaskState)> {
+        std::mem::take(&mut self.ended)
     }
 
     /// Records a newly queued transfer. Returns whether it ended up finished,
@@ -231,7 +295,12 @@ impl Tasks {
         if let Some(update) = self.early.remove(&job.id) {
             self.update(&update);
         }
-        was_active && self.by_id[&job.id].state == TaskState::Completed
+        let state = self.by_id[&job.id].state.clone();
+        // Announced already ended: record it, as `update` did not see it end.
+        if was_active && !state.is_active() && !self.ended.iter().any(|(id, _)| *id == job.id) {
+            self.ended.push((job.id.clone(), state.clone()));
+        }
+        was_active && state == TaskState::Completed
     }
 
     fn apply_early(&mut self) {
@@ -269,6 +338,9 @@ impl Tasks {
         if !task.state.is_active() && state.is_active() {
             return false;
         }
+        if task.state.is_active() && !state.is_active() {
+            self.ended.push((task.id.clone(), state.clone()));
+        }
         task.state = state;
         task.processed = event.processed_bytes;
         if event.total_bytes > 0 {
@@ -288,22 +360,23 @@ impl Tasks {
         self.removed.insert(id.to_string());
     }
 
-    /// The ids of every completed or cancelled transfer. Failed ones are not
-    /// included: they are kept until the user has dealt with them.
-    pub fn settled_ids(&self) -> Vec<String> {
+    /// The ids of every completed or cancelled task, with who runs it.
+    /// Failed ones are not included: they are kept until the user has dealt
+    /// with them.
+    pub fn settled_ids(&self) -> Vec<(String, TaskOrigin)> {
         self.by_id
             .values()
             .filter(|task| task.state.is_settled())
-            .map(|task| task.id.clone())
+            .map(|task| (task.id.clone(), task.origin))
             .collect()
     }
 
-    /// The ids of every transfer that can be cancelled.
-    pub fn cancellable_ids(&self) -> Vec<String> {
+    /// The ids of every task that can be cancelled, with who runs it.
+    pub fn cancellable_ids(&self) -> Vec<(String, TaskOrigin)> {
         self.by_id
             .values()
             .filter(|task| task.state.can_cancel())
-            .map(|task| task.id.clone())
+            .map(|task| (task.id.clone(), task.origin))
             .collect()
     }
 
@@ -352,7 +425,10 @@ impl Tasks {
     pub fn active_progress(&self) -> (u64, u64, f64) {
         self.by_id
             .values()
-            .filter(|task| task.state.is_active())
+            // Moves and renames count items, not bytes.
+            .filter(|task| {
+                task.state.is_active() && !matches!(task.kind, TaskKind::Move | TaskKind::Rename)
+            })
             .fold((0, 0, 0.0), |(done, total, speed), task| {
                 (
                     done + task.processed,
@@ -392,6 +468,17 @@ struct Pending {
     added: Vec<TransferJob>,
     updates: HashMap<String, TransferEvent>,
     overflowed: bool,
+    storage_errors: Vec<StorageError>,
+}
+
+/// Something the backend could not write to disk while it worked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageError {
+    /// The transfer journal: transfers go on, but would not be listed
+    /// after a restart.
+    Journal(String),
+    /// A saved job's result: scheduling of that job stops.
+    SavedJob(String),
 }
 
 /// What the interface collects from the queue in one go.
@@ -401,11 +488,15 @@ pub struct Collected {
     pub updates: Vec<TransferEvent>,
     /// Announcements were dropped: read the backend's list to catch up.
     pub overflowed: bool,
+    pub storage_errors: Vec<StorageError>,
 }
 
 impl Collected {
     pub fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.updates.is_empty() && !self.overflowed
+        self.added.is_empty()
+            && self.updates.is_empty()
+            && !self.overflowed
+            && self.storage_errors.is_empty()
     }
 }
 
@@ -440,6 +531,22 @@ impl EventQueue {
                     }
                 }
             }
+            "transfer-journal-error" | "saved-job-storage-error" => {
+                let detail = event
+                    .payload
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| event.payload.to_string());
+                let error = if event.name == "transfer-journal-error" {
+                    StorageError::Journal(detail)
+                } else {
+                    StorageError::SavedJob(detail)
+                };
+                // One of each kind is enough to say what happened.
+                if !pending.storage_errors.contains(&error) && pending.storage_errors.len() < 8 {
+                    pending.storage_errors.push(error);
+                }
+            }
             _ => {}
         }
     }
@@ -454,6 +561,7 @@ impl EventQueue {
             added: std::mem::take(&mut pending.added),
             updates: pending.updates.drain().map(|(_, update)| update).collect(),
             overflowed: std::mem::take(&mut pending.overflowed),
+            storage_errors: std::mem::take(&mut pending.storage_errors),
         }
     }
 }
@@ -468,11 +576,39 @@ pub fn format_speed(bytes_per_second: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_speed, EventQueue, TaskFilter, TaskKind, TaskState, Tasks};
+    use super::{
+        format_speed, EventQueue, Task, TaskFilter, TaskKind, TaskOrigin, TaskState, Tasks,
+    };
     use std::path::PathBuf;
     use std::sync::Arc;
     use supas3_core::host::Event;
     use supas3_core::transfer::{TransferEvent, TransferJob, TransferStatus, TransferType};
+
+    #[test]
+    fn storage_failures_are_collected_once_each() {
+        let queue = Arc::new(EventQueue::default());
+        let sink = queue.sink();
+        for _ in 0..3 {
+            sink(Event {
+                name: "transfer-journal-error".into(),
+                payload: serde_json::json!("disk full"),
+            });
+        }
+        sink(Event {
+            name: "saved-job-storage-error".into(),
+            payload: serde_json::json!("no space"),
+        });
+        let collected = queue.collect();
+        assert!(!collected.is_empty());
+        assert_eq!(
+            collected.storage_errors,
+            [
+                super::StorageError::Journal("disk full".into()),
+                super::StorageError::SavedJob("no space".into())
+            ]
+        );
+        assert!(queue.collect().is_empty());
+    }
 
     fn job(id: &str, kind: TransferType, key: &str, created_at: i64) -> TransferJob {
         let mut job = TransferJob::new(
@@ -621,9 +757,12 @@ mod tests {
         let mut tasks = Tasks::default();
         tasks.add(&job("done", TransferType::Upload, "done", 1));
         tasks.add(&job("gone", TransferType::Upload, "gone", 2));
+        tasks.add(&job("later", TransferType::Upload, "later", 4));
         tasks.update(&update("done", TransferStatus::Completed, 100));
+        tasks.update(&update("gone", TransferStatus::Completed, 100));
 
-        // A snapshot taken before "done" completed, after "gone" was cleared.
+        // A snapshot taken before "done" completed, after "gone" was cleared
+        // and before "later" was queued.
         tasks.merge_snapshot(&[
             job("done", TransferType::Upload, "done", 1),
             job("new", TransferType::Upload, "new", 3),
@@ -631,6 +770,7 @@ mod tests {
         assert_eq!(tasks.get("done").unwrap().state, TaskState::Completed);
         assert!(tasks.get("gone").is_none());
         assert_eq!(tasks.get("new").unwrap().state, TaskState::Queued);
+        assert_eq!(tasks.get("later").unwrap().state, TaskState::Queued);
     }
 
     #[test]
@@ -665,7 +805,8 @@ mod tests {
             tasks.add(&job(id, TransferType::Upload, id, 1));
             tasks.update(&update(id, status, 0));
         }
-        let sorted = |mut ids: Vec<String>| {
+        let sorted = |ids: Vec<(String, TaskOrigin)>| {
+            let mut ids: Vec<String> = ids.into_iter().map(|(id, _)| id).collect();
             ids.sort();
             ids
         };
@@ -675,6 +816,68 @@ mod tests {
             "failures are kept"
         );
         assert_eq!(sorted(tasks.cancellable_ids()), ["running", "waiting"]);
+    }
+
+    #[test]
+    fn every_end_is_announced_once_with_how_it_ended() {
+        let mut tasks = Tasks::default();
+        tasks.add(&job("a", TransferType::Upload, "a", 1));
+        tasks.add(&job("b", TransferType::Upload, "b", 2));
+        assert!(tasks.take_ended().is_empty());
+        tasks.update(&update("a", TransferStatus::Completed, 1));
+        tasks.update(&update("b", TransferStatus::Failed("x".into()), 0));
+        // A late progress report after the end changes nothing.
+        tasks.update(&update("a", TransferStatus::InProgress, 0));
+        let mut ended = tasks.take_ended();
+        ended.sort_by(|l, r| l.0.cmp(&r.0));
+        assert_eq!(
+            ended,
+            [
+                ("a".to_string(), TaskState::Completed),
+                ("b".to_string(), TaskState::Failed("x".into()))
+            ]
+        );
+        assert!(tasks.take_ended().is_empty());
+    }
+
+    #[test]
+    fn an_end_seen_only_in_a_snapshot_is_announced() {
+        let mut tasks = Tasks::default();
+        tasks.add(&job("a", TransferType::Upload, "a", 1));
+        tasks.take_ended();
+        // The completion event was lost; the backend's list says it is done.
+        let mut done = job("a", TransferType::Upload, "a", 1);
+        done.status = TransferStatus::Cancelled;
+        tasks.merge_snapshot(&[done.clone()]);
+        assert_eq!(
+            tasks.take_ended(),
+            [("a".to_string(), TaskState::Cancelled)]
+        );
+        // The same state again is not a new end.
+        tasks.merge_snapshot(&[done]);
+        assert!(tasks.take_ended().is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_keeps_the_applications_own_tasks() {
+        let mut tasks = Tasks::default();
+        let mut own = Task::from_job(&job("own", TransferType::Upload, "own", 1), false);
+        own.origin = TaskOrigin::App;
+        own.kind = TaskKind::LocalCopy;
+        own.state = TaskState::Running;
+        tasks.upsert_app(own.clone());
+        tasks.merge_snapshot(&[]);
+        assert!(tasks.get("own").is_some());
+        own.state = TaskState::Completed;
+        tasks.upsert_app(own.clone());
+        assert_eq!(
+            tasks.take_ended(),
+            [("own".to_string(), TaskState::Completed)]
+        );
+        // Once ended it stays ended.
+        own.state = TaskState::Running;
+        tasks.upsert_app(own);
+        assert_eq!(tasks.get("own").unwrap().state, TaskState::Completed);
     }
 
     #[test]

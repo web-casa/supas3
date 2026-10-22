@@ -5,7 +5,10 @@
 use crate::app_state::AppBackend;
 use crate::error_details::ErrorDetails;
 use crate::listing::{format_modified, format_size};
-use crate::object_actions::{can_restore, short_version_id, versioning_key, ObjectRef};
+use crate::object_actions::{
+    can_delete_version, can_download_version, can_restore, short_version_id, version_delete_note,
+    versioning_key, ObjectRef,
+};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::scroll::ScrollableElement as _;
@@ -18,6 +21,13 @@ use gpui_kit::*;
 use rust_i18n::t;
 use supas3_core::s3::versions::{Cursor, Version};
 
+/// What a version is waiting to be confirmed for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Confirm {
+    Restore,
+    Delete,
+}
+
 pub struct VersionsView {
     object: ObjectRef,
     /// The bucket's versioning status as the service reports it.
@@ -26,8 +36,9 @@ pub struct VersionsView {
     next: Option<Cursor>,
     loading: bool,
     error: Option<String>,
-    /// The version the user asked to restore and has not yet confirmed.
-    confirming: Option<String>,
+    /// What the user asked to do with a version and has not yet confirmed.
+    confirming: Option<(Confirm, String)>,
+    /// A restore or delete is running.
     restoring: bool,
     /// Counts reloads, so a late page of an older load is dropped.
     generation: u64,
@@ -131,6 +142,133 @@ impl VersionsView {
         .detach();
     }
 
+    fn delete(&mut self, version: Version, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self
+            .versions
+            .iter()
+            .find(|version| version.is_latest)
+            .map(|current| supas3_core::commands::version_ops::SeenCurrent {
+                version_id: current.version_id.clone(),
+                etag: current.etag.clone(),
+                is_delete_marker: current.is_delete_marker,
+            });
+        let (Some(current), Some(requests)) = (current, AppBackend::requests(cx)) else {
+            return;
+        };
+        self.restoring = true;
+        self.error = None;
+        cx.notify();
+        let object = self.object.clone();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = requests
+                .delete_version(
+                    object,
+                    version.version_id.clone(),
+                    current,
+                    version.is_delete_marker,
+                )
+                .await;
+            let _ = view.update_in(cx, |view, window, cx| {
+                view.restoring = false;
+                view.confirming = None;
+                match result {
+                    Ok(()) => {
+                        window.push_notification(
+                            (
+                                NotificationType::Success,
+                                SharedString::from(t!("versions.deleted").into_owned()),
+                            ),
+                            cx,
+                        );
+                        view.reload(cx);
+                    }
+                    Err(error) => {
+                        // The history may have changed; show it as it is.
+                        view.error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Downloads a version into a folder the user picks, under a name not
+    /// taken there.
+    fn download(&mut self, version: Version, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(requests) = AppBackend::requests(cx) else {
+            return;
+        };
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(t!("details.download_here").into_owned().into()),
+        });
+        let object = self.object.clone();
+        cx.spawn_in(window, async move |view, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else {
+                return;
+            };
+            let Some(folder) = paths.into_iter().next() else {
+                return;
+            };
+            let name = object
+                .key
+                .rsplit('/')
+                .next()
+                .unwrap_or(&object.key)
+                .to_string();
+            // The name must be a plain name on this computer, or the file
+            // could land outside the folder picked.
+            if !crate::transfer_plan::is_safe_local_name(&name) {
+                let _ = view.update(cx, |view, cx| {
+                    view.error =
+                        Some(t!("versions.unsafe_name", name = name.as_str()).into_owned());
+                    cx.notify();
+                });
+                return;
+            }
+            // The version goes into the name, so two versions downloaded
+            // into one folder do not race for the same name.
+            let range = crate::file_ops::stem_range(&name, false);
+            let tag: String = version
+                .version_id
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .take(8)
+                .collect();
+            let name = format!("{} ({tag}){}", &name[range.clone()], &name[range.end..]);
+            let name = crate::file_ops::unique_name(&name, false, |candidate| {
+                std::fs::symlink_metadata(folder.join(candidate)).is_ok()
+            });
+            let result = requests
+                .download_version(
+                    object,
+                    version.version_id.clone(),
+                    folder.join(&name),
+                    version.size.unwrap_or(0),
+                )
+                .await;
+            let _ = view.update_in(cx, |view, window, cx| {
+                match result {
+                    Ok(_) => window.push_notification(
+                        (
+                            NotificationType::Success,
+                            SharedString::from(
+                                t!("versions.download_queued", name = name.as_str()).into_owned(),
+                            ),
+                        ),
+                        cx,
+                    ),
+                    Err(error) => view.error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn render_version(
         &self,
         index: usize,
@@ -139,7 +277,14 @@ impl VersionsView {
     ) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let id = version.version_id.clone();
-        let confirming = self.confirming.as_deref() == Some(id.as_str());
+        let confirming = self
+            .confirming
+            .as_ref()
+            .filter(|(_, confirming)| *confirming == id)
+            .map(|(what, _)| *what);
+        let deletable = can_delete_version(version.is_latest, version.is_delete_marker)
+            && self.current_version().is_some();
+        let downloadable = can_download_version(version.is_delete_marker);
         let status = self.versioning.as_deref().unwrap_or_default();
         let restorable = can_restore(version.is_latest, version.is_delete_marker, status)
             && self.current_version().is_some();
@@ -192,7 +337,19 @@ impl VersionsView {
                                 .child(t!("versions.delete_marker").into_owned()),
                         )
                     })
-                    .when(restorable && !confirming, |this| {
+                    .when(downloadable && confirming.is_none(), |this| {
+                        let version = version.clone();
+                        this.child(
+                            Button::new(("download-version", index))
+                                .ghost()
+                                .xsmall()
+                                .label(t!("details.download").into_owned())
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    view.download(version.clone(), window, cx);
+                                })),
+                        )
+                    })
+                    .when(restorable && confirming.is_none(), |this| {
                         let id = id.clone();
                         this.child(
                             Button::new(("restore", index))
@@ -201,13 +358,71 @@ impl VersionsView {
                                 .label(t!("versions.restore_ellipsis").into_owned())
                                 .disabled(self.restoring)
                                 .on_click(cx.listener(move |view, _, _, cx| {
-                                    view.confirming = Some(id.clone());
+                                    view.confirming = Some((Confirm::Restore, id.clone()));
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .when(deletable && confirming.is_none(), |this| {
+                        let id = id.clone();
+                        this.child(
+                            Button::new(("delete-version", index))
+                                .ghost()
+                                .xsmall()
+                                .label(t!("action.delete_ellipsis").into_owned())
+                                .disabled(self.restoring)
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.confirming = Some((Confirm::Delete, id.clone()));
                                     cx.notify();
                                 })),
                         )
                     }),
             )
-            .when(confirming, |this| {
+            .when(confirming == Some(Confirm::Delete), |this| {
+                let note = version_delete_note(&self.versions, index);
+                let version = version.clone();
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .text_sm()
+                                .child(t!("versions.delete_question").into_owned())
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .whitespace_normal()
+                                        .child(t!(note).into_owned()),
+                                ),
+                        )
+                        .child(
+                            Button::new(("cancel-delete", index))
+                                .outline()
+                                .small()
+                                .label(t!("action.cancel").into_owned())
+                                .disabled(self.restoring)
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.confirming = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new(("confirm-delete", index))
+                                .danger()
+                                .small()
+                                .label(t!("versions.delete").into_owned())
+                                .loading(self.restoring)
+                                .disabled(self.restoring)
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    view.delete(version.clone(), window, cx);
+                                })),
+                        ),
+                )
+            })
+            .when(confirming == Some(Confirm::Restore), |this| {
                 this.child(
                     h_flex()
                         .w_full()

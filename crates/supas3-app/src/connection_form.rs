@@ -2,6 +2,7 @@
 //! The form for adding or editing a connection.
 
 use crate::app_state::AppBackend;
+use crate::aws_profiles::{self, LocalProfile};
 use crate::connection::{Draft, Problem, Service};
 use crate::error_details::ErrorDetails;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -44,6 +45,13 @@ pub struct ConnectionForm {
     access_key: Entity<InputState>,
     secret_key: Entity<InputState>,
     session_token: Entity<InputState>,
+    /// For AWS: typed keys, or one of the profiles below.
+    credential_select: Entity<SelectState<Vec<SharedString>>>,
+    /// The profiles of this computer's AWS configuration, `None` when it has
+    /// none; the usable ones follow "typed keys" in the select.
+    local_profiles: Option<Vec<LocalProfile>>,
+    /// The profile chosen in the select, if any.
+    aws_profile: Option<String>,
     /// Shown once the user has tried to save or test.
     problems: Vec<Problem>,
     check: Check,
@@ -83,6 +91,69 @@ impl ConnectionForm {
             .position(|service| *service == draft.service)
             .map(|row| IndexPath::default().row(row));
         let service_select = cx.new(|cx| SelectState::new(services, selected, window, cx));
+
+        let local_profiles = aws_profiles::discover();
+        // The usable profiles, and the one being edited even if it is gone
+        // from the files, so the form shows what the connection uses.
+        let mut usable: Vec<String> = local_profiles
+            .iter()
+            .flatten()
+            .filter(|profile| profile.unusable.is_none())
+            .map(|profile| profile.name.clone())
+            .collect();
+        if let Some(name) = &draft.aws_profile {
+            if !usable.contains(name) {
+                usable.push(name.clone());
+            }
+        }
+        let mut sources: Vec<SharedString> = vec![t!("form.credentials_typed").into_owned().into()];
+        sources.extend(usable.iter().map(|name| {
+            SharedString::from(t!("form.credentials_profile", name = name).into_owned())
+        }));
+        let selected_source = draft
+            .aws_profile
+            .as_ref()
+            .and_then(|name| usable.iter().position(|usable| usable == name))
+            .map_or(0, |index| index + 1);
+        let credential_select = cx.new(|cx| {
+            SelectState::new(
+                sources,
+                Some(IndexPath::default().row(selected_source)),
+                window,
+                cx,
+            )
+        });
+        cx.subscribe_in(
+            &credential_select,
+            window,
+            move |form, select, _: &SelectEvent<Vec<SharedString>>, window, cx| {
+                let row = select.read(cx).selected_index(cx).map(|index| index.row);
+                form.aws_profile = row
+                    .and_then(|row| row.checked_sub(1))
+                    .and_then(|index| usable.get(index).cloned());
+                form.problems.clear();
+                // Fill what the profile tells, without replacing anything typed.
+                if let Some(name) = form.aws_profile.clone() {
+                    let region = form
+                        .local_profiles
+                        .iter()
+                        .flatten()
+                        .find(|profile| profile.name == name)
+                        .and_then(|profile| profile.region.clone());
+                    for (input, value) in [(&form.name, Some(name)), (&form.region, region)] {
+                        if let Some(value) = value {
+                            input.update(cx, |input, cx| {
+                                if input.value().trim().is_empty() {
+                                    input.set_value(value, window, cx);
+                                }
+                            });
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        )
+        .detach();
         cx.subscribe(
             &service_select,
             |form, select, _: &SelectEvent<Vec<SharedString>>, cx| {
@@ -106,6 +177,9 @@ impl ConnectionForm {
             access_key,
             secret_key,
             session_token,
+            credential_select,
+            local_profiles,
+            aws_profile: draft.aws_profile.clone(),
             existing,
             problems: Vec::new(),
             check: Check::NotRun,
@@ -125,6 +199,60 @@ impl ConnectionForm {
             secret_key: text(&self.secret_key),
             session_token: text(&self.session_token),
             bucket: text(&self.bucket),
+            aws_profile: self.aws_profile.clone(),
+        }
+    }
+
+    /// What the credential select's help says: where profiles come from,
+    /// and which were left out and why.
+    fn credentials_help(&self) -> String {
+        // The profile this connection uses, if it is no longer usable.
+        if let Some(name) = &self.aws_profile {
+            let found = self
+                .local_profiles
+                .iter()
+                .flatten()
+                .find(|profile| &profile.name == name);
+            match found {
+                None => return t!("form.aws_profile_gone", name = name).into_owned(),
+                Some(profile) => {
+                    if let Some(why) = profile.unusable {
+                        return t!(
+                            "form.aws_profile_unusable",
+                            name = name,
+                            why = t!(why.message_key())
+                        )
+                        .into_owned();
+                    }
+                }
+            }
+        }
+        let Some(profiles) = &self.local_profiles else {
+            return t!("form.aws_config_missing").into_owned();
+        };
+        let left_out: Vec<String> = profiles
+            .iter()
+            .filter_map(|profile| {
+                let why = profile.unusable?;
+                Some(
+                    t!(
+                        "form.aws_profile_left_out",
+                        name = profile.name,
+                        why = t!(why.message_key())
+                    )
+                    .into_owned(),
+                )
+            })
+            .collect();
+        if left_out.is_empty() {
+            t!("form.aws_config_help").into_owned()
+        } else {
+            let separator = t!("form.list_separator");
+            t!(
+                "form.aws_config_left_out",
+                profiles = left_out.join(&separator)
+            )
+            .into_owned()
         }
     }
 
@@ -232,6 +360,7 @@ impl Render for ConnectionForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let draft = self.draft(cx);
         let is_aws = self.service == Service::Aws;
+        let typed_keys = !draft.uses_aws_profile();
         let endpoint_help = match self.service.endpoint_for(&draft.region) {
             Some(endpoint) => Some(t!("form.endpoint_default", endpoint = endpoint).into_owned()),
             None if self.service == Service::Generic => None,
@@ -316,20 +445,33 @@ impl Render for ConnectionForm {
                                 )
                                 .visible(!is_aws),
                             )
-                            .child(self.field(
-                                "form.access_key",
-                                &self.access_key,
-                                None,
-                                &[Problem::AccessKeyMissing],
-                                cx,
-                            ))
-                            .child(self.field(
-                                "form.secret_key",
-                                &self.secret_key,
-                                secret_help,
-                                &[Problem::SecretKeyMissing],
-                                cx,
-                            ))
+                            .child(
+                                Field::new()
+                                    .label(t!("form.credentials").into_owned())
+                                    .child(Select::new(&self.credential_select))
+                                    .description(self.credentials_help())
+                                    .visible(is_aws),
+                            )
+                            .child(
+                                self.field(
+                                    "form.access_key",
+                                    &self.access_key,
+                                    None,
+                                    &[Problem::AccessKeyMissing],
+                                    cx,
+                                )
+                                .visible(typed_keys),
+                            )
+                            .child(
+                                self.field(
+                                    "form.secret_key",
+                                    &self.secret_key,
+                                    secret_help,
+                                    &[Problem::SecretKeyMissing],
+                                    cx,
+                                )
+                                .visible(typed_keys),
+                            )
                             .child(
                                 self.field(
                                     "form.session_token",
@@ -344,7 +486,8 @@ impl Render for ConnectionForm {
                                     ),
                                     &[],
                                     cx,
-                                ),
+                                )
+                                .visible(typed_keys),
                             )
                             .child(self.field(
                                 "form.bucket",
