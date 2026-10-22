@@ -72,6 +72,27 @@ pub fn file_of(source: &Location, entry: &Entry) -> Option<FileRef> {
     }
 }
 
+/// What "copy address" puts on the clipboard for a row: `s3://bucket/key`
+/// for storage, with a trailing `/` for a bucket or folder, and the full
+/// path on this computer.
+pub fn address_of(source: &Location, entry: &Entry) -> Option<String> {
+    match (source, entry.kind) {
+        (Location::Local(folder), _) => Some(folder.join(&entry.name).display().to_string()),
+        (Location::Buckets { .. }, EntryKind::Bucket) => Some(format!("s3://{}/", entry.name)),
+        (Location::Objects { bucket, prefix, .. }, EntryKind::Folder) => {
+            let folder = entry
+                .prefix
+                .clone()
+                .unwrap_or_else(|| format!("{prefix}{}/", entry.name));
+            Some(format!("s3://{bucket}/{folder}"))
+        }
+        (Location::Objects { .. }, EntryKind::File) => {
+            file_of(source, entry).map(|file| file.display())
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageKind {
     Png,
@@ -203,6 +224,223 @@ pub fn needs_restore(storage_class: Option<&str>) -> bool {
         let class = class.to_ascii_uppercase();
         class == "GLACIER" || class.contains("ARCHIVE")
     })
+}
+
+/// User metadata the dialog does not let the user change: supaS3's record
+/// of the content's hash, and on IDrive e2 the two entries e2 sets itself.
+pub fn fixed_metadata_key(key: &str, idrive_e2: bool) -> bool {
+    key.eq_ignore_ascii_case("supas3-sha256")
+        || (idrive_e2 && (key.eq_ignore_ascii_case("e2iid") || key.eq_ignore_ascii_case("erid")))
+}
+
+/// The most user metadata an object may carry, keys and values together.
+pub const METADATA_LIMIT: usize = 2048;
+
+/// Why the metadata cannot be saved; `row` counts the editable rows from 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataProblem {
+    /// Letters, digits and `-` only.
+    Key {
+        row: usize,
+    },
+    Duplicate {
+        row: usize,
+    },
+    /// Kept by supaS3 or the service.
+    Fixed {
+        row: usize,
+    },
+    /// Printable ASCII only.
+    Value {
+        row: usize,
+    },
+    TooLarge,
+}
+
+impl MetadataProblem {
+    pub fn message_key(self) -> &'static str {
+        match self {
+            Self::Key { .. } => "metadata.key_invalid",
+            Self::Duplicate { .. } => "metadata.key_duplicate",
+            Self::Fixed { .. } => "metadata.key_fixed",
+            Self::Value { .. } => "metadata.value_invalid",
+            Self::TooLarge => "metadata.too_large",
+        }
+    }
+
+    pub fn row(self) -> Option<usize> {
+        match self {
+            Self::Key { row }
+            | Self::Duplicate { row }
+            | Self::Fixed { row }
+            | Self::Value { row } => Some(row),
+            Self::TooLarge => None,
+        }
+    }
+}
+
+/// The metadata to save from the rows typed (empty rows are dropped), with
+/// the fixed entries of `original` kept as they are. A row exactly as it
+/// was is kept without checks, so entries another tool wrote in a form not
+/// accepted here are not lost by editing others.
+pub fn metadata_to_save(
+    rows: &[(String, String)],
+    original: &std::collections::HashMap<String, String>,
+    idrive_e2: bool,
+) -> Result<std::collections::HashMap<String, String>, MetadataProblem> {
+    let mut saved: std::collections::HashMap<String, String> = original
+        .iter()
+        .filter(|(key, _)| fixed_metadata_key(key, idrive_e2))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    for (row, (key, value)) in rows.iter().enumerate() {
+        let (key, value) = (key.trim(), value.as_str());
+        if key.is_empty() && value.is_empty() {
+            continue;
+        }
+        let unchanged = original.get(key).is_some_and(|was| was == value);
+        // A fixed entry given back as it was is already kept.
+        if unchanged && fixed_metadata_key(key, idrive_e2) {
+            continue;
+        }
+        let key = if unchanged {
+            key.to_string()
+        } else {
+            if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                return Err(MetadataProblem::Key { row });
+            }
+            if fixed_metadata_key(key, idrive_e2) {
+                return Err(MetadataProblem::Fixed { row });
+            }
+            if !value.chars().all(|c| (' '..='~').contains(&c)) {
+                return Err(MetadataProblem::Value { row });
+            }
+            // Services store keys in lower case.
+            key.to_ascii_lowercase()
+        };
+        if saved.insert(key, value.to_string()).is_some() {
+            return Err(MetadataProblem::Duplicate { row });
+        }
+    }
+    let size: usize = saved
+        .iter()
+        .map(|(key, value)| key.len() + value.len())
+        .sum();
+    if size > METADATA_LIMIT {
+        return Err(MetadataProblem::TooLarge);
+    }
+    Ok(saved)
+}
+
+/// The most addresses imported at once, as the backend allows.
+pub const IMPORT_LIMIT: usize = 500;
+
+/// One address to import, with the object name taken from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportLine {
+    pub url: String,
+    pub name: Result<String, ImportProblem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportProblem {
+    /// Not an http or https address.
+    NotWeb,
+    /// The address names no file to call the object.
+    NoName,
+    /// Another line gives the same name.
+    Duplicate,
+    /// A user name or password in the address, which is not sent.
+    Credentials,
+}
+
+impl ImportProblem {
+    pub fn message_key(self) -> &'static str {
+        match self {
+            Self::NotWeb => "import.not_web",
+            Self::NoName => "import.no_name",
+            Self::Duplicate => "import.duplicate",
+            Self::Credentials => "import.credentials",
+        }
+    }
+}
+
+/// `%XX` sequences decoded, or `None` when they do not make UTF-8 text.
+fn percent_decoded(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = text.get(index + 1..index + 3)?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// The addresses typed, one a line (blank lines skipped), each with the
+/// name of the object it becomes: the last segment of its path, decoded.
+pub fn import_lines(text: &str) -> Vec<ImportLine> {
+    let mut lines: Vec<ImportLine> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            // The fragment is never sent to the server.
+            let url = line.split('#').next().unwrap_or_default();
+            let lower = url.to_ascii_lowercase();
+            let rest = ["https://", "http://"]
+                .iter()
+                .find(|scheme| lower.starts_with(*scheme))
+                .map(|scheme| &url[scheme.len()..]);
+            let name = match rest {
+                None => Err(ImportProblem::NotWeb),
+                Some(rest)
+                    if rest
+                        .split(['/', '?'])
+                        .next()
+                        .is_some_and(|host| host.contains('@')) =>
+                {
+                    Err(ImportProblem::Credentials)
+                }
+                Some(rest) => {
+                    let path = rest.split('?').next().unwrap_or_default();
+                    match path.split_once('/') {
+                        None => Err(ImportProblem::NoName),
+                        Some((_, path)) => {
+                            percent_decoded(path.rsplit('/').next().unwrap_or_default())
+                                .filter(|name| {
+                                    !name.is_empty()
+                                        && name != "."
+                                        && name != ".."
+                                        && !name.contains(['/', '\\'])
+                                        && !name.chars().any(char::is_control)
+                                })
+                                .ok_or(ImportProblem::NoName)
+                        }
+                    }
+                }
+            };
+            ImportLine {
+                url: url.to_string(),
+                name,
+            }
+        })
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    for line in &mut lines {
+        if let Ok(name) = &line.name {
+            if !seen.insert(name.clone()) {
+                line.name = Err(ImportProblem::Duplicate);
+            }
+        }
+    }
+    lines
 }
 
 /// Who may read an object, as far as the two choices offered here go.
@@ -972,5 +1210,156 @@ mod tests {
             assert!(!needs_restore(Some(class)), "{class}");
         }
         assert!(!needs_restore(None));
+    }
+
+    #[test]
+    fn addresses_name_what_a_row_is() {
+        let entry = |name: &str, kind: EntryKind, prefix: Option<&str>| Entry {
+            name: name.into(),
+            kind,
+            size: None,
+            modified: None,
+            prefix: prefix.map(Into::into),
+        };
+        let objects = Location::objects("p", "bucket", "a/");
+        assert_eq!(
+            address_of(&objects, &entry("f.txt", EntryKind::File, None)).as_deref(),
+            Some("s3://bucket/a/f.txt")
+        );
+        // A folder's own prefix is kept, empty segments included.
+        assert_eq!(
+            address_of(&objects, &entry("b", EntryKind::Folder, Some("a//b/"))).as_deref(),
+            Some("s3://bucket/a//b/")
+        );
+        assert_eq!(
+            address_of(
+                &Location::Buckets {
+                    profile_id: "p".into()
+                },
+                &entry("bucket", EntryKind::Bucket, None)
+            )
+            .as_deref(),
+            Some("s3://bucket/")
+        );
+        let local = Location::Local(std::path::PathBuf::from("/home/me"));
+        assert_eq!(
+            address_of(&local, &entry("notes.md", EntryKind::File, None)),
+            Some(
+                std::path::Path::new("/home/me")
+                    .join("notes.md")
+                    .display()
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn metadata_is_checked_only_where_it_was_changed() {
+        let original: std::collections::HashMap<String, String> = [
+            ("supas3-sha256", "abc"),
+            ("old_style", "caf\u{e9}"),
+            ("e2iid", "1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let rows = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+
+        // An entry left as it was is kept even though new ones like it are
+        // refused; fixed entries come back whatever the rows say.
+        let saved = metadata_to_save(
+            &rows(&[("old_style", "caf\u{e9}"), ("Owner", "ops"), ("", "")]),
+            &original,
+            true,
+        )
+        .unwrap();
+        assert_eq!(saved.len(), 4);
+        assert_eq!(saved["owner"], "ops");
+        assert_eq!(saved["supas3-sha256"], "abc");
+        assert_eq!(saved["e2iid"], "1");
+        // Fixed entries given back unchanged are no duplicates.
+        let again = metadata_to_save(
+            &rows(&[("e2iid", "1"), ("supas3-sha256", "abc")]),
+            &original,
+            true,
+        )
+        .unwrap();
+        assert_eq!(again.len(), 2);
+        // Elsewhere e2's names are ordinary entries, left out when removed.
+        let saved = metadata_to_save(&rows(&[]), &original, false).unwrap();
+        assert_eq!(saved.keys().collect::<Vec<_>>(), ["supas3-sha256"]);
+
+        let problem = |pairs: &[(&str, &str)]| metadata_to_save(&rows(pairs), &original, true);
+        assert_eq!(
+            problem(&[("a b", "x")]),
+            Err(MetadataProblem::Key { row: 0 })
+        );
+        assert_eq!(
+            problem(&[("new_style", "x")]),
+            Err(MetadataProblem::Key { row: 0 })
+        );
+        assert_eq!(
+            problem(&[("ok", "x"), ("OK", "y")]),
+            Err(MetadataProblem::Duplicate { row: 1 })
+        );
+        assert_eq!(
+            problem(&[("supas3-sha256", "x")]),
+            Err(MetadataProblem::Fixed { row: 0 })
+        );
+        assert_eq!(
+            problem(&[("erid", "x")]),
+            Err(MetadataProblem::Fixed { row: 0 })
+        );
+        assert_eq!(
+            problem(&[("note", "caf\u{e9}")]),
+            Err(MetadataProblem::Value { row: 0 })
+        );
+        assert_eq!(
+            problem(&[("note", &"x".repeat(2040))]),
+            Err(MetadataProblem::TooLarge)
+        );
+    }
+
+    #[test]
+    fn imported_objects_are_named_after_their_addresses() {
+        let lines = import_lines(
+            "https://example.com/files/report%20final.pdf?token=abc\n\n\
+             http://example.com/a/b/photo.jpg#top\n\
+             ftp://example.com/x.txt\n\
+             https://example.com/\n\
+             https://example.com\n\
+             https://other.example/dir/photo.jpg\n\
+             https://example.com/a%2Fb\n\
+             https://example.com/%E6%96%87%E4%BB%B6.txt\n\
+             HTTPS://EXAMPLE.COM/UPPER.TXT\n\
+             https://user:secret@example.com/private.txt\n",
+        );
+        let names: Vec<_> = lines.iter().map(|line| line.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![
+                Ok("report final.pdf".to_string()),
+                Ok("photo.jpg".to_string()),
+                Err(ImportProblem::NotWeb),
+                Err(ImportProblem::NoName),
+                Err(ImportProblem::NoName),
+                Err(ImportProblem::Duplicate),
+                Err(ImportProblem::NoName),
+                Ok("文件.txt".to_string()),
+                Ok("UPPER.TXT".to_string()),
+                Err(ImportProblem::Credentials),
+            ]
+        );
+        // What is sent leaves the fragment out.
+        assert_eq!(lines[1].url, "http://example.com/a/b/photo.jpg");
+        assert_eq!(
+            lines[0].url,
+            "https://example.com/files/report%20final.pdf?token=abc"
+        );
     }
 }

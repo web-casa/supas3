@@ -38,6 +38,9 @@ pub enum PaneEvent {
     CopyRequested(DraggedEntries),
     /// Delete these rows, read from the given location.
     DeleteRequested(DraggedEntries),
+    /// Put these rows' addresses on the clipboard, or their plain web
+    /// addresses when `public`.
+    AddressesRequested { rows: DraggedEntries, public: bool },
     /// Files were dragged in from outside the application.
     FilesDropped(Vec<std::path::PathBuf>),
     /// Rows were dragged in from a pane; `true` when they are to be moved.
@@ -48,6 +51,8 @@ pub enum PaneEvent {
     RowActionRequested(RowAction, Location, Entry),
     /// Sync the local folder this pane shows to the other pane.
     SyncRequested(Location),
+    /// Import web addresses into this location of a bucket.
+    ImportRequested(Location),
     /// The tabs or what they show changed; the layout is worth saving.
     Moved,
     /// Create a folder in the location shown.
@@ -361,6 +366,9 @@ impl Pane {
             RowCommand::Copy(rows) => cx.emit(PaneEvent::CopyRequested(rows)),
             RowCommand::Move(rows) => cx.emit(PaneEvent::MoveRequested(rows)),
             RowCommand::Delete(rows) => cx.emit(PaneEvent::DeleteRequested(rows)),
+            RowCommand::CopyAddresses { rows, public } => {
+                cx.emit(PaneEvent::AddressesRequested { rows, public })
+            }
             RowCommand::One(action, location, entry) => {
                 cx.emit(PaneEvent::RowActionRequested(action, location, entry));
             }
@@ -899,6 +907,16 @@ impl Pane {
         cx.notify();
     }
 
+    /// How many rows the tab in front shows, out of how many it loaded.
+    #[cfg(test)]
+    pub fn shown_count(&self, cx: &App) -> (usize, usize) {
+        self.tabs[self.active]
+            .table
+            .read(cx)
+            .delegate()
+            .shown_count()
+    }
+
     /// Shows the filter bar and puts the cursor in it.
     pub fn open_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.rows_in_front() {
@@ -1430,6 +1448,22 @@ impl Pane {
                         })),
                 )
             })
+            .when(
+                matches!(tab.history.current(), Location::Objects { .. }),
+                |this| {
+                    this.child(
+                        Button::new(self.id("import"))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Globe)
+                            .tooltip(t!("import.button").into_owned())
+                            .on_click(cx.listener(|pane, _, _, cx| {
+                                let location = pane.location().clone();
+                                cx.emit(PaneEvent::ImportRequested(location));
+                            })),
+                    )
+                },
+            )
             .when(is_local, |this| {
                 this.child(
                     Button::new(self.id("sync"))

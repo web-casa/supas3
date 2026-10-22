@@ -16,7 +16,9 @@ A native desktop application for browsing object storage and moving files betwee
 - Delete files and folders, after a confirmation. On this computer they go to the recycle bin.
 - Sort by name, size or date, filter the rows shown, and search names below a location in a bucket.
 - Open text files of up to 8 MiB in a tab to read or edit them, and view PNG, JPEG and simple WebP images with zoom. Quitting or closing the window asks about unsaved edits.
-- Change an object's Content-Type, and see or change whether it is private or public, from the details panel.
+- Change an object's Content-Type and user metadata, and see or change whether it is private or public, from the details panel; make everything in a folder private or public at once.
+- Import files into a bucket from web addresses.
+- Copy the address of files, folders and buckets, or the public web address of files.
 - Set how many transfers run at once and a speed limit for each transfer.
 - Make a signed link to an object that expires after an hour, a day or a week.
 - Show an object's version history, download a chosen version, and restore an older version or delete a version for good on buckets with versioning turned on.
@@ -48,14 +50,14 @@ Download the file for your computer from the [releases page](https://github.com/
 | macOS, Apple Silicon | `supas3-<version>-macos-arm64.dmg` |
 | Windows, x64 | `supas3-<version>-windows-x64-setup.exe`, or the `.zip` to run without installing |
 | Windows, ARM64 | `supas3-<version>-windows-arm64-setup.exe`, or the `.zip` |
-| Linux, x64 | `supas3_<version>_amd64.deb`, or the `.tar.gz` |
-| Linux, ARM64 | `supas3_<version>_arm64.deb`, or the `.tar.gz` |
+| Linux, x64 | `supas3_<version>_amd64.deb`, `supas3-<version>-1.x86_64.rpm`, `supas3-<version>-linux-x64.AppImage`, or the `.tar.gz` |
+| Linux, ARM64 | `supas3_<version>_arm64.deb`, `supas3-<version>-1.aarch64.rpm`, `supas3-<version>-linux-arm64.AppImage`, or the `.tar.gz` |
 
 The packages are not signed with a developer certificate.
 
 - **macOS:** open the disk image and drag supaS3 to Applications. The first time, macOS refuses to open it; open *System Settings → Privacy & Security* and choose *Open Anyway*, or run `xattr -dr com.apple.quarantine /Applications/supaS3.app`.
 - **Windows:** SmartScreen may warn about an unrecognized app; choose *More info → Run anyway*. The installer installs for the current user and needs no administrator rights.
-- **Linux:** `sudo apt install ./supas3_<version>_<arch>.deb`. The application needs a working Vulkan driver; on machines without a GPU, `mesa-vulkan-drivers` provides one.
+- **Linux:** on Debian and Ubuntu, `sudo apt install ./supas3_<version>_<arch>.deb`; on Fedora and similar, `sudo dnf install ./supas3-<version>-1.<arch>.rpm`; an AppImage runs once made executable (`chmod +x supas3-*.AppImage`). Every package needs glibc 2.39 or later (for example Ubuntu 24.04, Debian 13, Fedora 40 and later). The application needs a working Vulkan driver; on machines without a GPU, `mesa-vulkan-drivers` provides one.
 
 Access keys are kept in the system's credential store (Keychain, Credential Manager, or the Secret Service on Linux). Where none is available, a key is kept only until the application closes.
 

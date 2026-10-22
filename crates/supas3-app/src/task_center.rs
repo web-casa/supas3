@@ -168,16 +168,24 @@ impl TaskCenter {
             let result = match action {
                 TaskAction::Cancel => requests.cancel_transfer(id.clone()).await.map(|_| true),
                 // `None`: the backend has nothing to retry it with.
-                TaskAction::Retry => requests
-                    .retry_transfer(id.clone())
-                    .await
-                    .map(|retried| retried.is_some()),
+                TaskAction::Retry => match requests.retry_transfer(id.clone()).await {
+                    // A download from an earlier run is queued afresh and
+                    // its old record dropped; its row goes too.
+                    Ok(Some(_)) => {
+                        let gone = matches!(requests.transfer_job(id.clone()).await, Ok(None));
+                        Ok(!gone)
+                    }
+                    Ok(None) => Err(t!("tasks.cannot_retry").into_owned()),
+                    Err(error) => Err(error),
+                },
                 TaskAction::Remove => requests.remove_transfer(id.clone()).await.map(|_| true),
             };
             let _ = center.update(cx, |center, cx| {
                 match result {
                     Ok(_) if action == TaskAction::Remove => center.tasks.remove(&id),
                     Ok(true) => {}
+                    // Retried as a new transfer, whose own row follows.
+                    Ok(false) if action == TaskAction::Retry => center.tasks.remove(&id),
                     Ok(false) => center.error = Some(t!("tasks.cannot_retry").into_owned()),
                     Err(error) => center.error = Some(error),
                 }
@@ -364,6 +372,7 @@ impl TaskCenter {
             TaskKind::LocalCopy => (IconName::Copy, t!("tasks.local_copy")),
             TaskKind::Move => (IconName::ArrowRight, t!("tasks.move")),
             TaskKind::Rename => (IconName::Replace, t!("tasks.rename")),
+            TaskKind::Access => (IconName::Settings, t!("tasks.access")),
         };
         let (state_text, danger) = match &task.state {
             TaskState::Queued => (t!("tasks.state_queued").into_owned(), false),

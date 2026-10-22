@@ -44,11 +44,17 @@ try {
     # The newest one found: an upgrade may leave an older one on PATH. The
     # installations are listed in the registry; ISCC.exe on PATH may be a
     # Chocolatey shim, which reports no version of its own.
+    # ISCC.exe itself carries no version; the registry lists each
+    # installation with its version.
     $uninstall = 'Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup *_is1'
-    $candidates = @(Get-ItemProperty -ErrorAction SilentlyContinue `
+    $registered = @{}
+    Get-ItemProperty -ErrorAction SilentlyContinue `
             "HKLM:\SOFTWARE\WOW6432Node\$uninstall", "HKLM:\SOFTWARE\$uninstall", "HKCU:\Software\$uninstall" |
-        Where-Object { $_.InstallLocation } |
-        ForEach-Object { Join-Path $_.InstallLocation 'ISCC.exe' })
+        Where-Object { $_.InstallLocation -and $_.DisplayVersion } |
+        ForEach-Object {
+            $registered[(Join-Path $_.InstallLocation 'ISCC.exe')] = $_.DisplayVersion
+        }
+    $candidates = @($registered.Keys)
     $candidates += foreach ($major in 7, 6) {
         (Join-Path ${env:ProgramFiles(x86)} "Inno Setup $major\ISCC.exe")
         (Join-Path $env:ProgramFiles "Inno Setup $major\ISCC.exe")
@@ -56,7 +62,9 @@ try {
     $candidates += @(Get-Command ISCC.exe -All -ErrorAction SilentlyContinue | ForEach-Object Source)
     $versionOf = {
         param($path)
-        $text = ((Get-Item $path).VersionInfo.ProductVersion) -replace '[^0-9.].*$', ''
+        $text = $registered[$path]
+        if (-not $text) { $text = (Get-Item $path).VersionInfo.ProductVersion }
+        $text = "$text" -replace '[^0-9.].*$', ''
         if ($text) { [version]$text } else { [version]'0.0' }
     }
     $iscc = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique |

@@ -1884,9 +1884,107 @@ pub async fn set_object_content_type(
     profile_state: State<'_, ProfileState>,
     s3_state: State<'_, S3State>,
 ) -> Result<()> {
+    replace_in_place(
+        bucket_name,
+        bucket_region,
+        key,
+        Some(content_type),
+        None,
+        None,
+        expected_etag,
+        expected_profile_id,
+        profile_state,
+        s3_state,
+    )
+    .await
+}
+
+/// An object's properties as the user saw them before changing some.
+#[derive(Debug, Clone)]
+pub struct SeenProperties {
+    pub etag: String,
+    pub content_type: Option<String>,
+    pub metadata: std::collections::HashMap<String, String>,
+    /// As [`ObjectMetadata::last_modified`] reports it.
+    pub last_modified: Option<String>,
+}
+
+impl SeenProperties {
+    /// Whether an object now has the Content-Type, user metadata and
+    /// modification time that were seen. No metadata and empty metadata
+    /// are the same.
+    pub fn matches(
+        &self,
+        content_type: Option<&str>,
+        metadata: Option<&std::collections::HashMap<String, String>>,
+        last_modified: Option<&str>,
+    ) -> bool {
+        content_type == self.content_type.as_deref()
+            && metadata.cloned().unwrap_or_default() == self.metadata
+            && last_modified == self.last_modified.as_deref()
+    }
+}
+
+/// The most user metadata an object may carry, keys and values together.
+const METADATA_LIMIT: usize = 2048;
+
+/// Replaces an object's user metadata, keeping everything else. Copying an
+/// object onto itself keeps its content and so its ETag: the metadata,
+/// Content-Type and modification time seen are compared as well, and the
+/// copy is made only if the object was not modified since.
+#[allow(clippy::too_many_arguments)]
+pub async fn set_object_metadata(
+    bucket_name: String,
+    bucket_region: Option<String>,
+    key: String,
+    metadata: std::collections::HashMap<String, String>,
+    seen: SeenProperties,
+    expected_profile_id: String,
+    profile_state: State<'_, ProfileState>,
+    s3_state: State<'_, S3State>,
+) -> Result<()> {
+    let size: usize = metadata.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if size > METADATA_LIMIT {
+        return Err(crate::error::AppError::ConfigError(format!(
+            "User metadata is limited to {METADATA_LIMIT} bytes of keys and values; this is {size}."
+        )));
+    }
+    let etag = seen.etag.clone();
+    replace_in_place(
+        bucket_name,
+        bucket_region,
+        key,
+        None,
+        Some(metadata),
+        Some(seen),
+        Some(etag),
+        expected_profile_id,
+        profile_state,
+        s3_state,
+    )
+    .await
+}
+
+/// Copies an object onto itself with a new Content-Type, new user metadata,
+/// or both; anything not given stays as it is.
+#[allow(clippy::too_many_arguments)]
+async fn replace_in_place(
+    bucket_name: String,
+    bucket_region: Option<String>,
+    key: String,
+    content_type: Option<String>,
+    metadata: Option<std::collections::HashMap<String, String>>,
+    seen: Option<SeenProperties>,
+    expected_etag: Option<String>,
+    expected_profile_id: String,
+    profile_state: State<'_, ProfileState>,
+    s3_state: State<'_, S3State>,
+) -> Result<()> {
     const MAX_SINGLE_COPY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
-    let content_type = crate::s3::validate_content_type(&content_type)?;
+    let content_type = content_type
+        .map(|value| crate::s3::validate_content_type(&value))
+        .transpose()?;
     let profile_manager = profile_state.read().await;
     let active_profile = profile_manager
         .get_active_profile()
@@ -1931,12 +2029,34 @@ pub async fn set_object_content_type(
             }
         })?;
 
-    if head.content_type() == Some(content_type.as_str()) {
+    if let Some(seen) = &seen {
+        let unchanged = seen.matches(
+            head.content_type.as_deref(),
+            head.metadata.as_ref(),
+            head.last_modified.map(|time| time.to_string()).as_deref(),
+        );
+        if !unchanged {
+            return Err(crate::error::AppError::S3Error(
+                "The object's properties changed since they were shown. Refresh and try again; nothing was changed."
+                    .to_string(),
+            ));
+        }
+    }
+    let same_type = content_type
+        .as_deref()
+        .is_none_or(|value| head.content_type() == Some(value));
+    let same_metadata = metadata
+        .as_ref()
+        .is_none_or(|value| *value == head.metadata.clone().unwrap_or_default());
+    if same_type && same_metadata {
         return Ok(());
     }
+    // Replacing metadata without a type would leave the service to pick one.
+    let content_type = content_type.or_else(|| head.content_type.clone());
+    let metadata = metadata.or_else(|| head.metadata.clone());
     if head.e_tag().is_none() {
         return Err(crate::error::AppError::S3Error(format!(
-            "Cannot safely update Content-Type because S3 did not return an ETag for s3://{bucket_name}/{key}"
+            "Cannot safely change the object's properties because S3 did not return an ETag for s3://{bucket_name}/{key}"
         )));
     }
 
@@ -1956,7 +2076,7 @@ pub async fn set_object_content_type(
         })?;
     if head.sse_customer_algorithm().is_some() {
         return Err(crate::error::AppError::ConfigError(
-            "Content-Type cannot be changed safely for an SSE-C encrypted object because its customer encryption key is not available"
+            "The properties of an SSE-C encrypted object cannot be changed safely because its customer encryption key is not available"
                 .to_string(),
         ));
     }
@@ -1979,21 +2099,24 @@ pub async fn set_object_content_type(
                 None
             } else {
                 return Err(crate::error::AppError::S3Error(format!(
-                    "Cannot safely update Content-Type because the current object ACL could not be read and preserved: {error_string}"
+                    "Cannot safely change the object's properties because the current object ACL could not be read and preserved: {error_string}"
                 )));
             }
         }
     };
 
     let copy_source = copy_source(&bucket_name, &key, head.version_id());
-    if object_size > MAX_SINGLE_COPY_SIZE && expected_etag.is_some() {
+    if object_size > MAX_SINGLE_COPY_SIZE && (expected_etag.is_some() || seen.is_some()) {
         // A multipart copy is completed without a condition, so a change
         // made just before could be overwritten.
         return Err(crate::error::AppError::ConfigError(
-            "Content-Type is changed here only for objects up to 5 GiB.".to_string(),
+            "Properties are changed here only for objects up to 5 GiB.".to_string(),
         ));
     }
     if object_size > MAX_SINGLE_COPY_SIZE {
+        let content_type = content_type.clone().ok_or_else(|| {
+            crate::error::AppError::S3Error("The object reports no Content-Type.".to_string())
+        })?;
         multipart_copy_content_type(
             &client,
             &bucket_name,
@@ -2015,15 +2138,17 @@ pub async fn set_object_content_type(
             .bucket(&bucket_name)
             .key(&key)
             .copy_source(&copy_source)
-            .content_type(&content_type)
+            .set_content_type(content_type.clone())
             .metadata_directive(MetadataDirective::Replace)
             .tagging_directive(TaggingDirective::Copy)
             .set_copy_source_if_match(expected_etag.clone().or_else(|| head.e_tag.clone()))
+            // A change of metadata alone keeps the ETag; the time tells.
+            .set_copy_source_if_unmodified_since(seen.as_ref().and(head.last_modified))
             .set_cache_control(head.cache_control.clone())
             .set_content_disposition(head.content_disposition.clone())
             .set_content_encoding(head.content_encoding.clone())
             .set_content_language(head.content_language.clone())
-            .set_metadata(head.metadata.clone())
+            .set_metadata(metadata.clone())
             .set_website_redirect_location(head.website_redirect_location.clone())
             .set_storage_class(head.storage_class.clone())
             .set_server_side_encryption(head.server_side_encryption.clone())
@@ -2060,12 +2185,12 @@ pub async fn set_object_content_type(
             // there is no ACL state to lose in that mode.
             build_request(None).send().await.map_err(|retry_error| {
                 crate::error::AppError::S3Error(format!(
-                    "Content-Type update failed after retrying without ACL headers: {retry_error}"
+                    "Changing the object's properties failed after retrying without ACL headers: {retry_error}"
                 ))
             })?;
         } else {
             return Err(crate::error::AppError::S3Error(format!(
-                "Content-Type update failed: {error_string}"
+                "Changing the object's properties failed: {error_string}"
             )));
         }
     }
@@ -2449,6 +2574,35 @@ pub async fn get_object_metadata(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn properties_seen_are_compared_whole() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("e2iid".to_string(), "1".to_string());
+        let seen = super::SeenProperties {
+            etag: "\"e\"".into(),
+            content_type: Some("text/plain".into()),
+            metadata: metadata.clone(),
+            last_modified: Some("2026-10-22T10:00:00Z".into()),
+        };
+        let now = Some("2026-10-22T10:00:00Z");
+        assert!(seen.matches(Some("text/plain"), Some(&metadata), now));
+        assert!(!seen.matches(Some("text/html"), Some(&metadata), now));
+        assert!(!seen.matches(Some("text/plain"), None, now));
+        assert!(!seen.matches(
+            Some("text/plain"),
+            Some(&metadata),
+            Some("2026-10-22T10:00:01Z")
+        ));
+        let bare = super::SeenProperties {
+            content_type: None,
+            metadata: Default::default(),
+            ..seen
+        };
+        // No metadata reported is the same as none seen.
+        assert!(bare.matches(None, None, now));
+        assert!(!bare.matches(Some("application/octet-stream"), None, now));
+    }
+
     use super::{
         classify_acl_error, copy_source, encode_object_tags, multipart_copy_content_type,
         quoted_acl_value,

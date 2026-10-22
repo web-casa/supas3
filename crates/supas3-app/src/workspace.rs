@@ -3,24 +3,27 @@
 
 use crate::app_jobs::{AppJobs, JobContext, JobError, JobLabel};
 use crate::app_state::{AppBackend, Connections};
-use crate::backend::default_config_dir;
+use crate::backend::{default_config_dir, Requests};
 use crate::conflicts::{conflicts, resolve, Choice, Existing};
 use crate::connection_form::{ConnectionForm, ConnectionFormEvent};
 use crate::content_type_view::{ContentTypeDialog, ContentTypeEvent};
 use crate::details_view::{ConnectionInfo, DetailsEvent, DetailsPanel};
-use crate::entries_table::RowAction;
+use crate::entries_table::{DraggedEntries, RowAction};
 use crate::file_ops::{
     check_local_name, check_object_name, folder_moves, stem_range, unique_name, FOLDER_RENAME_LIMIT,
 };
+use crate::folder_access::FOLDER_ACCESS_LIMIT;
 use crate::i18n;
+use crate::import_view::{ImportDialog, ImportEvent};
 use crate::listing::Entry;
 use crate::listing::EntryKind;
 use crate::local_copy;
 use crate::location::Location;
+use crate::metadata_view::{MetadataDialog, MetadataEvent};
 use crate::name_dialog::{NameDialog, NameDialogEvent};
 use crate::object_actions::{
-    access_of, brief_error, file_of, link_may_expire_early, plain_address_is_known, sync_pair,
-    Access, FileRef, Grant, ObjectRef,
+    access_of, address_of, brief_error, file_of, link_may_expire_early, plain_address_is_known,
+    sync_pair, Access, FileRef, Grant, ObjectRef,
 };
 use crate::object_view::{ObjectView, ObjectViewEvent};
 use crate::pane::{Pane, PaneEvent};
@@ -54,6 +57,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rust_i18n::t;
 use std::path::PathBuf;
+use supas3_core::commands::operations::SeenProperties;
 use supas3_core::credentials::Profile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -924,6 +928,9 @@ impl Workspace {
                 let target = self.pane(target_side).read(cx).location().clone();
                 self.start_copy(plan(&taken.source, &taken.entries, &target), window, cx);
             }
+            PaneEvent::AddressesRequested { rows, public } => {
+                self.copy_addresses(rows.clone(), *public, window, cx);
+            }
             PaneEvent::MoveRequested(taken) => {
                 let target = self.pane(Self::other(side)).read(cx).location().clone();
                 let planned = plan(&taken.source, &taken.entries, &target);
@@ -971,6 +978,7 @@ impl Workspace {
                 self.show_file(*action, source, entry, window, cx);
             }
             PaneEvent::SyncRequested(source) => self.show_sync(side, source, None, window, cx),
+            PaneEvent::ImportRequested(location) => self.show_import(location.clone(), window, cx),
             PaneEvent::SelectionChanged => {}
         }
     }
@@ -2128,6 +2136,26 @@ impl Workspace {
             DetailsEvent::Download(source, entry) => {
                 self.download(source.clone(), entry.clone(), window, cx);
             }
+            DetailsEvent::FolderAccess {
+                profile_id,
+                bucket,
+                prefix,
+                to,
+            } => {
+                let (profile_id, bucket, prefix) =
+                    (profile_id.clone(), bucket.clone(), prefix.clone());
+                self.confirm_folder_access(profile_id, bucket, prefix, *to, window, cx);
+            }
+            DetailsEvent::EditMetadata { object, seen } => {
+                self.show_metadata(object.clone(), seen.clone(), window, cx);
+            }
+            DetailsEvent::CopyAddress(source, entry) => {
+                let rows = DraggedEntries {
+                    source: source.clone(),
+                    entries: std::rc::Rc::new(vec![entry.clone()]),
+                };
+                self.copy_addresses(rows, false, window, cx);
+            }
             DetailsEvent::ChangeContentType {
                 object,
                 name,
@@ -2147,6 +2175,81 @@ impl Workspace {
                 self.confirm_access(object, *to, *current, etag, window, cx);
             }
         }
+    }
+
+    /// Puts the rows' addresses on the clipboard, one a line: where they
+    /// are, or for files in storage their plain web addresses.
+    fn copy_addresses(
+        &mut self,
+        rows: DraggedEntries,
+        public: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let done = |lines: Vec<String>, window: &mut Window, cx: &mut App| {
+            let count = lines.len();
+            cx.write_to_clipboard(ClipboardItem::new_string(lines.join("\n")));
+            let message = t!("address.copied", count = count).into_owned();
+            Self::notify(NotificationType::Success, message, window, cx);
+        };
+        if !public {
+            let lines: Vec<String> = rows
+                .entries
+                .iter()
+                .filter_map(|entry| address_of(&rows.source, entry))
+                .collect();
+            if !lines.is_empty() {
+                done(lines, window, cx);
+            }
+            return;
+        }
+        let Location::Objects {
+            profile_id,
+            bucket,
+            prefix,
+        } = rows.source.clone()
+        else {
+            return;
+        };
+        let keys: Vec<String> = rows
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::File)
+            .map(|entry| format!("{prefix}{}", entry.name))
+            .collect();
+        if keys.is_empty() {
+            let message = t!("address.files_only").into_owned();
+            Self::notify(NotificationType::Info, message, window, cx);
+            return;
+        }
+        let Some(requests) = AppBackend::requests(cx) else {
+            return;
+        };
+        let profile = self.connections.read(cx).get(&profile_id).cloned();
+        cx.spawn_in(window, async move |_, cx| {
+            // As in the share dialog: only where the plain address is known,
+            // not guessed for an endpoint taken from the environment.
+            let traits = requests.write_traits(profile_id.clone()).await.ok();
+            let known = match (&profile, traits) {
+                (Some(profile), Some(traits)) => {
+                    plain_address_is_known(profile, traits.custom_endpoint)
+                }
+                _ => false,
+            };
+            let result = if known {
+                requests.plain_links(profile_id, bucket, keys).await
+            } else {
+                Err(t!("address.unknown").into_owned())
+            };
+            let _ = cx.update(|window, cx| match result {
+                Ok(lines) => done(lines, window, cx),
+                Err(error) => {
+                    let message = t!("address.failed", detail = brief_error(&error)).into_owned();
+                    Self::notify(NotificationType::Error, message, window, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// An object was changed from the details panel: shows it anew, and
@@ -2196,7 +2299,7 @@ impl Workspace {
                         if error.contains("changed since it was shown") {
                             t!("content_type.changed").into_owned()
                         } else if error.contains("only for objects up to 5 GiB") {
-                            t!("content_type.too_large").into_owned()
+                            t!("properties.too_large").into_owned()
                         } else {
                             error
                         }
@@ -2214,6 +2317,366 @@ impl Workspace {
         .detach();
         let title: SharedString = t!("content_type.title", name = name).into_owned().into();
         let width = rems(30.).to_pixels(window.rem_size());
+        window.open_dialog(cx, move |modal, _, cx| {
+            let busy = dialog.read(cx).is_busy();
+            modal
+                .title(title.clone())
+                .width(width)
+                .keyboard(!busy)
+                .overlay_closable(!busy)
+                .close_button(!busy)
+                .on_ok(|_, _, _| false)
+                .child(dialog.clone())
+        });
+    }
+
+    /// Lists the objects under a folder, then asks whether to give each the
+    /// ACL `to`, saying how many there are and what it means.
+    fn confirm_folder_access(
+        &mut self,
+        profile_id: String,
+        bucket: String,
+        prefix: String,
+        to: Access,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(requests) = AppBackend::requests(cx) else {
+            return;
+        };
+        let Some(identity) = self
+            .connections
+            .read(cx)
+            .get(&profile_id)
+            .map(|profile| profile.cache_identity())
+        else {
+            return;
+        };
+        cx.spawn_in(window, async move |workspace, cx| {
+            let mut listed = requests
+                .list_keys(profile_id.clone(), bucket.clone(), prefix.clone())
+                .await;
+            // The first object tells whether the service lets ACLs be read
+            // and changed here at all.
+            if let Some(first) = listed.as_ref().ok().and_then(|keys| keys.first()) {
+                let object = ObjectRef {
+                    profile_id: profile_id.clone(),
+                    bucket: bucket.clone(),
+                    key: first.key.clone(),
+                };
+                match requests.object_permissions(object).await {
+                    Ok(permissions) if permissions.status == "available" => {}
+                    Ok(permissions) => {
+                        let key = match permissions.status.as_str() {
+                            "unsupported" => "access.unsupported",
+                            "access_denied" => "access.denied",
+                            _ => "access.unknown",
+                        };
+                        listed = Err(t!(key).into_owned());
+                    }
+                    Err(error) => listed = Err(error),
+                }
+            }
+            let _ = workspace.update_in(cx, |_, window, cx| {
+                let keys: Vec<String> = match listed {
+                    Ok(keys) => keys.into_iter().map(|listed| listed.key).collect(),
+                    Err(error) => {
+                        let message =
+                            t!("access.failed", detail = brief_error(&error)).into_owned();
+                        Self::notify(NotificationType::Error, message, window, cx);
+                        return;
+                    }
+                };
+                if keys.is_empty() || keys.len() > FOLDER_ACCESS_LIMIT {
+                    let message = if keys.is_empty() {
+                        t!("folder_access.empty").into_owned()
+                    } else {
+                        t!(
+                            "folder_access.too_many",
+                            count = keys.len(),
+                            limit = FOLDER_ACCESS_LIMIT
+                        )
+                        .into_owned()
+                    };
+                    Self::notify(NotificationType::Info, message, window, cx);
+                    return;
+                }
+                let address = format!("s3://{bucket}/{prefix}");
+                let mut lines = vec![
+                    t!("folder_access.count", count = keys.len()).into_owned(),
+                    t!(if to == Access::PublicRead {
+                        "access.public_body"
+                    } else {
+                        "access.private_body"
+                    })
+                    .into_owned(),
+                    t!("folder_access.replaced").into_owned(),
+                    t!("access.inherit_note").into_owned(),
+                ];
+                lines.dedup();
+                let (title, confirm): (SharedString, SharedString) = match to {
+                    Access::PublicRead => (
+                        t!("folder_access.public_title").into_owned().into(),
+                        t!("access.make_public").into_owned().into(),
+                    ),
+                    _ => (
+                        t!("folder_access.private_title").into_owned().into(),
+                        t!("access.make_private").into_owned().into(),
+                    ),
+                };
+                let this = cx.weak_entity();
+                window.open_dialog(cx, move |dialog, _, cx| {
+                    let muted = cx.theme().muted_foreground;
+                    let (this, keys, identity) = (this.clone(), keys.clone(), identity.clone());
+                    let (profile_id, bucket, prefix) =
+                        (profile_id.clone(), bucket.clone(), prefix.clone());
+                    dialog
+                        .title(title.clone())
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .child(div().text_xs().text_color(muted).child(address.clone()))
+                                .children(
+                                    lines.iter().map(|line| div().text_sm().child(line.clone())),
+                                ),
+                        )
+                        .footer(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new("cancel-folder-access")
+                                        .outline()
+                                        .label(t!("action.cancel").into_owned())
+                                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                                )
+                                .child(
+                                    Button::new("confirm-folder-access")
+                                        .primary()
+                                        .label(confirm.clone())
+                                        .on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            let job = (
+                                                profile_id.clone(),
+                                                bucket.clone(),
+                                                prefix.clone(),
+                                                keys.clone(),
+                                                identity.clone(),
+                                            );
+                                            let _ = this.update(cx, |workspace, cx| {
+                                                workspace.start_folder_access(job, to, window, cx);
+                                            });
+                                        }),
+                                ),
+                        )
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Gives each listed object the ACL `to`, as a job of the task center.
+    fn start_folder_access(
+        &mut self,
+        (profile_id, bucket, prefix, keys, identity): (String, String, String, Vec<String>, String),
+        to: Access,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(requests) = AppBackend::requests(cx) else {
+            return;
+        };
+        let label = JobLabel {
+            kind: TaskKind::Access,
+            name: prefix
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+            source: format!("s3://{bucket}/{prefix}"),
+            target: match to {
+                Access::PublicRead => t!("access.make_public").into_owned(),
+                _ => t!("access.make_private").into_owned(),
+            },
+        };
+        let total = keys.len() as u64;
+        cx.global::<AppJobs>().start(label, total, move |job| {
+            struct Storage<'a> {
+                requests: &'a Requests,
+                profile_id: String,
+                bucket: String,
+                to: Access,
+            }
+            impl crate::folder_access::AccessBackend for Storage<'_> {
+                fn set(&self, key: &str) -> Result<(), String> {
+                    let object = ObjectRef {
+                        profile_id: self.profile_id.clone(),
+                        bucket: self.bucket.clone(),
+                        key: key.to_string(),
+                    };
+                    self.requests
+                        .wait(self.requests.set_object_access(object, self.to))
+                }
+                fn identity(&self) -> Option<String> {
+                    let profiles = self.requests.wait(self.requests.profiles()).ok()?;
+                    profiles
+                        .iter()
+                        .find(|profile| profile.id == self.profile_id)
+                        .map(|profile| profile.cache_identity())
+                }
+            }
+            let storage = Storage {
+                requests: &requests,
+                profile_id,
+                bucket,
+                to,
+            };
+            let report = crate::folder_access::run(&keys, &identity, &storage, job);
+            crate::folder_access::outcome(&report, job.cancelled(), |report| {
+                t!(
+                    if report.connection_changed {
+                        "folder_access.stopped"
+                    } else {
+                        "folder_access.summary"
+                    },
+                    changed = report.changed,
+                    failed = report.failed,
+                    left = report.left,
+                    error = report
+                        .first_error
+                        .as_deref()
+                        .map(brief_error)
+                        .unwrap_or_default()
+                )
+                .into_owned()
+            })
+        });
+        Self::notify(
+            NotificationType::Info,
+            t!("folder_access.started").into_owned(),
+            window,
+            cx,
+        );
+    }
+
+    /// Asks for web addresses and queues their import into `location`.
+    fn show_import(&mut self, location: Location, window: &mut Window, cx: &mut Context<Self>) {
+        let Location::Objects {
+            profile_id,
+            bucket,
+            prefix,
+        } = location.clone()
+        else {
+            return;
+        };
+        let dialog = cx.new(|cx| ImportDialog::new(window, cx));
+        cx.subscribe_in(&dialog, window, move |_, dialog, event, window, cx| {
+            let ImportEvent::Submitted(items, max_bytes) = event;
+            let Some(requests) = AppBackend::requests(cx) else {
+                let message = t!("error.backend_stopped").into_owned();
+                dialog.update(cx, |dialog, cx| dialog.failed(message, cx));
+                return;
+            };
+            let (dialog, items, max_bytes) = (dialog.clone(), items.clone(), *max_bytes);
+            let (profile_id, bucket, prefix) = (profile_id.clone(), bucket.clone(), prefix.clone());
+            cx.spawn_in(window, async move |_, cx| {
+                let result = requests
+                    .import_urls(profile_id, bucket, prefix, items, max_bytes)
+                    .await;
+                let _ = cx.update(|window, cx| match result {
+                    Ok(count) => {
+                        window.close_dialog(cx);
+                        let message = t!("import.queued", count = count).into_owned();
+                        Self::notify(NotificationType::Info, message, window, cx);
+                    }
+                    Err(error) => dialog.update(cx, |dialog, cx| dialog.failed(error, cx)),
+                });
+            })
+            .detach();
+        })
+        .detach();
+        let title: SharedString = t!("import.title", place = self.describe(&location, cx))
+            .into_owned()
+            .into();
+        let width = rems(36.).to_pixels(window.rem_size());
+        window.open_dialog(cx, move |modal, _, cx| {
+            let busy = dialog.read(cx).is_busy();
+            modal
+                .title(title.clone())
+                .width(width)
+                .keyboard(!busy)
+                .overlay_closable(!busy)
+                .close_button(!busy)
+                .on_ok(|_, _, _| false)
+                .child(dialog.clone())
+        });
+    }
+
+    /// Edits an object's user metadata, only on the properties the panel
+    /// showed.
+    fn show_metadata(
+        &mut self,
+        object: ObjectRef,
+        seen: SeenProperties,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let idrive_e2 = self
+            .connections
+            .read(cx)
+            .get(&object.profile_id)
+            .is_some_and(|profile| {
+                profile.compat.provider == supas3_core::credentials::Provider::IdriveE2
+            });
+        let original = seen.metadata.clone();
+        let dialog = cx.new(|cx| MetadataDialog::new(original, idrive_e2, window, cx));
+        let name = object
+            .key
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        cx.subscribe_in(&dialog, window, move |_, dialog, event, window, cx| {
+            let MetadataEvent::Submitted(metadata) = event;
+            let Some(requests) = AppBackend::requests(cx) else {
+                let message = t!("error.backend_stopped").into_owned();
+                dialog.update(cx, |dialog, cx| dialog.failed(message, cx));
+                return;
+            };
+            let (dialog, object, metadata, seen) = (
+                dialog.clone(),
+                object.clone(),
+                metadata.clone(),
+                seen.clone(),
+            );
+            cx.spawn_in(window, async move |workspace, cx| {
+                let result = requests
+                    .set_metadata(object.clone(), metadata, seen)
+                    .await
+                    .map_err(|error| {
+                        // The refusals made before anything is written.
+                        if error.contains("changed since") {
+                            t!("metadata.changed").into_owned()
+                        } else if error.contains("only for objects up to 5 GiB") {
+                            t!("properties.too_large").into_owned()
+                        } else {
+                            error
+                        }
+                    });
+                let _ = workspace.update_in(cx, |workspace, window, cx| match result {
+                    Ok(()) => {
+                        window.close_dialog(cx);
+                        workspace.object_changed(&object, cx);
+                    }
+                    Err(error) => dialog.update(cx, |dialog, cx| dialog.failed(error, cx)),
+                });
+            })
+            .detach();
+        })
+        .detach();
+        let title: SharedString = t!("metadata.title", name = name).into_owned().into();
+        let width = rems(36.).to_pixels(window.rem_size());
         window.open_dialog(cx, move |modal, _, cx| {
             let busy = dialog.read(cx).is_busy();
             modal

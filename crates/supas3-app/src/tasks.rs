@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The transfers the task center shows, kept up to date from backend events.
 
+use rust_i18n::t;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use supas3_core::host::{Event, EventSink};
@@ -18,6 +19,8 @@ pub enum TaskKind {
     Move,
     /// A folder renamed by moving everything in it.
     Rename,
+    /// The access of every object in a folder changed.
+    Access,
 }
 
 /// Who runs a task, and so who is asked to cancel or forget it.
@@ -38,6 +41,10 @@ pub enum TaskState {
     Failed(String),
     Cancelled,
 }
+
+/// How the backend marks a download cut off by the app closing; its advice
+/// is not what this app does.
+const INTERRUPTED_DOWNLOAD: &str = "Interrupted when the app closed. Queue the download again";
 
 impl TaskState {
     fn of(status: &TransferStatus) -> Self {
@@ -119,19 +126,34 @@ impl Task {
             .filter(|name| !name.is_empty())
             .unwrap_or(&job.key)
             .to_string();
+        let retryable = !restored || can_be_retried(job);
+        let state = match &job.status {
+            // The backend's advice is not what this app offers.
+            TransferStatus::Failed(message) if message.starts_with(INTERRUPTED_DOWNLOAD) => {
+                TaskState::Failed(
+                    t!(if retryable {
+                        "tasks.interrupted_download"
+                    } else {
+                        "tasks.interrupted_download_again"
+                    })
+                    .into_owned(),
+                )
+            }
+            status => TaskState::of(status),
+        };
         Self {
             id: job.id.clone(),
             kind,
             name,
             source,
             target,
-            state: TaskState::of(&job.status),
+            state,
             processed: job.processed_bytes,
             total: job.total_bytes,
             bytes_per_second: job.bytes_per_second,
             group: job.parent_group_id.clone(),
             group_name: job.group_name.clone(),
-            retryable: !restored || can_be_retried(job),
+            retryable,
             origin: TaskOrigin::Transfer,
             created_at: job.created_at,
         }
@@ -162,8 +184,11 @@ fn can_be_retried(job: &TransferJob) -> bool {
         .url_import
         .as_ref()
         .is_some_and(|source| source.url.is_empty());
-    let download_lost_its_destination =
-        matches!(job.transfer_type, TransferType::Download) && job.download_destination.is_none();
+    // A download that lost its destination is queued afresh to the same
+    // file, but only for the connection it was added with.
+    let download_lost_its_destination = matches!(job.transfer_type, TransferType::Download)
+        && job.download_destination.is_none()
+        && job.profile_identity.is_none();
     !(copy_lost_its_source
         || sync_lost_its_plan
         || import_lost_its_url
@@ -789,6 +814,23 @@ mod tests {
         let mut fresh = Tasks::default();
         fresh.add(&download);
         assert!(fresh.get("d").unwrap().retryable);
+
+        // One that records its connection is queued afresh, and says so;
+        // one from an older journal is not, and says what to do instead.
+        let interrupted = format!("{} to choose its destination.", super::INTERRUPTED_DOWNLOAD);
+        let mut known = job("k", TransferType::Download, "k", 3);
+        known.status = TransferStatus::Failed(interrupted.clone());
+        known.profile_identity = Some("identity".into());
+        let mut old = job("o", TransferType::Download, "o", 4);
+        old.status = TransferStatus::Failed(interrupted);
+        let mut restored = Tasks::default();
+        restored.merge_snapshot(&[known, old]);
+        let (known, old) = (restored.get("k").unwrap(), restored.get("o").unwrap());
+        assert!(known.retryable && !old.retryable);
+        assert_ne!(known.state, old.state);
+        assert!(
+            matches!(&known.state, TaskState::Failed(text) if !text.contains("Queue the download again"))
+        );
     }
 
     #[test]

@@ -15,11 +15,21 @@ use gpui_kit::{
 use std::sync::Arc;
 
 fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workspace>) {
+    open_with(
+        cx,
+        Err(anyhow::anyhow!("no backend in interaction tests")),
+        Arc::new(EventQueue::default()),
+    )
+}
+
+fn open_with(
+    cx: &mut TestAppContext,
+    backend: anyhow::Result<crate::backend::Backend>,
+    events: Arc<EventQueue>,
+) -> (AnyWindowHandle, Entity<Workspace>) {
     cx.update(|cx| {
         gpui_kit::init(cx);
-        cx.set_global(AppBackend::new(Err(anyhow::anyhow!(
-            "no backend in interaction tests"
-        ))));
+        cx.set_global(AppBackend::new(backend));
         cx.set_global(AppJobs::default());
         crate::bind_keys(cx);
         let options = WindowOptions {
@@ -29,7 +39,6 @@ fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workspace>) {
             })),
             ..Default::default()
         };
-        let events = Arc::new(EventQueue::default());
         let (window, workspace) = gpui_kit::open_window(options, cx, |window, cx| {
             cx.new(|cx| Workspace::new(Settings::default(), events, window, cx))
         })
@@ -91,4 +100,147 @@ async fn tab_moves_between_the_sidebar_and_the_panes(cx: &mut TestAppContext) {
     cx.update(|cx| assert_eq!(workspace.read(cx).active, Side::Left));
     assert_eq!(press(cx, "tab"), Some(2));
     cx.update(|cx| assert_eq!(workspace.read(cx).active, Side::Right));
+}
+
+/// Runs the app until `ready` holds, in real time: a backend answers from
+/// its own threads.
+fn until(cx: &mut TestAppContext, what: &str, mut ready: impl FnMut(&mut TestAppContext) -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        cx.run_until_parked();
+        if ready(cx) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Timers in the app run on the test's clock, not the wall's.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Everything that needs the storage backend is in this one test, which
+/// runs alone among the tests that start one: the backend's runtime is
+/// registered for the whole process.
+#[gpui_kit::test]
+async fn on_this_computer_filter_new_folder_and_move_work(cx: &mut TestAppContext) {
+    use crate::listing::{Entry, EntryKind};
+    use crate::location::Location;
+    use gpui_kit::AppContext as _;
+
+    cx.executor().allow_parking();
+    let _serial = crate::backend::one_backend_at_a_time();
+    let root = std::env::temp_dir().join(format!("supas3-ui-backend-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (left_dir, right_dir) = (root.join("left"), root.join("right"));
+    std::fs::create_dir_all(&left_dir).unwrap();
+    std::fs::create_dir_all(&right_dir).unwrap();
+    for name in ["alpha.txt", "beta.txt", "notes.md"] {
+        std::fs::write(left_dir.join(name), name).unwrap();
+    }
+    let events = Arc::new(EventQueue::default());
+    let backend = crate::backend::Backend::start(root.join("config"), events.sink());
+    let (window, workspace) = open_with(cx, backend, events);
+    cx.update(|cx| {
+        let workspace = workspace.read(cx);
+        let (left, right) = (workspace.left.clone(), workspace.right.clone());
+        left.update(cx, |pane, cx| {
+            pane.open(Location::Local(left_dir.clone()), cx)
+        });
+        right.update(cx, |pane, cx| {
+            pane.open(Location::Local(right_dir.clone()), cx)
+        });
+    });
+    let shown = |cx: &mut TestAppContext, side: Side| {
+        cx.update(|cx| {
+            let pane = workspace.read(cx).pane(side).clone();
+            let pane = pane.read(cx);
+            pane.shown_count(cx)
+        })
+    };
+    until(cx, "the left folder to list", |cx| {
+        shown(cx, Side::Left) == (3, 3)
+    });
+
+    // Filter: only the loaded rows whose names match stay.
+    cx.update(|cx| workspace.update(cx, |workspace, _| workspace.active = Side::Left));
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.pane_command(super::PaneCommand::Filter, window, cx)
+        });
+        window.input("note", cx);
+    })
+    .unwrap();
+    until(cx, "the filter", |cx| shown(cx, Side::Left) == (1, 3));
+
+    // New folder, named in its dialog.
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.pane_command(super::PaneCommand::NewFolder, window, cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.press("secondary-a", cx);
+        window.input("made", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    until(cx, "the new folder", |_| left_dir.join("made").is_dir());
+    let dialog_open = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            use gpui_kit::component::WindowExt as _;
+            window.has_active_dialog(cx)
+        })
+        .unwrap()
+    };
+    until(cx, "the name dialog to close", |cx| !dialog_open(cx));
+
+    // Move a file to the other pane: asked first, then done.
+    let entry = Entry {
+        name: "alpha.txt".into(),
+        kind: EntryKind::File,
+        size: Some(9),
+        modified: None,
+        prefix: None,
+    };
+    let source = Location::Local(left_dir.clone());
+    let planned =
+        crate::transfer_plan::plan(&source, &[entry], &Location::Local(right_dir.clone()));
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.start_move(planned, &source, window, cx)
+        });
+    })
+    .unwrap();
+    until(cx, "the move to be asked about", dialog_open);
+    // The dialog slides in on the wall clock; a click during that may miss,
+    // so it is made again until the dialog has gone.
+    until(cx, "the move to be confirmed", |cx| {
+        if dialog_open(cx) {
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                if window.try_find("confirm-move").is_some() {
+                    window.click("confirm-move", cx);
+                }
+            })
+            .unwrap();
+        }
+        !dialog_open(cx)
+    });
+    until(cx, "the move", |_| {
+        right_dir.join("alpha.txt").is_file() && !left_dir.join("alpha.txt").exists()
+    });
+    assert_eq!(
+        std::fs::read_to_string(right_dir.join("alpha.txt")).unwrap(),
+        "alpha.txt"
+    );
+
+    cx.update(|cx| AppBackend::shutdown(cx));
+    let _ = std::fs::remove_dir_all(root);
 }

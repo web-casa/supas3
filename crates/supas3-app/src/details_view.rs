@@ -20,7 +20,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rust_i18n::t;
 use std::time::Duration;
-use supas3_core::commands::operations::{ObjectMetadata, ObjectPermissions};
+use supas3_core::commands::operations::{ObjectMetadata, ObjectPermissions, SeenProperties};
 
 /// How long the selection must stay on an object before it is asked about,
 /// so moving through a list does not send a request per row.
@@ -43,12 +43,26 @@ pub enum DetailsEvent {
     Row(RowAction, Location, Entry),
     /// Download the row, read from the location.
     Download(Location, Entry),
+    /// Put the row's address on the clipboard.
+    CopyAddress(Location, Entry),
     /// Change the Content-Type of the object, which has the ETag.
     ChangeContentType {
         object: ObjectRef,
         name: String,
         current: Option<String>,
         etag: String,
+    },
+    /// Give every object under a folder this ACL.
+    FolderAccess {
+        profile_id: String,
+        bucket: String,
+        prefix: String,
+        to: Access,
+    },
+    /// Edit the object's user metadata, which has the properties `seen`.
+    EditMetadata {
+        object: ObjectRef,
+        seen: SeenProperties,
     },
     /// Give the object this ACL; it now reads as `current`, and has the
     /// ETag, if one was read.
@@ -223,15 +237,8 @@ impl DetailsPanel {
             .small()
             .outline()
             .label(t!("content_type.change").into_owned());
-        let refusal = if size > CONTENT_TYPE_LIMIT {
-            Some(t!("content_type.too_large"))
-        } else if needs_restore(metadata.storage_class.as_deref()) {
-            Some(t!("content_type.archived"))
-        } else {
-            None
-        };
-        if let Some(refusal) = refusal {
-            return Some(button.disabled(true).tooltip(refusal.into_owned()));
+        if let Some(refusal) = copy_refusal(size, metadata) {
+            return Some(button.disabled(true).tooltip(refusal));
         }
         let (object, name, current) = (
             object.clone(),
@@ -244,6 +251,37 @@ impl DetailsPanel {
                 name: name.clone(),
                 current: current.clone(),
                 etag: etag.clone(),
+            });
+        })))
+    }
+
+    /// The metadata's edit button, on the same terms as the Content-Type.
+    fn metadata_button(
+        &self,
+        object: &ObjectRef,
+        metadata: &ObjectMetadata,
+        cx: &mut Context<Self>,
+    ) -> Option<Button> {
+        let etag = metadata.e_tag.clone()?;
+        let size = u64::try_from(metadata.size).ok()?;
+        let button = Button::new("details-metadata")
+            .small()
+            .outline()
+            .label(t!("metadata.edit").into_owned());
+        if let Some(refusal) = copy_refusal(size, metadata) {
+            return Some(button.disabled(true).tooltip(refusal));
+        }
+        let seen = SeenProperties {
+            etag,
+            content_type: metadata.content_type.clone(),
+            metadata: metadata.user_metadata.clone(),
+            last_modified: metadata.last_modified.clone(),
+        };
+        let object = object.clone();
+        Some(button.on_click(cx.listener(move |_, _, _, cx| {
+            cx.emit(DetailsEvent::EditMetadata {
+                object: object.clone(),
+                seen: seen.clone(),
             });
         })))
     }
@@ -379,6 +417,18 @@ impl DetailsPanel {
     }
 }
 
+/// Why an object cannot be copied onto itself to change its properties
+/// here, if it cannot.
+fn copy_refusal(size: u64, metadata: &ObjectMetadata) -> Option<String> {
+    if size > CONTENT_TYPE_LIMIT {
+        Some(t!("properties.too_large").into_owned())
+    } else if needs_restore(metadata.storage_class.as_deref()) {
+        Some(t!("properties.archived").into_owned())
+    } else {
+        None
+    }
+}
+
 /// A size with the exact byte count where the short form rounds.
 fn exact_size(size: u64) -> String {
     let short = format_size(size);
@@ -473,10 +523,63 @@ impl Render for DetailsPanel {
                     Location::Objects { bucket, prefix, .. } => format!("{bucket}/{prefix}"),
                     Location::Buckets { .. } => entry.name.clone(),
                 };
-                list()
+                let items = list()
                     .item(t!("details.name").into_owned(), entry.name.clone(), 1)
-                    .item(t!("details.location").into_owned(), place, 1)
-                    .into_any_element()
+                    .item(t!("details.location").into_owned(), place, 1);
+                let changes = self
+                    .connection
+                    .as_ref()
+                    .is_some_and(|connection| !connection.idrive_e2);
+                match (&location, &entry.prefix) {
+                    (
+                        Location::Objects {
+                            profile_id, bucket, ..
+                        },
+                        Some(prefix),
+                    ) if changes => {
+                        let choice =
+                            |id: &'static str, to: Access, label: String| {
+                                let (profile_id, bucket, prefix) =
+                                    (profile_id.clone(), bucket.clone(), prefix.clone());
+                                Button::new(id).small().outline().label(label).on_click(
+                                    cx.listener(move |_, _, _, cx| {
+                                        cx.emit(DetailsEvent::FolderAccess {
+                                            profile_id: profile_id.clone(),
+                                            bucket: bucket.clone(),
+                                            prefix: prefix.clone(),
+                                            to,
+                                        });
+                                    }),
+                                )
+                            };
+                        v_flex()
+                            .gap_3()
+                            .child(items)
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(t!("access.title").into_owned()),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .child(choice(
+                                        "folder-private",
+                                        Access::Private,
+                                        t!("folder_access.make_private").into_owned(),
+                                    ))
+                                    .child(choice(
+                                        "folder-public",
+                                        Access::PublicRead,
+                                        t!("folder_access.make_public").into_owned(),
+                                    )),
+                            )
+                            .into_any_element()
+                    }
+                    _ => items.into_any_element(),
+                }
             }
             Some(Subject::LocalFile { path, entry }) => list()
                 .item(t!("details.name").into_owned(), entry.name.clone(), 1)
@@ -538,10 +641,11 @@ impl Render for DetailsPanel {
                             items = items.item(format!("x-amz-meta-{name}"), value.clone(), 1);
                         }
                         let change = self.content_type_button(&object, &entry.name, metadata, cx);
+                        let edit = self.metadata_button(&object, metadata, cx);
                         v_flex()
                             .gap_2()
                             .child(items)
-                            .when_some(change, |this, change| this.child(h_flex().child(change)))
+                            .child(h_flex().flex_wrap().gap_1().children(change).children(edit))
                             .into_any_element()
                     }
                     Metadata::Failed(error) => {
@@ -557,6 +661,7 @@ impl Render for DetailsPanel {
                         .into_any_element(),
                 };
                 let (download_source, download_entry) = (self.source.clone(), entry.clone());
+                let (address_source, address_entry) = (self.source.clone(), entry.clone());
                 v_flex()
                     .gap_3()
                     .child(
@@ -594,6 +699,20 @@ impl Render for DetailsPanel {
                                             cx.emit(DetailsEvent::Download(
                                                 source,
                                                 download_entry.clone(),
+                                            ));
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new("details-copy-address")
+                                    .small()
+                                    .outline()
+                                    .label(t!("action.copy_address").into_owned())
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        if let Some(source) = address_source.clone() {
+                                            cx.emit(DetailsEvent::CopyAddress(
+                                                source,
+                                                address_entry.clone(),
                                             ));
                                         }
                                     })),

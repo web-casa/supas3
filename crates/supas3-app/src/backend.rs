@@ -17,17 +17,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use supas3_core::commands::cross_copy::{self, CopyItem};
-use supas3_core::commands::operations::{ObjectMetadata, ObjectPermissions};
+use supas3_core::commands::operations::{ObjectMetadata, ObjectPermissions, SeenProperties};
 use supas3_core::commands::sync::Preview as SyncPreview;
 use supas3_core::commands::{
-    buckets, objects, operations, preview, profiles, replace, sync, transfer, urls, versions,
+    buckets, objects, operations, preview, profiles, replace, sync, transfer, urls, version_ops,
+    versions,
 };
 use supas3_core::credentials::{with_profile, Profile};
 use supas3_core::host::EventSink;
 use supas3_core::s3::versions::{Cursor, History};
 use supas3_core::s3::WriteTraits;
 use supas3_core::transfer::controls::SyncOptions;
-use supas3_core::transfer::TransferJob;
+use supas3_core::transfer::{TransferJob, TransferType};
 use supas3_core::{Core, CoreOptions};
 
 /// How long quitting waits for transfers to cancel and clean up.
@@ -108,6 +109,76 @@ impl Backend {
     }
 }
 
+/// Queues a download from an earlier run again, from the start, to the
+/// file it was going to, if the connection is still the one it was added
+/// with. The old record goes once the new one is queued.
+async fn redownload(core: &Core, job: TransferJob) -> Result<String, String> {
+    let profiles = profiles::list_profiles(core.profiles()).await?;
+    let current = profiles
+        .iter()
+        .find(|profile| profile.id == job.profile_id)
+        .map(|profile| profile.cache_identity());
+    if job.profile_identity.is_none() || current != job.profile_identity {
+        return Err(rust_i18n::t!("redownload.connection_changed").into_owned());
+    }
+    let path = PathBuf::from(&job.local_path);
+    let folder = path.parent().unwrap_or(&path);
+    if !folder.is_dir() {
+        let folder = folder.display().to_string();
+        return Err(rust_i18n::t!("redownload.folder_gone", folder = folder).into_owned());
+    }
+    // A download that was to replace a file, or a file that appeared
+    // since: nothing is downloaded over it.
+    if path.exists() {
+        let file = path.display().to_string();
+        return Err(rust_i18n::t!("redownload.exists", file = file).into_owned());
+    }
+    let profile_id = job.profile_id.clone();
+    let queued = match job.version_id.clone() {
+        Some(version_id) => {
+            with_profile(
+                profile_id.clone(),
+                version_ops::queue_version_download(
+                    job.bucket.clone(),
+                    job.bucket_region.clone().unwrap_or_default(),
+                    job.key.clone(),
+                    version_id,
+                    path,
+                    job.total_bytes,
+                    profile_id,
+                    core.app(),
+                    core.profiles(),
+                    core.s3(),
+                    core.transfers(),
+                ),
+            )
+            .await
+        }
+        None => {
+            with_profile(
+                profile_id.clone(),
+                transfer::queue_download(
+                    job.bucket.clone(),
+                    job.bucket_region.clone(),
+                    job.key.clone(),
+                    job.local_path.clone(),
+                    job.total_bytes,
+                    Some(false),
+                    profile_id,
+                    core.app(),
+                    core.profiles(),
+                    core.s3(),
+                    core.transfers(),
+                ),
+            )
+            .await
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    let _ = transfer::remove_transfer(job.id, core.transfers()).await;
+    Ok(queued)
+}
+
 /// Sets how many transfers run at once and the speed of each transfer
 /// queued from now on.
 fn set_transfer_limits(core: &Core, limits: TransferSettings) -> Result<(), String> {
@@ -117,6 +188,14 @@ fn set_transfer_limits(core: &Core, limits: TransferSettings) -> Result<(), Stri
         .map_err(|error| error.to_string())?;
     manager.set_max_concurrency(limits.concurrency as usize);
     Ok(())
+}
+
+/// Tests that start a backend run one at a time: its runtime is registered
+/// for the whole process, so work queued by one could land on another's.
+#[cfg(test)]
+pub(crate) fn one_backend_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The per-user configuration directory, for example `~/.config/supas3`.
@@ -591,6 +670,14 @@ impl Requests {
     /// transfer's id, or `None` if it could not be retried.
     pub async fn retry_transfer(&self, id: String) -> Result<Option<String>, String> {
         self.run(move |core| async move {
+            // A download from an earlier run lost where it was going; it is
+            // queued afresh to the same file, never over one.
+            if let Some(job) = core.transfers().get_job(&id).await.filter(|job| {
+                matches!(job.transfer_type, TransferType::Download)
+                    && job.download_destination.is_none()
+            }) {
+                return redownload(&core, job).await.map(Some);
+            }
             transfer::retry_transfer(id, core.app(), core.profiles(), core.s3(), core.transfers())
                 .await
                 .map_err(|error| error.to_string())
@@ -1016,6 +1103,85 @@ impl Requests {
         .await
     }
 
+    /// Replaces an object's user metadata, only if it still has the
+    /// properties `seen`.
+    pub async fn set_metadata(
+        &self,
+        object: ObjectRef,
+        metadata: std::collections::HashMap<String, String>,
+        seen: SeenProperties,
+    ) -> Result<(), String> {
+        self.run(move |core| async move {
+            let ObjectRef {
+                profile_id,
+                bucket,
+                key,
+            } = object;
+            with_profile(
+                profile_id.clone(),
+                operations::set_object_metadata(
+                    bucket,
+                    None,
+                    key,
+                    metadata,
+                    seen,
+                    profile_id,
+                    core.profiles(),
+                    core.s3(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Queues imports of web addresses into a folder of a bucket, each as
+    /// `(address, object name)`, never over an existing object, each at
+    /// most `max_bytes`. Returns how many were queued.
+    pub async fn import_urls(
+        &self,
+        profile_id: String,
+        bucket: String,
+        prefix: String,
+        items: Vec<(String, String)>,
+        max_bytes: u64,
+    ) -> Result<usize, String> {
+        use supas3_core::transfer::url_import::ImportEntry;
+        self.run(move |core| async move {
+            let region = bucket_region(&core, &profile_id, &bucket).await;
+            let entries = items
+                .into_iter()
+                .map(|(url, path)| ImportEntry {
+                    max_attempts: 3,
+                    url,
+                    path,
+                    headers: Default::default(),
+                    replace: false,
+                    sha256: None,
+                    max_bytes,
+                })
+                .collect();
+            with_profile(
+                profile_id.clone(),
+                urls::queue_url_imports(
+                    bucket,
+                    Some(region),
+                    prefix,
+                    entries,
+                    profile_id,
+                    core.app(),
+                    core.profiles(),
+                    core.s3(),
+                    core.transfers(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
     /// Who may read and change one object, as its ACL says. A service
     /// without object ACLs, or a refusal to show them, is reported in the
     /// result's status rather than as an error.
@@ -1232,30 +1398,40 @@ impl Requests {
     /// The object's plain address, which works only if the object can be
     /// read without credentials.
     pub async fn plain_link(&self, object: ObjectRef) -> Result<String, String> {
+        let ObjectRef {
+            profile_id,
+            bucket,
+            key,
+        } = object;
+        self.plain_links(profile_id, bucket, vec![key])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "The service returned no link.".to_string())
+    }
+
+    /// The plain addresses of several objects of one bucket, in order.
+    pub async fn plain_links(
+        &self,
+        profile_id: String,
+        bucket: String,
+        keys: Vec<String>,
+    ) -> Result<Vec<String>, String> {
         self.run(move |core| async move {
-            let ObjectRef {
-                profile_id,
-                bucket,
-                key,
-            } = object;
             let region = bucket_region(&core, &profile_id, &bucket).await;
-            let links = with_profile(
+            with_profile(
                 profile_id.clone(),
                 urls::get_public_urls(
                     bucket,
                     Some(region),
-                    vec![key],
+                    keys,
                     None,
                     profile_id,
                     core.profiles(),
                 ),
             )
             .await
-            .map_err(|error| error.to_string())?;
-            links
-                .into_iter()
-                .next()
-                .ok_or_else(|| "The service returned no link.".to_string())
+            .map_err(|error| error.to_string())
         })
         .await
     }
@@ -1945,6 +2121,7 @@ mod tests {
 
     #[test]
     fn text_over_the_limit_is_not_saved() {
+        let _serial = super::one_backend_at_a_time();
         use crate::object_actions::{ObjectRef, TEXT_LIMIT};
         let dir = test_dir("too-large");
         let backend = Backend::start(dir.clone(), ignore_events()).unwrap();
@@ -1966,6 +2143,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn saving_a_connection_into_a_read_only_folder_reports_an_error() {
+        let _serial = super::one_backend_at_a_time();
         use std::os::unix::fs::PermissionsExt as _;
         let dir = test_dir("read-only");
         let backend = Backend::start(dir.clone(), ignore_events()).unwrap();
@@ -2004,6 +2182,7 @@ mod tests {
 
     #[test]
     fn a_backend_starts_answers_requests_shuts_down_and_can_be_reopened() {
+        let _serial = super::one_backend_at_a_time();
         let dir = test_dir("backend");
         let mut backend = Backend::start(dir.clone(), ignore_events()).unwrap();
         let requests = backend.requests().unwrap();
@@ -2082,6 +2261,7 @@ mod tests {
 
     #[test]
     fn a_backend_lists_a_local_folder_through_a_request() {
+        let _serial = super::one_backend_at_a_time();
         let dir = test_dir("request");
         let data = test_dir("request-data");
         std::fs::write(data.join("file.txt"), b"x").unwrap();
@@ -2112,6 +2292,7 @@ mod tests {
     #[test]
     #[ignore]
     fn two_connections_page_at_the_same_time_without_interfering() {
+        let _serial = super::one_backend_at_a_time();
         use crate::connection::{Draft, Service};
         let var =
             |name: String| std::env::var(&name).unwrap_or_else(|_| panic!("{name} is required"));
@@ -2220,6 +2401,7 @@ mod tests {
     #[test]
     #[ignore]
     fn copy_plans_and_deletion_work_end_to_end_on_real_storage() {
+        let _serial = super::one_backend_at_a_time();
         use crate::connection::{Draft, Service};
         use crate::listing::{Entry, EntryKind};
         use crate::tasks::{EventQueue, Tasks};
@@ -2438,6 +2620,7 @@ mod tests {
     #[test]
     #[ignore]
     fn object_actions_work_end_to_end_on_real_storage() {
+        let _serial = super::one_backend_at_a_time();
         use crate::connection::{Draft, Service};
         use crate::listing::Entry;
         use crate::object_actions::{sync_pair, FileRef, ObjectRef, SyncFilters};
@@ -2946,12 +3129,79 @@ mod tests {
         assert!(failed.is_empty(), "{failed:#?}");
     }
 
+    /// Times what a pane does with a very large folder: listing it on this
+    /// computer, sorting and filtering the rows. Run in release:
+    /// `cargo test --release -p supas3-app large_folders -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn large_folders_are_listed_sorted_and_filtered_in_time() {
+        use crate::entries_table::EntriesDelegate;
+        use crate::listing::{sort_entries, Sort, SortField};
+        use std::time::Instant;
+        const COUNT: usize = 100_000;
+        let dir = test_dir("large-folder");
+        std::fs::create_dir_all(&dir).unwrap();
+        for index in 0..COUNT {
+            std::fs::write(dir.join(format!("file-{index:06}.txt")), b"x").unwrap();
+        }
+        let started = Instant::now();
+        let page = list_local(&dir).unwrap();
+        let listed = started.elapsed();
+        assert_eq!(page.entries.len(), COUNT);
+
+        let mut entries = page.entries.clone();
+        let mut sorted = Vec::new();
+        for field in [SortField::Name, SortField::Size, SortField::Modified] {
+            let started = Instant::now();
+            sort_entries(
+                &mut entries,
+                Sort {
+                    field,
+                    descending: true,
+                },
+            );
+            sorted.push((field, started.elapsed()));
+        }
+
+        let mut table = EntriesDelegate::new(
+            gpui_kit::px(16.),
+            Location::Local(dir.clone()),
+            |_, _, _| {},
+        );
+        table.append(entries);
+        let mut filtered = Vec::new();
+        for filter in ["f", "fi", "file-0", "file-09", "file-099", "file-0999", ""] {
+            let started = Instant::now();
+            table.set_filter(filter);
+            filtered.push((filter, table.shown_count().0, started.elapsed()));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        println!(
+            "{} logical CPUs; {COUNT} files listed in {listed:?}",
+            std::thread::available_parallelism().map_or(0, |n| n.get())
+        );
+        for (field, took) in &sorted {
+            println!("sorted by {field:?} in {took:?}");
+        }
+        for (filter, shown, took) in &filtered {
+            println!("filter {filter:?}: {shown} rows in {took:?}");
+        }
+        // The plan's limits, for a release build: a filter keystroke under
+        // 50 ms, a sort under 300 ms.
+        if !cfg!(debug_assertions) {
+            assert!(filtered.iter().all(|(_, _, took)| took.as_millis() < 50));
+            assert!(sorted.iter().all(|(_, took)| took.as_millis() < 300));
+        }
+    }
+
     /// Changes an object's Content-Type and access on real storage the way
     /// the details panel does. Uses the SUPAS3_PANE1_* variables of the
     /// paging test; run with `SUPAS3_SMOKE_TEST=properties`.
     #[test]
     #[ignore]
     fn properties_work_end_to_end_on_real_storage() {
+        let _serial = super::one_backend_at_a_time();
         use crate::connection::{Draft, Service};
         use crate::object_actions::{access_of, Access, FileRef, Grant, ObjectRef};
         use crate::tasks::{EventQueue, Tasks};
@@ -3158,6 +3408,117 @@ mod tests {
                     other => Err(format!("{:?}", other.as_ref().map(|m| &m.content_type))),
                 },
             ));
+            // User metadata: entries written by another tool, kept as they
+            // are when other entries are edited.
+            let seen_of = |metadata: &supas3_core::commands::operations::ObjectMetadata| {
+                supas3_core::commands::operations::SeenProperties {
+                    etag: metadata.e_tag.clone().unwrap_or_default(),
+                    content_type: metadata.content_type.clone(),
+                    metadata: metadata.user_metadata.clone(),
+                    last_modified: metadata.last_modified.clone(),
+                }
+            };
+            let before = requests.object_properties(object.clone()).await;
+            let foreign: std::collections::HashMap<String, String> =
+                [("old_key", "1"), ("note", "caf\u{e9}")]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+            let written = match &before {
+                Ok(metadata) => {
+                    let mut wanted = metadata.user_metadata.clone();
+                    wanted.extend(foreign.clone());
+                    requests
+                        .set_metadata(object.clone(), wanted, seen_of(metadata))
+                        .await
+                }
+                Err(error) => Err(error.clone()),
+            };
+            println!("writing a non-ASCII value directly: {written:?}");
+            if written.is_err() {
+                // Write the ASCII entry alone, so editing around it is tested.
+                if let Ok(metadata) = requests.object_properties(object.clone()).await {
+                    let mut wanted = metadata.user_metadata.clone();
+                    wanted.insert("old_key".into(), "1".into());
+                    let alone = requests
+                        .set_metadata(object.clone(), wanted, seen_of(&metadata))
+                        .await;
+                    // OSS and COS refuse such names (the signature does not
+                    // match); nothing is written then.
+                    println!("writing an entry named with an underscore: {alone:?}");
+                }
+            }
+            let shown = requests.object_properties(object.clone()).await;
+            println!(
+                "metadata read back: {:?}",
+                shown.as_ref().map(|m| &m.user_metadata)
+            );
+            let edited = match &shown {
+                Ok(metadata) => {
+                    let mut rows: Vec<(String, String)> = metadata
+                        .user_metadata
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    rows.push(("Owner".into(), "ops".into()));
+                    match crate::object_actions::metadata_to_save(
+                        &rows,
+                        &metadata.user_metadata,
+                        service == Service::IdriveE2,
+                    ) {
+                        Ok(wanted) => {
+                            requests
+                                .set_metadata(object.clone(), wanted, seen_of(metadata))
+                                .await
+                        }
+                        Err(problem) => Err(format!("{problem:?}")),
+                    }
+                }
+                Err(error) => Err(error.clone()),
+            };
+            steps.push(("edit metadata", edited));
+            let after = requests.object_properties(object.clone()).await;
+            steps.push((
+                "the edit kept the other entries, the type and the content",
+                match (&after, &shown) {
+                    (Ok(after), Ok(shown)) => {
+                        let kept = shown
+                            .user_metadata
+                            .iter()
+                            .filter(|(key, _)| !matches!(key.as_str(), "e2iid" | "erid"))
+                            .all(|(key, value)| after.user_metadata.get(key) == Some(value));
+                        if kept
+                            && after.user_metadata.get("owner").map(String::as_str) == Some("ops")
+                            && after.content_type == shown.content_type
+                            && after.e_tag == shown.e_tag
+                        {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "{:?} -> {:?}",
+                                shown.user_metadata, after.user_metadata
+                            ))
+                        }
+                    }
+                    (Err(error), _) | (_, Err(error)) => Err(error.clone()),
+                },
+            ));
+            let stale = match &shown {
+                Ok(metadata) => {
+                    requests
+                        .set_metadata(object.clone(), Default::default(), seen_of(metadata))
+                        .await
+                }
+                Err(error) => Err(error.clone()),
+            };
+            steps.push((
+                "an edit of properties seen earlier is refused",
+                match &stale {
+                    Err(error) if error.contains("changed since") => Ok(()),
+                    other => Err(format!("{other:?}")),
+                },
+            ));
+
             if supported {
                 let read = requests.object_permissions(object.clone()).await;
                 steps.push((
@@ -3179,6 +3540,134 @@ mod tests {
                         Ok(p) if access(p) == Access::Private => Ok(()),
                         Ok(p) => Err(format!("{:?}", access(p))),
                         Err(error) => Err(error.clone()),
+                    },
+                ));
+            }
+
+            // Import from a web address: the object's own signed link.
+            let link = requests.signed_link(object.clone(), 600).await;
+            let import = |name: &str| {
+                let link = link.clone();
+                let (requests, profile_id, bucket, run) = (
+                    &requests,
+                    profile.id.clone(),
+                    draft.bucket.clone(),
+                    run.clone(),
+                );
+                let name = name.to_string();
+                async move {
+                    let link = link?;
+                    requests
+                        .import_urls(profile_id, bucket, run, vec![(link, name)], 1 << 20)
+                        .await
+                }
+            };
+            let settle = || async {
+                let mut tasks = Tasks::default();
+                for _ in 0..300 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    if let Ok(jobs) = requests.transfers().await {
+                        tasks.merge_snapshot(&jobs);
+                        if tasks.counts().active == 0 {
+                            return tasks
+                                .list(crate::tasks::TaskFilter::Failed)
+                                .iter()
+                                .map(|task| format!("{}: {:?}", task.name, task.state))
+                                .collect::<Vec<_>>();
+                        }
+                    }
+                }
+                vec!["imports did not finish".to_string()]
+            };
+            let failed_before = settle().await.len();
+            steps.push(("queue an import", import("imported.txt").await.map(|_| ())));
+            let failed = settle().await;
+            steps.push((
+                "the import finishes",
+                if failed.len() == failed_before {
+                    Ok(())
+                } else {
+                    Err(failed.join("; "))
+                },
+            ));
+            let imported = ObjectRef {
+                key: format!("{run}imported.txt"),
+                ..object.clone()
+            };
+            let text = requests.read_text(FileRef::Remote(imported.clone())).await;
+            steps.push((
+                "the imported object has the source's content",
+                match &text {
+                    Ok(text) if text.content == "# 新标题\n" => Ok(()),
+                    other => Err(format!("{:?}", other.as_ref().map(|t| &t.content))),
+                },
+            ));
+            // The same name again: queued, then refused without a write.
+            let again = import("imported.txt").await;
+            let failed = settle().await;
+            println!("importing over an existing object: {again:?}, failed: {failed:?}");
+            steps.push((
+                "an import never replaces an existing object",
+                if again.is_err() || failed.len() > failed_before {
+                    Ok(())
+                } else {
+                    Err("the second import succeeded".to_string())
+                },
+            ));
+
+            // A folder's access, as the job sets it: every object in turn.
+            if supported {
+                struct Storage<'a> {
+                    requests: &'a super::Requests,
+                    profile: &'a supas3_core::credentials::Profile,
+                    bucket: String,
+                }
+                impl crate::folder_access::AccessBackend for Storage<'_> {
+                    fn set(&self, key: &str) -> Result<(), String> {
+                        let object = ObjectRef {
+                            profile_id: self.profile.id.clone(),
+                            bucket: self.bucket.clone(),
+                            key: key.to_string(),
+                        };
+                        futures_lite(self.requests.set_object_access(object, Access::Private))
+                    }
+                    fn identity(&self) -> Option<String> {
+                        Some(self.profile.cache_identity())
+                    }
+                }
+                struct Run;
+                impl crate::folder_access::Control for Run {
+                    fn cancelled(&self) -> bool {
+                        false
+                    }
+                    fn progress(&self, _: u64, _: u64) {}
+                }
+                let keys: Vec<String> = requests
+                    .list_keys(profile.id.clone(), draft.bucket.clone(), run.clone())
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|listed| listed.key)
+                    .collect();
+                let storage = Storage {
+                    requests: &requests,
+                    profile: &profile,
+                    bucket: draft.bucket.clone(),
+                };
+                // On a thread of its own, as the job runs.
+                let identity = profile.cache_identity();
+                let report = std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| crate::folder_access::run(&keys, &identity, &storage, &Run))
+                        .join()
+                        .unwrap()
+                });
+                steps.push((
+                    "every object of the folder is made private",
+                    if keys.len() >= 2 && report.changed == keys.len() && report.failed == 0 {
+                        Ok(())
+                    } else {
+                        Err(format!("{} keys: {report:?}", keys.len()))
                     },
                 ));
             }
@@ -3221,6 +3710,7 @@ mod tests {
     #[test]
     #[ignore]
     fn file_operations_work_end_to_end_on_real_storage() {
+        let _serial = super::one_backend_at_a_time();
         use crate::connection::{Draft, Service};
         use crate::file_ops::folder_moves;
         let key = |field: &str| {
@@ -3630,6 +4120,7 @@ mod tests {
     #[test]
     #[ignore = "needs two real connections"]
     fn moves_work_end_to_end_on_real_storage() {
+        let _serial = super::one_backend_at_a_time();
         use crate::connection::{Draft, Service};
         use crate::listing::Entry;
         use crate::moves::{Control, Report};

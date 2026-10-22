@@ -293,9 +293,12 @@ content_type.suggested:
 content_type.note:
   en: The object is copied onto itself with the new type; its content, metadata, tags and permissions stay. Its modified time changes, and with versioning on this adds a version. If its content changed since it was shown, nothing is changed; a change made meanwhile to its other properties is not noticed.
   zh-CN: 对象会以新的类型复制到原位置，内容、元数据、标签与访问权限不变；修改时间会更新，开启版本控制的桶里会多一个版本。对象内容在显示之后被改动过时不做修改；期间他人对其他属性的修改无法察觉。
-content_type.archived:
-  en: An archived object must be restored before its Content-Type can be changed.
-  zh-CN: 归档存储的对象需要先解冻，才能修改内容类型。
+properties.too_large:
+  en: The type and metadata are changed here only for objects up to 5 GiB.
+  zh-CN: 只能修改不超过 5 GiB 的对象的内容类型与元数据。
+properties.archived:
+  en: An archived object must be restored before its type or metadata can be changed.
+  zh-CN: 归档存储的对象需要先解冻，才能修改内容类型或元数据。
 content_type.changed:
   en: The object’s content changed since it was shown. Nothing was changed; look at it again and retry.
   zh-CN: 对象内容在显示之后已被改动，未做修改。请重新查看后再试。
@@ -305,6 +308,134 @@ content_type.unchanged:
 content_type.save:
   en: Change
   zh-CN: 修改
+metadata.edit:
+  en: Edit metadata…
+  zh-CN: 编辑元数据…
+metadata.title:
+  en: "Metadata of %{name}"
+  zh-CN: "%{name} 的元数据"
+metadata.key:
+  en: Name
+  zh-CN: 名称
+metadata.value:
+  en: Value
+  zh-CN: 值
+metadata.add:
+  en: Add
+  zh-CN: 添加
+metadata.remove:
+  en: Remove
+  zh-CN: 移除
+metadata.fixed:
+  en: "%{key}: %{value} (kept as it is)"
+  zh-CN: "%{key}：%{value}（保持不变）"
+metadata.note:
+  en: Names are stored in lower case. New or changed entries may use letters, digits and hyphens in names and plain ASCII in values; entries left as they are stay as they are. The object is copied onto itself, so its modified time changes. If its content or properties changed since they were shown, nothing is changed; a change in the second before saving, or to its permissions, may not be noticed.
+  zh-CN: 名称以小写保存。新增或修改的条目，名称只能用字母、数字和连字符，值只能用 ASCII 可打印字符；未改动的条目保持原样。对象会复制到原位置，修改时间会更新。对象内容或属性在显示之后被改动过时不做修改；保存前一秒内的改动、或对访问权限的改动可能察觉不到。
+metadata.key_invalid:
+  en: A name may use letters, digits and hyphens only.
+  zh-CN: 名称只能使用字母、数字和连字符。
+metadata.key_duplicate:
+  en: Each name may be used once (names do not differ by case).
+  zh-CN: 每个名称只能出现一次（不区分大小写）。
+metadata.key_fixed:
+  en: This name is kept by supaS3 or the service and cannot be set here.
+  zh-CN: 此名称由 supaS3 或服务保留，不能在这里设置。
+metadata.value_invalid:
+  en: A new or changed value may use printable ASCII characters only.
+  zh-CN: 新增或修改的值只能使用 ASCII 可打印字符。
+metadata.too_large:
+  en: Metadata is limited to 2 KiB of names and values together.
+  zh-CN: 元数据的名称与值合计不能超过 2 KiB。
+metadata.unchanged:
+  en: Nothing was changed.
+  zh-CN: 没有改动。
+metadata.changed:
+  en: The object’s content or properties changed since they were shown. Nothing was changed; look at it again and retry.
+  zh-CN: 对象内容或属性在显示之后已被改动，未做修改。请重新查看后再试。
+
+folder_access.make_private:
+  en: Make everything in it private…
+  zh-CN: 将其中对象设为私有…
+folder_access.make_public:
+  en: Make everything in it public…
+  zh-CN: 将其中对象设为公开读取…
+folder_access.private_title:
+  en: Make every object in this folder private?
+  zh-CN: 将此文件夹中的所有对象设为私有？
+folder_access.public_title:
+  en: Make every object in this folder public?
+  zh-CN: 将此文件夹中的所有对象设为公开读取？
+folder_access.count:
+  en: "%{count} objects, in this folder and the folders inside it, are changed one by one. This is not done all at once: if it stops, some are changed and some are not; the task list says how many."
+  zh-CN: "此文件夹及其子文件夹中的 %{count} 个对象会逐个修改，不是一次完成：中途停止时会有部分已改、部分未改，任务列表会显示数量。"
+folder_access.replaced:
+  en: Each object’s current grants are replaced, including ones given to particular accounts.
+  zh-CN: 每个对象当前的授权都会被替换，包括授予特定账户的授权。
+folder_access.empty:
+  en: This folder holds no objects.
+  zh-CN: 此文件夹中没有对象。
+folder_access.too_many:
+  en: "This folder holds %{count} objects; access is changed here for at most %{limit} at a time."
+  zh-CN: "此文件夹中有 %{count} 个对象，这里一次最多修改 %{limit} 个。"
+folder_access.started:
+  en: Changing access; the task list shows progress.
+  zh-CN: 正在修改访问权限，进度见任务列表。
+folder_access.summary:
+  en: "%{changed} changed, %{failed} failed, %{left} not reached. First error: %{error}"
+  zh-CN: "已修改 %{changed} 个，失败 %{failed} 个，未处理 %{left} 个。首个错误：%{error}"
+folder_access.stopped:
+  en: "Stopped because the connection was edited: %{changed} changed, %{failed} failed, %{left} not reached."
+  zh-CN: "连接已被修改，已停止：已修改 %{changed} 个，失败 %{failed} 个，未处理 %{left} 个。"
+import.button:
+  en: Import from web addresses…
+  zh-CN: 从网址导入…
+import.title:
+  en: "Import into %{place}"
+  zh-CN: "导入到 %{place}"
+import.placeholder:
+  en: One web address a line, http or https
+  zh-CN: 每行一个网址（http 或 https）
+import.ready:
+  en: "%{count} ready to import."
+  zh-CN: "%{count} 个可以导入。"
+import.not_web:
+  en: not an http or https address
+  zh-CN: 不是 http 或 https 网址
+import.no_name:
+  en: the address names no file to call the object
+  zh-CN: 网址中没有可作为对象名的文件名
+import.credentials:
+  en: a user name or password in the address is not supported
+  zh-CN: 不支持网址中带用户名或密码
+import.duplicate:
+  en: another line gives the same name
+  zh-CN: 与其他行的对象名重复
+import.limit:
+  en: Largest file
+  zh-CN: 单个文件上限
+import.limit_invalid:
+  en: Enter a size limit from 1 to 5,242,880 MiB.
+  zh-CN: 请输入 1 到 5242880 之间的大小上限（MiB）。
+import.fix_lines:
+  en: Correct or remove the lines marked in red first.
+  zh-CN: 请先修改或删除标红的行。
+import.none:
+  en: Enter at least one web address.
+  zh-CN: 请至少输入一个网址。
+import.too_many:
+  en: "Import at most %{limit} addresses at a time."
+  zh-CN: "一次最多导入 %{limit} 个网址。"
+import.note:
+  en: Each file is downloaded in full to this computer’s temporary folder, then uploaded; make sure there is room. An existing object of the same name is never replaced (on R2 and IDrive e2 a large upload checks first, which is not atomic). Addresses on private networks are refused, and the system proxy is not used. The addresses are kept only until supaS3 closes; after a restart these imports cannot be retried.
+  zh-CN: 每个文件先完整下载到本机临时目录再上传，请确保空间足够。不会替换已存在的同名对象（在 R2 与 IDrive e2 上大文件为先检查后写入，并非原子操作）。内网地址会被拒绝，不使用系统代理。网址只保存到 supaS3 关闭为止，重启后这些导入不能重试。
+import.start:
+  en: Import
+  zh-CN: 导入
+import.queued:
+  en: "%{count} imports added; the task list shows progress."
+  zh-CN: "已添加 %{count} 个导入任务，进度见任务列表。"
+
 access.title:
   en: Access
   zh-CN: 访问权限
@@ -362,6 +493,25 @@ access.object_changed:
 access.failed:
   en: "The access could not be changed: %{detail}"
   zh-CN: "无法修改访问权限：%{detail}"
+
+action.copy_address:
+  en: Copy address
+  zh-CN: 复制地址
+action.copy_public_address:
+  en: Copy public web address
+  zh-CN: 复制公开网址
+address.copied:
+  en: "Copied %{count} address(es)."
+  zh-CN: "已复制 %{count} 个地址。"
+address.files_only:
+  en: Public web addresses are for files; select files to copy theirs.
+  zh-CN: 公开网址只适用于文件，请选择文件。
+address.unknown:
+  en: The plain web address of objects on this connection is not known; use a share link instead.
+  zh-CN: 无法确定此连接上对象的公开网址，请改用分享链接。
+address.failed:
+  en: "The web addresses could not be made: %{detail}"
+  zh-CN: "无法生成网址：%{detail}"
 
 preferences.language:
   en: Language
@@ -1001,6 +1151,24 @@ tasks.move:
 tasks.rename:
   en: Rename
   zh-CN: 重命名
+tasks.interrupted_download_again:
+  en: Interrupted when supaS3 closed. Download it again from the pane. A partial file named .supas3-…part may be left in that folder.
+  zh-CN: supaS3 关闭时中断。请从面板重新下载。该文件夹中可能留有名为 .supas3-…part 的不完整文件，需要手动删除。
+redownload.connection_changed:
+  en: The connection changed since this download was added; download it again from the pane.
+  zh-CN: 添加此下载之后连接已被修改，请从面板重新下载。
+redownload.folder_gone:
+  en: "The folder it was going to does not exist (removed, or not made yet when interrupted): %{folder}. Download it again from the pane."
+  zh-CN: "目标文件夹不存在（已删除，或中断时尚未建立）：%{folder}。请从面板重新下载。"
+redownload.exists:
+  en: "%{file} already exists and is not replaced; download it again from the pane to choose."
+  zh-CN: "%{file} 已存在，不会被替换；如需替换请从面板重新下载。"
+tasks.interrupted_download:
+  en: Interrupted when supaS3 closed. Retry downloads it again from the start, to the same file; an existing file there is not replaced. A partial file named .supas3-…part may be left in that folder.
+  zh-CN: supaS3 关闭时中断。点“重试”会从头重新下载到同一位置，不会替换那里已有的文件。该文件夹中可能留有名为 .supas3-…part 的不完整文件，需要手动删除。
+tasks.access:
+  en: Access
+  zh-CN: 访问权限
 tasks.state_running:
   en: Running
   zh-CN: 进行中

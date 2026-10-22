@@ -33,6 +33,9 @@ pub enum RowCommand {
     Move(DraggedEntries),
     /// Delete these rows.
     Delete(DraggedEntries),
+    /// Put the rows' addresses on the clipboard; `public` asks for the
+    /// plain web address of each file instead.
+    CopyAddresses { rows: DraggedEntries, public: bool },
     /// Something for one row alone, whatever else is marked.
     One(RowAction, Location, Entry),
 }
@@ -411,7 +414,10 @@ impl TableDelegate for EntriesDelegate {
         let taken = self.taken(Some(row_ix));
         let (copy, delete) = (self.commands.clone(), self.commands.clone());
         let send_move = self.commands.clone();
+        let (address, public) = (self.commands.clone(), self.commands.clone());
+        let (addressed, published) = (taken.clone(), taken.clone());
         let (copied, moved, deleted) = (taken.clone(), taken.clone(), taken);
+        let remote = matches!(self.location, Location::Objects { .. });
         // Actions for the row under the pointer alone.
         let mut menu = menu;
         if let Some(entry) = self.entries.get(row_ix) {
@@ -459,6 +465,32 @@ impl TableDelegate for EntriesDelegate {
                 move |_, window, cx| send_move(RowCommand::Move(moved.clone()), window, cx),
             ),
         )
+        .separator()
+        .item(
+            PopupMenuItem::new(t!("action.copy_address").into_owned()).on_click(
+                move |_, window, cx| {
+                    let rows = addressed.clone();
+                    address(
+                        RowCommand::CopyAddresses {
+                            rows,
+                            public: false,
+                        },
+                        window,
+                        cx,
+                    )
+                },
+            ),
+        )
+        .when(remote, |menu| {
+            menu.item(
+                PopupMenuItem::new(t!("action.copy_public_address").into_owned()).on_click(
+                    move |_, window, cx| {
+                        let rows = published.clone();
+                        public(RowCommand::CopyAddresses { rows, public: true }, window, cx)
+                    },
+                ),
+            )
+        })
         .separator()
         .item(
             PopupMenuItem::new(t!("action.delete_ellipsis").into_owned()).on_click(

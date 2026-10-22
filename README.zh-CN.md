@@ -16,7 +16,9 @@
 - 删除文件与文件夹，执行前需确认；本机文件移到回收站。
 - 按名称、大小或日期排序，筛选显示的行，在存储桶的某个位置下按名称搜索。
 - 在标签页中打开不超过 8 MiB 的文本文件查看或编辑；查看 PNG、JPEG 与简单格式的 WebP 图片，可缩放。退出或关闭窗口时会询问未保存的修改。
-- 在详情面板中修改对象的内容类型，查看或修改对象是私有还是公开读取。
+- 在详情面板中修改对象的内容类型与用户元数据，查看或修改对象是私有还是公开读取；一次把文件夹中的所有对象设为私有或公开读取。
+- 从网址把文件导入到存储桶。
+- 复制文件、文件夹、存储桶的地址，或文件的公开网址。
 - 设置同时进行的传输数，以及每个传输的速度上限。
 - 为对象生成签名链接，有效期 1 小时、1 天或 7 天。
 - 查看对象的版本历史，下载指定版本；在已开启版本控制的存储桶上可恢复旧版本或永久删除某个版本。
@@ -48,14 +50,14 @@
 | macOS，Apple 芯片 | `supas3-<版本>-macos-arm64.dmg` |
 | Windows，x64 | `supas3-<版本>-windows-x64-setup.exe`，或免安装的 `.zip` |
 | Windows，ARM64 | `supas3-<版本>-windows-arm64-setup.exe`，或 `.zip` |
-| Linux，x64 | `supas3_<版本>_amd64.deb`，或 `.tar.gz` |
-| Linux，ARM64 | `supas3_<版本>_arm64.deb`，或 `.tar.gz` |
+| Linux，x64 | `supas3_<版本>_amd64.deb`、`supas3-<版本>-1.x86_64.rpm`、`supas3-<版本>-linux-x64.AppImage`，或 `.tar.gz` |
+| Linux，ARM64 | `supas3_<版本>_arm64.deb`、`supas3-<版本>-1.aarch64.rpm`、`supas3-<版本>-linux-arm64.AppImage`，或 `.tar.gz` |
 
 安装包没有使用开发者证书签名。
 
 - **macOS：** 打开磁盘映像，把 supaS3 拖到“应用程序”。首次打开会被系统阻止；请在“系统设置 → 隐私与安全性”中选择“仍要打开”，或运行 `xattr -dr com.apple.quarantine /Applications/supaS3.app`。
 - **Windows：** SmartScreen 可能提示无法识别的应用；选择“更多信息 → 仍要运行”。安装程序只为当前用户安装，不需要管理员权限。
-- **Linux：** `sudo apt install ./supas3_<版本>_<架构>.deb`。应用需要可用的 Vulkan 驱动；没有显卡的机器可以安装 `mesa-vulkan-drivers`。
+- **Linux：** Debian、Ubuntu 用 `sudo apt install ./supas3_<版本>_<架构>.deb`；Fedora 等用 `sudo dnf install ./supas3-<版本>-1.<架构>.rpm`；AppImage 加上执行权限后直接运行（`chmod +x supas3-*.AppImage`）。各种包都需要 glibc 2.39 或更新（例如 Ubuntu 24.04、Debian 13、Fedora 40 及以后）。应用需要可用的 Vulkan 驱动；没有显卡的机器可以安装 `mesa-vulkan-drivers`。
 
 访问密钥保存在系统的凭据存储中（钥匙串、凭据管理器，或 Linux 上的 Secret Service）。没有可用的凭据存储时，密钥只保留到应用关闭。
 

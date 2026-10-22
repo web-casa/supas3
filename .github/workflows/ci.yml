@@ -224,6 +224,7 @@ jobs:
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
+          sudo apt-get install -y --no-install-recommends rpm
           packaging/linux/package.sh target/release/supas3 THIRD_PARTY_LICENSES.txt dist
           # The package must install with its declared dependencies and put
           # the program on the path.
@@ -231,6 +232,14 @@ jobs:
           test -x /usr/bin/supas3
           test -f /usr/share/doc/supas3/THIRD_PARTY_LICENSES.txt
           grep -q 'Lucide Icons and Contributors' /usr/share/doc/supas3/LICENSES/Lucide-ISC.txt
+          # The RPM installs on Fedora with the dependencies it declares.
+          docker run --rm -v "$PWD/dist:/dist:ro" fedora:42 sh -euc \
+            'dnf install -y -q --setopt=install_weak_deps=False /dist/*.rpm; test -x /usr/bin/supas3; test -f /usr/share/doc/supas3/THIRD_PARTY_LICENSES.txt'
+          # The AppImage holds the program, its launcher and the licenses.
+          (mkdir -p appimage-check && cd appimage-check \
+            && APPIMAGE_EXTRACT_AND_RUN=1 ../dist/*.AppImage --appimage-extract > /dev/null \
+            && test -x squashfs-root/AppRun && test -x squashfs-root/usr/bin/supas3 \
+            && test -f squashfs-root/usr/share/doc/supas3/THIRD_PARTY_LICENSES.txt)
 
       # With a Developer ID certificate in the repository's secrets the app
       # is signed with it, and a version tag is also notarized. Without one
@@ -321,7 +330,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           ls -l dist
-          test "$(ls dist | wc -l)" -eq 9
+          test "$(ls dist | wc -l)" -eq 13
           (cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
           # The section of CHANGELOG.md for this version.
           awk -v heading="## ${TAG#v}" '

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Copy the address of files, folders and buckets, or the public web address of files, to the clipboard.
+- Edit an object's user metadata; entries left as they are stay as they are.
+- Make every object in a folder private or public at once, as a task that can be cancelled.
+- Import files into a bucket from web addresses.
+- A download cut off by closing supaS3 can be retried, from the start, to the same file.
+- AppImage and RPM packages for Linux, x64 and ARM64.
+
 ## 0.2.0
 
 - New folder, and rename of files and folders, in storage and on this computer.
