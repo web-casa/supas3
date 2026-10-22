@@ -23,6 +23,8 @@ pub enum ImportEvent {
 }
 
 pub struct ImportDialog {
+    /// Where the files go, as the user would name it.
+    place: String,
     addresses: Entity<TextareaState>,
     limit: Entity<InputState>,
     lines: Vec<ImportLine>,
@@ -37,7 +39,7 @@ pub struct ImportDialog {
 impl EventEmitter<ImportEvent> for ImportDialog {}
 
 impl ImportDialog {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(place: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let addresses = cx.new(|cx| {
             TextareaState::new(window, cx).placeholder(t!("import.placeholder").into_owned())
         });
@@ -63,6 +65,7 @@ impl ImportDialog {
             }),
         ];
         Self {
+            place,
             addresses,
             limit,
             lines: Vec::new(),
@@ -142,6 +145,13 @@ impl Render for ImportDialog {
         v_flex()
             .w_full()
             .gap_3()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .truncate()
+                    .child(t!("import.into", place = self.place.as_str()).into_owned()),
+            )
             .child(Textarea::new(&self.addresses).h(height).disabled(self.busy))
             .when(!self.lines.is_empty(), |this| {
                 this.child(
@@ -246,7 +256,7 @@ mod tests {
             };
             gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| {
-                    let dialog = cx.new(|cx| ImportDialog::new(window, cx));
+                    let dialog = cx.new(|cx| ImportDialog::new("bucket/".into(), window, cx));
                     let events = cx.subscribe(&dialog, |host: &mut Host, _, event, _| {
                         let ImportEvent::Submitted(items, limit) = event;
                         host.submitted.push((items.clone(), *limit));

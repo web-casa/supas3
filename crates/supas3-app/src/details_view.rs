@@ -9,10 +9,11 @@ use crate::error_details::ErrorDetails;
 use crate::listing::{format_modified, format_size, Entry};
 use crate::location::Location;
 use crate::object_actions::{
-    access_of, needs_restore, Access, Grant, ObjectRef, CONTENT_TYPE_LIMIT,
+    access_of, brief_error, needs_restore, Access, Grant, ObjectRef, CONTENT_TYPE_LIMIT,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::description_list::DescriptionList;
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{
     h_flex, v_flex, ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _,
 };
@@ -20,6 +21,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rust_i18n::t;
 use std::time::Duration;
+use supas3_core::commands::bucket_admin::Versioning;
 use supas3_core::commands::operations::{ObjectMetadata, ObjectPermissions, SeenProperties};
 
 /// How long the selection must stay on an object before it is asked about,
@@ -37,6 +39,7 @@ pub struct ConnectionInfo {
     pub idrive_e2: bool,
 }
 
+#[derive(Clone)]
 pub enum DetailsEvent {
     Close,
     /// Do this with the row, read from the location.
@@ -51,6 +54,17 @@ pub enum DetailsEvent {
         name: String,
         current: Option<String>,
         etag: String,
+    },
+    /// Turn a bucket's versioning on, or pause it.
+    SetVersioning {
+        profile_id: String,
+        bucket: String,
+        enabled: bool,
+    },
+    /// Show and edit a bucket's policy.
+    EditPolicy {
+        profile_id: String,
+        bucket: String,
     },
     /// Give every object under a folder this ACL.
     FolderAccess {
@@ -87,7 +101,7 @@ enum Permissions {
 }
 
 impl Permissions {
-    fn from(permissions: ObjectPermissions, idrive_e2: bool) -> Self {
+    fn from(permissions: ObjectPermissions, custom_endpoint: bool) -> Self {
         let grants: Vec<Grant> = permissions
             .grants
             .iter()
@@ -98,7 +112,7 @@ impl Permissions {
                 permission: grant.permission.as_deref(),
             })
             .collect();
-        let access = access_of(permissions.owner_id.as_deref(), &grants, idrive_e2);
+        let access = access_of(permissions.owner_id.as_deref(), &grants, custom_endpoint);
         Self::Loaded {
             status: permissions.status,
             message: permissions.message,
@@ -121,6 +135,8 @@ pub struct DetailsPanel {
     connection: Option<ConnectionInfo>,
     metadata: Metadata,
     permissions: Permissions,
+    /// A bucket's versioning, read for a bucket shown.
+    versioning: Option<Result<Versioning, String>>,
     /// Counts subjects shown; an answer about an earlier one is dropped.
     generation: u64,
 }
@@ -135,6 +151,7 @@ impl DetailsPanel {
             connection: None,
             metadata: Metadata::None,
             permissions: Permissions::None,
+            versioning: None,
             generation: 0,
         }
     }
@@ -178,14 +195,37 @@ impl DetailsPanel {
         let generation = self.generation;
         self.metadata = Metadata::None;
         self.permissions = Permissions::None;
+        self.versioning = None;
+        if let Some(Subject::Bucket { profile_id, bucket }) = &self.subject {
+            let (profile_id, bucket) = (profile_id.clone(), bucket.clone());
+            if let Some(requests) = AppBackend::requests(cx) {
+                cx.spawn(async move |panel, cx| {
+                    cx.background_executor().timer(settle).await;
+                    let current = panel
+                        .read_with(cx, |panel, _| panel.generation == generation)
+                        .unwrap_or(false);
+                    if !current {
+                        return;
+                    }
+                    let result = requests.bucket_versioning(profile_id, bucket).await;
+                    let _ = panel.update(cx, |panel, cx| {
+                        if panel.generation == generation {
+                            panel.versioning = Some(result);
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
+        }
         if let Some(Subject::Object { object, .. }) = &self.subject {
             self.metadata = Metadata::Loading;
             self.permissions = Permissions::Loading;
             let object = object.clone();
-            let idrive_e2 = self
+            let custom_endpoint = self
                 .connection
                 .as_ref()
-                .is_some_and(|connection| connection.idrive_e2);
+                .is_some_and(|connection| connection.endpoint.is_some());
             if let Some(requests) = AppBackend::requests(cx) {
                 cx.spawn(async move |panel, cx| {
                     cx.background_executor().timer(settle).await;
@@ -209,7 +249,7 @@ impl DetailsPanel {
                     let _ = panel.update(cx, |panel, cx| {
                         if panel.generation == generation {
                             panel.permissions = match result {
-                                Ok(permissions) => Permissions::from(permissions, idrive_e2),
+                                Ok(permissions) => Permissions::from(permissions, custom_endpoint),
                                 Err(error) => Permissions::Failed(error),
                             };
                             cx.notify();
@@ -284,6 +324,74 @@ impl DetailsPanel {
                 seen: seen.clone(),
             });
         })))
+    }
+
+    /// A bucket's versioning with the choice to change it, and its policy.
+    fn render_bucket(&self, profile_id: &str, bucket: &str, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let event = |enabled: bool| DetailsEvent::SetVersioning {
+            profile_id: profile_id.to_string(),
+            bucket: bucket.to_string(),
+            enabled,
+        };
+        let (status, change) = match &self.versioning {
+            None => (t!("view.loading").into_owned(), None),
+            Some(Err(error)) => (brief_error(error), None),
+            Some(Ok(Versioning::Unavailable(_))) => {
+                (t!("bucket.versioning_unavailable").into_owned(), None)
+            }
+            Some(Ok(Versioning::Off)) => (
+                t!("bucket.versioning_off").into_owned(),
+                Some(("versioning-on", t!("bucket.versioning_enable"), event(true))),
+            ),
+            Some(Ok(Versioning::Suspended)) => (
+                t!("bucket.versioning_suspended").into_owned(),
+                Some(("versioning-on", t!("bucket.versioning_enable"), event(true))),
+            ),
+            Some(Ok(Versioning::Enabled)) => (
+                t!("bucket.versioning_enabled").into_owned(),
+                Some((
+                    "versioning-off",
+                    t!("bucket.versioning_suspend"),
+                    event(false),
+                )),
+            ),
+        };
+        let policy = DetailsEvent::EditPolicy {
+            profile_id: profile_id.to_string(),
+            bucket: bucket.to_string(),
+        };
+        v_flex()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .child(t!("bucket.versioning").into_owned()),
+            )
+            .child(div().text_sm().text_color(muted).child(status))
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .when_some(change, |this, (id, label, event)| {
+                        this.child(
+                            Button::new(id)
+                                .small()
+                                .outline()
+                                .label(label.into_owned())
+                                .on_click(cx.listener(move |_, _, _, cx| cx.emit(event.clone()))),
+                        )
+                    })
+                    .child(
+                        Button::new("bucket-policy")
+                            .small()
+                            .outline()
+                            .label(t!("bucket.policy_ellipsis").into_owned())
+                            .on_click(cx.listener(move |_, _, _, cx| cx.emit(policy.clone()))),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// Who may read the object, and the choice to change it.
@@ -396,6 +504,61 @@ impl DetailsPanel {
             .into_any_element()
     }
 
+    /// The object's less frequent commands, in one menu.
+    fn more_menu(
+        &self,
+        source: Option<Location>,
+        entry: Entry,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let panel = cx.weak_entity();
+        // Keyed by the subject, so a menu left open while the panel moves
+        // on to another one is built anew rather than acting on the old.
+        let subject = {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            source.hash(&mut hasher);
+            entry.name.hash(&mut hasher);
+            hasher.finish()
+        };
+        Button::new(("details-more", subject as usize))
+            .small()
+            .outline()
+            .icon(IconName::Ellipsis)
+            .tooltip(t!("details.more").into_owned())
+            .dropdown_menu(move |menu, _, _| {
+                let emit = |event: Option<DetailsEvent>| {
+                    let panel = panel.clone();
+                    move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                        if let Some(event) = event.clone() {
+                            let _ = panel.update(cx, |_, cx| cx.emit(event));
+                        }
+                    }
+                };
+                let row = |action| {
+                    source
+                        .clone()
+                        .map(|source| DetailsEvent::Row(action, source, entry.clone()))
+                };
+                menu.item(
+                    PopupMenuItem::new(t!("action.share_ellipsis").into_owned())
+                        .on_click(emit(row(RowAction::Share))),
+                )
+                .item(
+                    PopupMenuItem::new(t!("action.versions_ellipsis").into_owned())
+                        .on_click(emit(row(RowAction::Versions))),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new(t!("action.copy_address").into_owned()).on_click(emit(
+                        source
+                            .clone()
+                            .map(|source| DetailsEvent::CopyAddress(source, entry.clone())),
+                    )),
+                )
+            })
+    }
+
     fn row_button(
         &self,
         id: &'static str,
@@ -442,7 +605,15 @@ fn exact_size(size: u64) -> String {
 impl Render for DetailsPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
-        let label_width = rems(6.).to_pixels(window.rem_size());
+        let label_width = rems(8.).to_pixels(window.rem_size());
+        // What the panel describes, named in its title.
+        let heading = match &self.subject {
+            Some(Subject::Object { entry, .. })
+            | Some(Subject::LocalFile { entry, .. })
+            | Some(Subject::Folder { entry, .. }) => entry.name.clone(),
+            Some(Subject::Bucket { bucket, .. }) => bucket.clone(),
+            _ => t!("details.title").into_owned(),
+        };
         let unknown = || t!("properties.unknown").into_owned();
         let list = || DescriptionList::new().columns(1).label_width(label_width);
         let note = |text: String| div().text_sm().text_color(muted).child(text);
@@ -495,8 +666,8 @@ impl Render for DetailsPanel {
                 }
                 items.into_any_element()
             }
-            Some(Subject::Bucket { bucket, .. }) => {
-                let mut items = list().item(t!("details.bucket").into_owned(), bucket, 1);
+            Some(Subject::Bucket { profile_id, bucket }) => {
+                let mut items = list().item(t!("details.bucket").into_owned(), bucket.clone(), 1);
                 if let Some(connection) = &self.connection {
                     items = items
                         .item(
@@ -515,7 +686,11 @@ impl Render for DetailsPanel {
                             1,
                         );
                 }
-                items.into_any_element()
+                v_flex()
+                    .gap_3()
+                    .child(items)
+                    .child(self.render_bucket(&profile_id, &bucket, cx))
+                    .into_any_element()
             }
             Some(Subject::Folder { location, entry }) => {
                 let place = match &location {
@@ -675,20 +850,6 @@ impl Render for DetailsPanel {
                                 &entry,
                                 cx,
                             ))
-                            .child(self.row_button(
-                                "details-share",
-                                t!("action.share_ellipsis").into_owned(),
-                                RowAction::Share,
-                                &entry,
-                                cx,
-                            ))
-                            .child(self.row_button(
-                                "details-versions",
-                                t!("action.versions_ellipsis").into_owned(),
-                                RowAction::Versions,
-                                &entry,
-                                cx,
-                            ))
                             .child(
                                 Button::new("details-download")
                                     .small()
@@ -703,20 +864,7 @@ impl Render for DetailsPanel {
                                         }
                                     })),
                             )
-                            .child(
-                                Button::new("details-copy-address")
-                                    .small()
-                                    .outline()
-                                    .label(t!("action.copy_address").into_owned())
-                                    .on_click(cx.listener(move |_, _, _, cx| {
-                                        if let Some(source) = address_source.clone() {
-                                            cx.emit(DetailsEvent::CopyAddress(
-                                                source,
-                                                address_entry.clone(),
-                                            ));
-                                        }
-                                    })),
-                            ),
+                            .child(self.more_menu(address_source, address_entry, cx)),
                     )
                     .child(reported)
                     .when(matches!(self.metadata, Metadata::Loading), |this| {
@@ -745,9 +893,12 @@ impl Render for DetailsPanel {
                     .border_color(cx.theme().border)
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_sm()
                             .font_semibold()
-                            .child(t!("details.title").into_owned()),
+                            .child(heading),
                     )
                     .child(
                         Button::new("details-close")

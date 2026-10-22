@@ -1,3 +1,4 @@
+pub mod bucket_admin;
 pub mod bucket_management;
 pub mod buckets;
 pub mod cross_copy;
@@ -7,6 +8,7 @@ pub mod operations;
 pub mod preview;
 pub mod profiles;
 pub mod replace;
+pub mod retry_cleanup;
 pub mod sync;
 pub mod transfer;
 pub mod urls;

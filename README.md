@@ -12,7 +12,7 @@ A native desktop application for browsing object storage and moving files betwee
 - Upload, download, copy within a connection, and copy between two connections. A copy between connections passes through this computer and says so before it starts.
 - Move items to the other pane, from the menu or by dragging with Command held on macOS or Shift on Windows and Linux. Each original is removed only after its copy has been checked; anything that cannot be checked keeps its original.
 - New folder and rename, in storage and on this computer. A folder in storage is renamed object by object, in the background.
-- A transfer list with progress, cancel and retry.
+- A transfer list with progress, cancel and retry. Uploads, downloads and copies cut off by the network are retried on their own, up to three times; an upload only while its target is still as it was.
 - Delete files and folders, after a confirmation. On this computer they go to the recycle bin.
 - Sort by name, size or date, filter the rows shown, and search names below a location in a bucket.
 - Open text files of up to 8 MiB in a tab to read or edit them, and view PNG, JPEG and simple WebP images with zoom. Quitting or closing the window asks about unsaved edits.
@@ -21,6 +21,7 @@ A native desktop application for browsing object storage and moving files betwee
 - Copy the address of files, folders and buckets, or the public web address of files.
 - Set how many transfers run at once and a speed limit for each transfer.
 - Make a signed link to an object that expires after an hour, a day or a week.
+- Create and delete buckets, turn versioning on or pause it, and edit a bucket's policy, where the service and the keys allow it.
 - Show an object's version history, download a chosen version, and restore an older version or delete a version for good on buckets with versioning turned on.
 - Sync a folder on this computer to storage: compare first, see what would be uploaded, then start. Nothing in storage is deleted.
 - A details panel for the selected item, a sidebar that collapses to icons, and keyboard movement between the sidebar and the panes.
@@ -39,7 +40,7 @@ When a copy finds a name already taken, it asks whether to skip the item, keep b
 | Huawei Cloud OBS | Implemented from Huawei's documentation, not tested |
 | Amazon S3 | Not tested against a real bucket in this version. Connects with typed keys or with a profile of this computer's AWS configuration |
 
-The domestic cloud services are used through their S3-compatible interface. Alibaba Cloud requires accounts that started using OSS after 20 March 2025 to reach buckets in mainland China through a custom domain bound to the bucket; supaS3 cannot use such a domain yet, and says so when OSS refuses a request for this reason. Version history has been tested only on buckets without versioning; restoring a version follows the services' documentation and is untested.
+The domestic cloud services are used through their S3-compatible interface. Alibaba Cloud requires accounts that started using OSS after 20 March 2025 to reach buckets in mainland China through a custom domain bound to the bucket; supaS3 cannot use such a domain yet, and says so when OSS refuses a request for this reason. Version history, restoring, downloading and deleting a version have been tested on Tencent Cloud COS and MinIO buckets with versioning on.
 
 ## Install
 

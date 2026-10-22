@@ -3,7 +3,7 @@
 //! workspace applies the limits and saves them.
 
 use crate::error_details::ErrorDetails;
-use crate::settings::{TransferSettings, CONCURRENCY};
+use crate::settings::{TransferProblem, TransferSettings, CONCURRENCY};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Disableable as _, WindowExt as _};
@@ -19,7 +19,7 @@ pub enum TransfersDialogEvent {
 pub struct TransfersDialog {
     concurrency: Entity<InputState>,
     bandwidth: Entity<InputState>,
-    problem: Option<String>,
+    problem: Option<TransferProblem>,
     busy: bool,
     error: Option<String>,
     /// Focus to apply once shown: the dialog takes focus as it opens.
@@ -78,7 +78,7 @@ impl TransfersDialog {
                 self.error = None;
                 cx.emit(TransfersDialogEvent::Submitted(limits));
             }
-            Err(problem) => self.problem = Some(t!(problem.message_key()).into_owned()),
+            Err(problem) => self.problem = Some(problem),
         }
         cx.notify();
     }
@@ -104,19 +104,34 @@ impl Render for TransfersDialog {
             });
         }
         let muted = cx.theme().muted_foreground;
+        let danger = cx.theme().danger;
+        let problem = self.problem;
         let field = |id: &'static str,
                      label: String,
                      input: &Entity<InputState>,
-                     suffix: Option<String>| {
-            v_flex().gap_1().child(div().text_sm().child(label)).child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(Input::new(input).id(id).disabled(self.busy))
-                    .when_some(suffix, |this, suffix| {
-                        this.child(div().text_sm().text_color(muted).child(suffix))
-                    }),
-            )
+                     suffix: Option<String>,
+                     concerns: TransferProblem| {
+            v_flex()
+                .gap_1()
+                .child(div().text_sm().child(label))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(Input::new(input).id(id).disabled(self.busy))
+                        .when_some(suffix, |this, suffix| {
+                            this.child(div().text_sm().text_color(muted).child(suffix))
+                        }),
+                )
+                // What is wrong shows beside what is wrong.
+                .when(problem == Some(concerns), |this| {
+                    this.child(
+                        div()
+                            .text_sm()
+                            .text_color(danger)
+                            .child(t!(concerns.message_key()).into_owned()),
+                    )
+                })
         };
         v_flex()
             .w_full()
@@ -131,12 +146,14 @@ impl Render for TransfersDialog {
                 .into_owned(),
                 &self.concurrency,
                 None,
+                TransferProblem::Concurrency,
             ))
             .child(field(
                 "transfers-bandwidth",
                 t!("transfers.bandwidth").into_owned(),
                 &self.bandwidth,
                 Some("MiB/s".to_string()),
+                TransferProblem::Bandwidth,
             ))
             .child(
                 div()
@@ -144,9 +161,6 @@ impl Render for TransfersDialog {
                     .text_color(muted)
                     .child(t!("transfers.note").into_owned()),
             )
-            .when_some(self.problem.clone(), |this, problem| {
-                this.child(div().text_sm().text_color(cx.theme().danger).child(problem))
-            })
             .when_some(self.error.clone(), |this, error| {
                 this.child(ErrorDetails::new("transfers-error", error).danger())
             })

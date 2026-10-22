@@ -154,6 +154,16 @@ impl Render for MetadataDialog {
         v_flex()
             .w_full()
             .gap_2()
+            .when(!self.rows.is_empty(), |this| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(div().w(rems(10.)).child(t!("metadata.key").into_owned()))
+                        .child(div().flex_1().child(t!("metadata.value").into_owned())),
+                )
+            })
             .children(self.rows.iter().enumerate().map(|(index, row)| {
                 h_flex()
                     .gap_2()

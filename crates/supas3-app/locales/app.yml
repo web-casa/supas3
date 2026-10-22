@@ -202,6 +202,9 @@ problem.bucket_dot:
 action.cancel:
   en: Cancel
   zh-CN: 取消
+action.add:
+  en: Add
+  zh-CN: 添加
 action.save:
   en: Save
   zh-CN: 保存
@@ -264,6 +267,9 @@ status.loading_more:
 status.items:
   en: "%{count} items"
   zh-CN: "%{count} 项"
+status.items_one:
+  en: "1 item"
+  zh-CN: "1 项"
 status.items_more:
   en: "%{count} items loaded, more available"
   zh-CN: "已加载 %{count} 项，还有更多"
@@ -291,8 +297,8 @@ content_type.suggested:
   en: "By its name:"
   zh-CN: 按文件名建议：
 content_type.note:
-  en: The object is copied onto itself with the new type; its content, metadata, tags and permissions stay. Its modified time changes, and with versioning on this adds a version. If its content changed since it was shown, nothing is changed; a change made meanwhile to its other properties is not noticed.
-  zh-CN: 对象会以新的类型复制到原位置，内容、元数据、标签与访问权限不变；修改时间会更新，开启版本控制的桶里会多一个版本。对象内容在显示之后被改动过时不做修改；期间他人对其他属性的修改无法察觉。
+  en: "The object is copied onto itself with the new type; its modified time changes. Nothing is changed if its content changed since it was shown."
+  zh-CN: "对象会以新类型复制到原位置，修改时间随之更新。对象内容在显示之后被改动过时不做修改。"
 properties.too_large:
   en: The type and metadata are changed here only for objects up to 5 GiB.
   zh-CN: 只能修改不超过 5 GiB 的对象的内容类型与元数据。
@@ -330,8 +336,8 @@ metadata.fixed:
   en: "%{key}: %{value} (kept as it is)"
   zh-CN: "%{key}：%{value}（保持不变）"
 metadata.note:
-  en: Names are stored in lower case. New or changed entries may use letters, digits and hyphens in names and plain ASCII in values; entries left as they are stay as they are. The object is copied onto itself, so its modified time changes. If its content or properties changed since they were shown, nothing is changed; a change in the second before saving, or to its permissions, may not be noticed.
-  zh-CN: 名称以小写保存。新增或修改的条目，名称只能用字母、数字和连字符，值只能用 ASCII 可打印字符；未改动的条目保持原样。对象会复制到原位置，修改时间会更新。对象内容或属性在显示之后被改动过时不做修改；保存前一秒内的改动、或对访问权限的改动可能察觉不到。
+  en: "Names: letters, digits and hyphens. Values: ASCII only. Entries left as they are stay as they are. Saving updates the modified time; nothing is changed if the object changed since it was shown."
+  zh-CN: "名称只能用字母、数字和连字符，值只能用 ASCII 字符；未改动的条目保持原样。保存会更新修改时间；对象在显示之后被改动过时不做修改。"
 metadata.key_invalid:
   en: A name may use letters, digits and hyphens only.
   zh-CN: 名称只能使用字母、数字和连字符。
@@ -391,7 +397,10 @@ import.button:
   en: Import from web addresses…
   zh-CN: 从网址导入…
 import.title:
-  en: "Import into %{place}"
+  en: "Import from web addresses"
+  zh-CN: "从网址导入"
+import.into:
+  en: "Into %{place}"
   zh-CN: "导入到 %{place}"
 import.placeholder:
   en: One web address a line, http or https
@@ -427,8 +436,8 @@ import.too_many:
   en: "Import at most %{limit} addresses at a time."
   zh-CN: "一次最多导入 %{limit} 个网址。"
 import.note:
-  en: Each file is downloaded in full to this computer’s temporary folder, then uploaded; make sure there is room. An existing object of the same name is never replaced (on R2 and IDrive e2 a large upload checks first, which is not atomic). Addresses on private networks are refused, and the system proxy is not used. The addresses are kept only until supaS3 closes; after a restart these imports cannot be retried.
-  zh-CN: 每个文件先完整下载到本机临时目录再上传，请确保空间足够。不会替换已存在的同名对象（在 R2 与 IDrive e2 上大文件为先检查后写入，并非原子操作）。内网地址会被拒绝，不使用系统代理。网址只保存到 supaS3 关闭为止，重启后这些导入不能重试。
+  en: "Files are downloaded to this computer first, then uploaded; make sure there is room. Existing objects are never replaced. Private network addresses are refused."
+  zh-CN: "文件先下载到本机再上传，请确保空间足够。不会替换已存在的对象。内网地址会被拒绝。"
 import.start:
   en: Import
   zh-CN: 导入
@@ -436,12 +445,148 @@ import.queued:
   en: "%{count} imports added; the task list shows progress."
   zh-CN: "已添加 %{count} 个导入任务，进度见任务列表。"
 
+bucket.new_ellipsis:
+  en: New bucket…
+  zh-CN: 新建存储桶…
+bucket.new_title:
+  en: New bucket
+  zh-CN: 新建存储桶
+bucket.name:
+  en: Name
+  zh-CN: 名称
+bucket.region:
+  en: Region
+  zh-CN: 地域
+bucket.region_fixed:
+  en: The bucket is made in the connection’s region; another region needs a connection to it.
+  zh-CN: 存储桶建在连接所在的地域；其他地域需要另建对应的连接。
+bucket.region_missing:
+  en: Enter a region.
+  zh-CN: 请输入地域。
+bucket.rule:
+  en: 3 to 63 lower-case letters, digits and hyphens, starting and ending with a letter or digit. Names are unique within the service or account.
+  zh-CN: 3 到 63 个小写字母、数字或连字符，以字母或数字开头和结尾。名称在服务或账户内唯一。
+bucket.rule_dots:
+  en: 3 to 63 lower-case letters, digits, hyphens and dots, starting and ending with a letter or digit. On Amazon S3 names are unique across all accounts.
+  zh-CN: 3 到 63 个小写字母、数字、连字符或点，以字母或数字开头和结尾。Amazon S3 上的名称在所有账户间唯一。
+bucket.rule_cos:
+  en: Lower-case letters, digits and hyphens, ending with -APPID (for example photos-1250000000); the whole host name is at most 60 characters.
+  zh-CN: 小写字母、数字或连字符，以 -APPID 结尾（例如 photos-1250000000）；完整访问域名不超过 60 个字符。
+bucket.name_form:
+  en: Use 3 to 63 lower-case letters, digits and hyphens, starting and ending with a letter or digit.
+  zh-CN: 请使用 3 到 63 个小写字母、数字或连字符，并以字母或数字开头和结尾。
+bucket.name_dot:
+  en: This service does not allow dots in bucket names.
+  zh-CN: 此服务的存储桶名称不能含点。
+bucket.name_app_id:
+  en: COS bucket names end with -APPID, for example photos-1250000000.
+  zh-CN: COS 存储桶名称须以 -APPID 结尾，例如 photos-1250000000。
+bucket.name_cos_long:
+  en: The name is too long for this region; COS host names are at most 60 characters.
+  zh-CN: 对此地域而言名称过长：COS 访问域名不超过 60 个字符。
+bucket.create:
+  en: Create
+  zh-CN: 新建
+bucket.created:
+  en: "Bucket %{name} was created."
+  zh-CN: "已新建存储桶 %{name}。"
+bucket.delete_ellipsis:
+  en: Delete bucket…
+  zh-CN: 删除存储桶…
+bucket.delete_title:
+  en: "Delete bucket %{name}?"
+  zh-CN: "删除存储桶 %{name}？"
+bucket.delete_body:
+  en: Only an empty bucket can be deleted, with no objects, old versions, delete markers or unfinished multipart uploads left. Deleting cannot be undone, and the name may be taken by someone else afterwards.
+  zh-CN: 只能删除空的存储桶：不能有对象、历史版本、删除标记或未完成的分片上传。删除无法撤销，之后该名称可能被他人占用。
+bucket.delete_type:
+  en: "Type %{name} to confirm."
+  zh-CN: "请输入 %{name} 以确认。"
+bucket.delete:
+  en: Delete bucket
+  zh-CN: 删除存储桶
+bucket.delete_unsaved:
+  en: An object of this bucket has unsaved edits; save or close it first.
+  zh-CN: 此存储桶中有对象存在未保存的修改，请先保存或关闭。
+bucket.delete_busy:
+  en: Transfers are still working in this bucket; wait for them or cancel them first.
+  zh-CN: 仍有传输在使用此存储桶，请等待完成或先取消。
+bucket.not_empty:
+  en: The bucket is not empty. Delete its objects first, including old versions and delete markers; unfinished multipart uploads also keep it from being deleted.
+  zh-CN: 存储桶不为空。请先删除其中的对象，包括历史版本与删除标记；未完成的分片上传也会阻止删除。
+bucket.deleted:
+  en: "Bucket %{name} was deleted."
+  zh-CN: "已删除存储桶 %{name}。"
+bucket.deleted_default:
+  en: "Bucket %{name} was deleted. It was the bucket this connection opens; edit the connection to choose another."
+  zh-CN: "已删除存储桶 %{name}。它是此连接默认打开的存储桶，请编辑连接另选一个。"
+bucket.versioning:
+  en: Versioning
+  zh-CN: 版本控制
+bucket.versioning_off:
+  en: Never turned on.
+  zh-CN: 未开启。
+bucket.versioning_enabled:
+  en: "On: every change and deletion keeps the earlier version."
+  zh-CN: 已开启：每次修改和删除都会保留之前的版本。
+bucket.versioning_suspended:
+  en: "Paused: versions kept so far stay; new changes keep none."
+  zh-CN: 已暂停：已有的版本保留，新的修改不再保留版本。
+bucket.versioning_unavailable:
+  en: Not available here (the service does not offer it, or these credentials may not use it).
+  zh-CN: 此处不可用（服务不支持，或当前凭据无权使用）。
+bucket.versioning_enable:
+  en: Turn on versioning
+  zh-CN: 开启版本控制
+bucket.versioning_suspend:
+  en: Pause versioning
+  zh-CN: 暂停版本控制
+bucket.versioning_enable_title:
+  en: "Turn on versioning for %{name}?"
+  zh-CN: "为 %{name} 开启版本控制？"
+bucket.versioning_enable_body:
+  en: Every change and deletion will keep the earlier version, and old versions are stored and billed until they are deleted. Once on, versioning can be paused but never turned off again.
+  zh-CN: 之后每次修改和删除都会保留之前的版本，旧版本会占用存储并计费，直到删除。开启后只能暂停，不能再关闭。
+bucket.versioning_suspend_title:
+  en: "Pause versioning for %{name}?"
+  zh-CN: "暂停 %{name} 的版本控制？"
+bucket.versioning_suspend_body:
+  en: Versions kept so far stay and can still be restored; new changes will replace objects without keeping the earlier version.
+  zh-CN: 已有的版本保留，仍可恢复；之后的修改会直接替换对象，不再保留之前的版本。
+bucket.versioning_failed:
+  en: "Versioning could not be changed: %{detail}"
+  zh-CN: "无法修改版本控制：%{detail}"
+bucket.policy_ellipsis:
+  en: Bucket policy…
+  zh-CN: 存储桶策略…
+policy.title:
+  en: "Policy of %{name}"
+  zh-CN: "%{name} 的存储桶策略"
+policy.unreadable:
+  en: "The policy could not be read (the service may not offer it, or these credentials may not use it): %{detail}"
+  zh-CN: "无法读取策略（服务可能不支持，或当前凭据无权使用）：%{detail}"
+policy.saved:
+  en: The bucket policy was saved.
+  zh-CN: 存储桶策略已保存。
+policy.note:
+  en: Saving replaces the whole policy; an empty text removes it. A policy can make a bucket public or lock out even its owner, so check it first. Tencent COS names principals differently from AWS (qcs::cam::…).
+  zh-CN: 保存会整份替换策略；内容为空表示删除策略。策略可能让存储桶公开，甚至把所有者也挡在外面，请先确认。腾讯云 COS 的主体写法与 AWS 不同（qcs::cam::…）。
+policy.not_object:
+  en: A bucket policy is a JSON object.
+  zh-CN: 存储桶策略须是一个 JSON 对象。
+policy.invalid:
+  en: "This is not valid JSON: %{detail}"
+  zh-CN: "不是有效的 JSON：%{detail}"
+policy.unchanged:
+  en: The policy is unchanged.
+  zh-CN: 策略没有改动。
+
 access.title:
   en: Access
   zh-CN: 访问权限
 access.private:
   en: "Private: the object’s ACL grants no one else access. The bucket’s permissions or policy may still let others read it."
-  zh-CN: 私有：对象 ACL 未授权给其他人。Bucket 的权限或策略仍可能允许他人读取。
+  zh-CN: 私有：对象 ACL 未授权给其他人。存储桶的权限或策略仍可能允许他人读取。
 access.public_read:
   en: "Public read: anyone may read it."
   zh-CN: 公开读取：任何人都可以读取。
@@ -467,23 +612,23 @@ access.make_public:
   en: Make public
   zh-CN: 设为公开读取
 access.public_title:
-  en: Make this object public?
-  zh-CN: 将此对象设为公开读取？
+  en: "Make “%{name}” public?"
+  zh-CN: "将“%{name}”设为公开读取？"
 access.private_title:
-  en: Make this object private?
-  zh-CN: 将此对象设为私有？
+  en: "Make “%{name}” private?"
+  zh-CN: "将“%{name}”设为私有？"
 access.public_body:
   en: Anyone with its address will be able to read it, without credentials. Some buckets, for example ones that block public access, refuse or ignore this.
-  zh-CN: 任何知道地址的人都可以不带凭据读取它。部分 Bucket（例如开启了阻止公共访问的）会拒绝或忽略此设置。
+  zh-CN: 任何知道地址的人都可以不带凭据读取它。部分存储桶（例如开启了阻止公共访问的）会拒绝或忽略此设置。
 access.private_body:
   en: The object’s ACL will grant no one but the owner; grants to others go. The bucket’s permissions or policy are not changed and may still let others read it.
-  zh-CN: 对象 ACL 将只授权给所有者，授予他人的权限会被移除。Bucket 的权限或策略不变，仍可能允许他人读取。
+  zh-CN: 对象 ACL 将只授权给所有者，授予他人的权限会被移除。存储桶的权限或策略不变，仍可能允许他人读取。
 access.custom_replaced:
   en: Its current grants are replaced, including ones given to particular accounts.
   zh-CN: 当前的授权会被全部替换，包括授予特定账户的授权。
 access.inherit_note:
   en: An object that follows its bucket’s permissions (the default on Alibaba Cloud OSS) cannot be set back to that here.
-  zh-CN: 原来跟随 Bucket 权限的对象（阿里云 OSS 的默认值）修改后不能在这里改回跟随。
+  zh-CN: 原来跟随存储桶权限的对象（阿里云 OSS 的默认值）修改后不能在这里改回跟随。
 access.changed_meanwhile:
   en: Its access was changed by someone else meanwhile; nothing was changed. The panel shows it now.
   zh-CN: 访问权限已被他人修改，未做更改。详情面板已显示最新状态。
@@ -532,8 +677,8 @@ preferences.transfers:
   en: Transfers…
   zh-CN: 传输设置…
 transfers.title:
-  en: Transfers
-  zh-CN: 传输设置
+  en: "Transfer settings"
+  zh-CN: "传输设置"
 transfers.concurrency:
   en: "Transfers running at once (%{min}–%{max})"
   zh-CN: "同时进行的传输数（%{min}–%{max}）"
@@ -612,6 +757,9 @@ copy.unnamed_item:
 copy.across_title:
   en: "Copy %{count} items to “%{target}”?"
   zh-CN: "将 %{count} 项复制到“%{target}”？"
+copy.across_title_one:
+  en: "Copy 1 item to “%{target}”?"
+  zh-CN: "将 1 项复制到“%{target}”？"
 copy.across_body:
   en: "From “%{source}”. These are two connections, so the data is downloaded to a temporary file on this computer and uploaded from there. It uses this computer’s network and disk space, and supaS3 must stay open until it finishes."
   zh-CN: "来源：“%{source}”。这是两个不同的连接，数据会先下载到此电脑的临时文件，再从这里上传。期间占用此电脑的网络和磁盘空间，完成前请保持 supaS3 运行。"
@@ -1166,6 +1314,21 @@ redownload.exists:
 tasks.interrupted_download:
   en: Interrupted when supaS3 closed. Retry downloads it again from the start, to the same file; an existing file there is not replaced. A partial file named .supas3-…part may be left in that folder.
   zh-CN: supaS3 关闭时中断。点“重试”会从头重新下载到同一位置，不会替换那里已有的文件。该文件夹中可能留有名为 .supas3-…part 的不完整文件，需要手动删除。
+retry.scheduled:
+  en: "%{name} was cut off by the network; retrying in %{seconds} s (attempt %{attempt} of %{of}). Remove it from the list to stop."
+  zh-CN: "%{name} 因网络中断失败，将在 %{seconds} 秒后自动重试（第 %{attempt} 次，共 %{of} 次）。从列表中移除即可取消。"
+retry.scheduled_many:
+  en: "%{count} transfers were cut off by the network; retrying in about %{seconds} s. Remove one from the list to stop it."
+  zh-CN: "%{count} 个传输因网络中断失败，约 %{seconds} 秒后自动重试。从列表中移除即可取消对应的重试。"
+retry.gave_up:
+  en: "%{name} was not retried: %{error}"
+  zh-CN: "%{name} 未能自动重试：%{error}"
+retry.in_progress:
+  en: This transfer is being retried already.
+  zh-CN: 该传输已在重试中。
+retry.maybe_written:
+  en: "%{name} was not retried: its target changed since it started, so the cut-off attempt may have written it. Check the target."
+  zh-CN: "%{name} 未自动重试：目标在传输开始后已有变化，中断的那次可能已经写入。请核对目标。"
 tasks.access:
   en: Access
   zh-CN: 访问权限
@@ -1383,6 +1546,9 @@ sidebar.collapse:
 sidebar.expand:
   en: Expand sidebar
   zh-CN: 展开侧栏
+details.more:
+  en: More
+  zh-CN: 更多
 details.title:
   en: Details
   zh-CN: 详情

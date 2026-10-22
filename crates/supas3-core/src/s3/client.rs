@@ -85,6 +85,18 @@ fn build_s3_config(sdk_config: &aws_config::SdkConfig, profile: &Profile) -> aws
 
     builder = builder.request_checksum_calculation(RequestChecksumCalculation::WhenRequired);
 
+    // supaS3: the SDK gives up on a stream that moves nothing for 5 s by
+    // default. Uploads of 128 MiB parts to OSS from a distant link tripped
+    // it again and again, even with 30 s, failing the whole file; uploads
+    // have their own time limit per part instead. Downloads keep it, with
+    // more patience for a slow link.
+    builder = builder.stalled_stream_protection(
+        aws_sdk_s3::config::StalledStreamProtectionConfig::enabled()
+            .upload_enabled(false)
+            .grace_period(std::time::Duration::from_secs(30))
+            .build(),
+    );
+
     builder.build()
 }
 
@@ -249,6 +261,15 @@ impl S3ClientManager {
         self.bucket_regions
             .get(&(profile.cache_identity(), bucket_name.to_string()))
             .cloned()
+    }
+
+    /// Forgets what is cached about a deleted bucket: its region, under any
+    /// connection revision, and its listings. A bucket of the same name
+    /// made later may be elsewhere.
+    pub fn forget_bucket_region(&mut self, profile_id: &str, bucket_name: &str) {
+        self.bucket_regions
+            .retain(|(_, bucket), _| bucket != bucket_name);
+        self.remove_bucket_cache(profile_id, bucket_name);
     }
 
     /// Cache the region for a bucket

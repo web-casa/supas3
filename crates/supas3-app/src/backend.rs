@@ -20,8 +20,8 @@ use supas3_core::commands::cross_copy::{self, CopyItem};
 use supas3_core::commands::operations::{ObjectMetadata, ObjectPermissions, SeenProperties};
 use supas3_core::commands::sync::Preview as SyncPreview;
 use supas3_core::commands::{
-    buckets, objects, operations, preview, profiles, replace, sync, transfer, urls, version_ops,
-    versions,
+    bucket_admin, bucket_management, buckets, objects, operations, preview, profiles, replace,
+    retry_cleanup, sync, transfer, urls, version_ops, versions,
 };
 use supas3_core::credentials::{with_profile, Profile};
 use supas3_core::host::EventSink;
@@ -177,6 +177,27 @@ async fn redownload(core: &Core, job: TransferJob) -> Result<String, String> {
     .map_err(|error| error.to_string())?;
     let _ = transfer::remove_transfer(job.id, core.transfers()).await;
     Ok(queued)
+}
+
+/// Whether a failed transfer is one the app may retry on its own: not one
+/// a sync, an import, a restore or a move waits on.
+fn retry_on_its_own(job: &TransferJob) -> bool {
+    job.sync_source.is_none()
+        && job.url_import.is_none()
+        && job.restore_guard.is_none()
+        && !crate::auto_retry::is_awaited_by_app(&job.id)
+}
+
+/// What an automatic retry did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoRetry {
+    /// Queued again, as this transfer.
+    Queued(String),
+    /// The target changed since the transfer began; the cut-off attempt
+    /// may have written it, so nothing was sent.
+    MaybeWritten,
+    /// Not one to retry on its own.
+    NotEligible,
 }
 
 /// Sets how many transfers run at once and the speed of each transfer
@@ -685,6 +706,131 @@ impl Requests {
         .await
     }
 
+    /// Retries, on its own, a transfer the network cut short: only one the
+    /// user started directly; an upload only while its target is still as
+    /// it was before (otherwise the cut-off attempt may have written it),
+    /// after aborting the multipart uploads that attempt left unfinished.
+    /// Which of these failed transfers may be retried on their own: not
+    /// those a sync, an import, a restore or a move of the app waits on.
+    pub async fn auto_retry_eligible(&self, ids: Vec<String>) -> Result<Vec<String>, String> {
+        self.run(move |core| async move {
+            let mut eligible = Vec::new();
+            for id in ids {
+                if let Some(job) = core.transfers().get_job(&id).await {
+                    if retry_on_its_own(&job) {
+                        eligible.push(id);
+                    }
+                }
+            }
+            Ok(eligible)
+        })
+        .await
+    }
+
+    pub async fn auto_retry(&self, id: String) -> Result<AutoRetry, String> {
+        self.run(move |core| async move {
+            let Some(job) = core.transfers().get_job(&id).await else {
+                return Ok(AutoRetry::NotEligible);
+            };
+            if !retry_on_its_own(&job) {
+                return Ok(AutoRetry::NotEligible);
+            }
+            if matches!(job.transfer_type, TransferType::Upload) {
+                let profile_id = job.profile_id.clone();
+                let region = bucket_region(&core, &profile_id, &job.bucket).await;
+                let now = with_profile(
+                    profile_id.clone(),
+                    retry_cleanup::object_etag(
+                        job.bucket.clone(),
+                        Some(region.clone()),
+                        job.key.clone(),
+                        profile_id.clone(),
+                        core.profiles(),
+                    ),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                let as_before = match (&job.replace_etag, &now) {
+                    (None, None) => true,
+                    (Some(expected), Some(now)) => supas3_core::s3::same_etag(expected, now),
+                    _ => false,
+                };
+                if !as_before {
+                    return Ok(AutoRetry::MaybeWritten);
+                }
+                // Parts of the attempt that failed are removed first. Only
+                // a large file was sent in parts; credentials that may not
+                // list unfinished uploads leave them to the bucket's rules.
+                let in_parts = job.total_bytes == 0
+                    || job.total_bytes >= supas3_core::s3::MULTIPART_UPLOAD_THRESHOLD;
+                if in_parts {
+                    let cleaned = with_profile(
+                        profile_id.clone(),
+                        retry_cleanup::abort_unfinished_uploads(
+                            job.bucket.clone(),
+                            Some(region),
+                            job.key.clone(),
+                            job.created_at,
+                            profile_id,
+                            core.profiles(),
+                        ),
+                    )
+                    .await
+                    .map_err(|error| error.to_string());
+                    if let Err(error) = cleaned {
+                        if crate::auto_retry::transient(&error) {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            let retried = transfer::retry_transfer(
+                id.clone(),
+                core.app(),
+                core.profiles(),
+                core.s3(),
+                core.transfers(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let Some(new_id) = retried else {
+                return Ok(AutoRetry::NotEligible);
+            };
+            // The new transfer stands for the old one, which goes, so a
+            // later start does not list both.
+            let _ = transfer::remove_transfer(id, core.transfers()).await;
+            Ok(AutoRetry::Queued(new_id))
+        })
+        .await
+    }
+
+    /// How many unfinished multipart uploads a bucket holds, aborting
+    /// them: for tests, to tell that none was left behind.
+    #[cfg(test)]
+    pub async fn unfinished_uploads(
+        &self,
+        profile_id: String,
+        bucket: String,
+    ) -> Result<usize, String> {
+        self.run(move |core| async move {
+            let region = bucket_region(&core, &profile_id, &bucket).await;
+            with_profile(
+                profile_id.clone(),
+                retry_cleanup::abort_unfinished_uploads(
+                    bucket,
+                    Some(region),
+                    String::new(),
+                    0,
+                    profile_id,
+                    core.profiles(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
     /// Cancels every listed transfer that is still waiting or running.
     /// Returns how many were cancelled.
     pub async fn cancel_transfers(&self, ids: Vec<String>) -> Result<usize, String> {
@@ -1174,6 +1320,158 @@ impl Requests {
                     core.profiles(),
                     core.s3(),
                     core.transfers(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Creates a bucket in `region`.
+    pub async fn create_bucket(
+        &self,
+        profile_id: String,
+        name: String,
+        region: String,
+    ) -> Result<(), String> {
+        self.run(move |core| async move {
+            with_profile(
+                profile_id.clone(),
+                bucket_management::create_bucket(
+                    name,
+                    region,
+                    profile_id,
+                    core.profiles(),
+                    core.s3(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Deletes an empty bucket. `confirmation` is the name as the user
+    /// typed it.
+    pub async fn delete_bucket(
+        &self,
+        profile_id: String,
+        name: String,
+        confirmation: String,
+    ) -> Result<(), String> {
+        self.run(move |core| async move {
+            let region = bucket_region(&core, &profile_id, &name).await;
+            let result = with_profile(
+                profile_id.clone(),
+                bucket_management::delete_bucket(
+                    name.clone(),
+                    Some(region),
+                    confirmation,
+                    profile_id.clone(),
+                    core.profiles(),
+                    core.s3(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string());
+            if result.is_ok() {
+                core.s3()
+                    .write()
+                    .await
+                    .forget_bucket_region(&profile_id, &name);
+            }
+            result
+        })
+        .await
+    }
+
+    /// Whether a bucket keeps versions of its objects.
+    pub async fn bucket_versioning(
+        &self,
+        profile_id: String,
+        bucket: String,
+    ) -> Result<bucket_admin::Versioning, String> {
+        self.run(move |core| async move {
+            let region = bucket_region(&core, &profile_id, &bucket).await;
+            with_profile(
+                profile_id.clone(),
+                bucket_admin::bucket_versioning(bucket, Some(region), profile_id, core.profiles()),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Turns a bucket's versioning on, or pauses it.
+    pub async fn set_bucket_versioning(
+        &self,
+        profile_id: String,
+        bucket: String,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.run(move |core| async move {
+            let region = bucket_region(&core, &profile_id, &bucket).await;
+            with_profile(
+                profile_id.clone(),
+                bucket_admin::set_bucket_versioning(
+                    bucket,
+                    Some(region),
+                    enabled,
+                    profile_id,
+                    core.profiles(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// A bucket's policy, or `None` when it has none.
+    pub async fn bucket_policy(
+        &self,
+        profile_id: String,
+        bucket: String,
+    ) -> Result<Option<String>, String> {
+        self.run(move |core| async move {
+            let region = bucket_region(&core, &profile_id, &bucket).await;
+            with_profile(
+                profile_id.clone(),
+                bucket_management::get_bucket_policy(
+                    bucket,
+                    Some(region),
+                    profile_id,
+                    core.profiles(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Replaces a bucket's policy, or removes it with `None`, only while
+    /// it is still `expected`.
+    pub async fn put_bucket_policy(
+        &self,
+        profile_id: String,
+        bucket: String,
+        policy: Option<String>,
+        expected: Option<String>,
+    ) -> Result<(), String> {
+        self.run(move |core| async move {
+            let region = bucket_region(&core, &profile_id, &bucket).await;
+            with_profile(
+                profile_id.clone(),
+                bucket_management::put_bucket_policy(
+                    bucket,
+                    Some(region),
+                    policy,
+                    expected,
+                    profile_id,
+                    core.profiles(),
                 ),
             )
             .await
@@ -1879,6 +2177,8 @@ impl crate::moves::MoveBackend for Requests {
             .await
             .map_err(|error| error.to_string())
         }))
+        // The move waits on it; it is never retried behind its back.
+        .inspect(|id| crate::auto_retry::awaited_by_app(id))
     }
 
     fn download(
@@ -1911,6 +2211,8 @@ impl crate::moves::MoveBackend for Requests {
             .await
             .map_err(|error| error.to_string())
         }))
+        // The move waits on it; it is never retried behind its back.
+        .inspect(|id| crate::auto_retry::awaited_by_app(id))
     }
 
     fn copy_across(
@@ -1944,7 +2246,10 @@ impl crate::moves::MoveBackend for Requests {
         }
         // Exactly the transfer this request queued, never one found by name.
         match outcome.transfers.as_slice() {
-            [id] => Ok(id.clone()),
+            [id] => {
+                crate::auto_retry::awaited_by_app(id);
+                Ok(id.clone())
+            }
             _ => Err("The copy was not queued.".to_string()),
         }
     }
@@ -3195,6 +3500,1201 @@ mod tests {
         }
     }
 
+    /// Makes a temporary bucket, turns versioning on, and goes through what
+    /// versions offer: history, restore, download and delete of one version;
+    /// then its policy, pausing versioning, emptying it and deleting it.
+    /// Needs credentials that may create buckets (COS here, or MinIO); run
+    /// with `SUPAS3_SMOKE_TEST=buckets_and_versions`.
+    #[test]
+    #[ignore]
+    fn buckets_and_versions_work_end_to_end_on_real_storage() {
+        use crate::connection::{Draft, Service};
+        use crate::object_actions::{FileRef, ObjectRef};
+        use crate::tasks::{EventQueue, Tasks};
+        use crate::transfer_plan::{plan, plan_deletion};
+        use supas3_core::commands::bucket_admin::Versioning;
+        use supas3_core::commands::version_ops::SeenCurrent;
+        let _serial = super::one_backend_at_a_time();
+        let key = |field: &str| {
+            let name = format!("SUPAS3_PANE1_{field}");
+            std::env::var(&name).unwrap_or_else(|_| panic!("{name} is required"))
+        };
+        let service = match key("SERVICE").as_str() {
+            "oss" => Service::Oss,
+            "cos" => Service::Cos,
+            "obs" => Service::Obs,
+            "e2" => Service::IdriveE2,
+            _ => Service::Generic,
+        };
+        let suffix = format!("{:08x}", std::process::id() ^ 0x5a5a);
+        let existing = key("BUCKET");
+        let temp = match service {
+            Service::Cos => format!(
+                "supas3-test-{suffix}-{}",
+                existing.rsplit('-').next().unwrap_or_default()
+            ),
+            _ => format!("supas3-test-{suffix}"),
+        };
+        let draft = Draft {
+            name: "buckets".into(),
+            region: key("REGION"),
+            endpoint: key("ENDPOINT"),
+            access_key: key("ACCESS_KEY"),
+            secret_key: key("SECRET_KEY"),
+            ..Draft::new(service)
+        };
+        let config = test_dir("buckets");
+        let work = test_dir("buckets-data");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("v.txt"), "one").unwrap();
+        let queue = std::sync::Arc::new(EventQueue::default());
+        let backend = Backend::start(config.clone(), queue.sink()).unwrap();
+        let requests = backend.requests().unwrap();
+
+        let report = futures_lite(async {
+            let mut steps: Vec<(&str, Result<(), String>)> = Vec::new();
+            let check = |ok: bool, detail: String| if ok { Ok(()) } else { Err(detail) };
+            let profile = requests
+                .save_profile(draft.to_profile(None), false)
+                .await
+                .unwrap();
+            let pid = profile.id.clone();
+            let settle = || async {
+                let mut tasks = Tasks::default();
+                for _ in 0..300 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    if let Ok(jobs) = requests.transfers().await {
+                        tasks.merge_snapshot(&jobs);
+                        if tasks.counts().active == 0 {
+                            return tasks
+                                .list(crate::tasks::TaskFilter::Failed)
+                                .iter()
+                                .map(|task| format!("{}: {:?}", task.name, task.state))
+                                .collect::<Vec<_>>();
+                        }
+                    }
+                }
+                vec!["transfers did not finish".to_string()]
+            };
+
+            let made = requests
+                .create_bucket(pid.clone(), temp.clone(), draft.region.clone())
+                .await;
+            if let Err(error) = &made {
+                // Credentials kept to one bucket: what can be read of it.
+                let denied = error.contains("AccessDenied")
+                    || error.contains("403")
+                    || error.contains("forbidden");
+                println!(
+                    "creating a bucket: {}",
+                    error.chars().take(160).collect::<String>()
+                );
+                let versioning = requests
+                    .bucket_versioning(pid.clone(), existing.clone())
+                    .await;
+                let policy = requests.bucket_policy(pid.clone(), existing.clone()).await;
+                println!(
+                    "existing bucket: versioning {:?}; policy {:?}",
+                    versioning
+                        .as_ref()
+                        .map_err(|e| e.chars().take(160).collect::<String>()),
+                    policy
+                        .as_ref()
+                        .map(|p| p.is_some())
+                        .map_err(|e| e.chars().take(160).collect::<String>())
+                );
+                steps.push(("a refusal to create says so", check(denied, error.clone())));
+                steps.push((
+                    "the existing bucket's versioning reads",
+                    versioning.map(|_| ()),
+                ));
+                let _ = requests.delete_profile(pid).await;
+                return steps;
+            }
+            steps.push(("create a bucket", made));
+            let versioning = requests.bucket_versioning(pid.clone(), temp.clone()).await;
+            steps.push((
+                "a new bucket keeps no versions",
+                check(
+                    matches!(versioning, Ok(Versioning::Off)),
+                    format!("{versioning:?}"),
+                ),
+            ));
+            steps.push((
+                "turn versioning on",
+                requests
+                    .set_bucket_versioning(pid.clone(), temp.clone(), true)
+                    .await,
+            ));
+            let versioning = requests.bucket_versioning(pid.clone(), temp.clone()).await;
+            steps.push((
+                "it reads as on",
+                check(
+                    matches!(versioning, Ok(Versioning::Enabled)),
+                    format!("{versioning:?}"),
+                ),
+            ));
+
+            // Three versions: written, rewritten, deleted.
+            let here = Location::objects(&pid, &temp, "");
+            let local = Location::Local(work.clone());
+            let rows = requests
+                .list(local.clone(), None, true, crate::listing::Sort::default())
+                .await
+                .unwrap()
+                .entries;
+            steps.push((
+                "upload",
+                requests
+                    .execute(plan(&local, &rows, &here).unwrap())
+                    .await
+                    .map(|_| ()),
+            ));
+            let failed = settle().await;
+            steps.push((
+                "the upload finishes",
+                check(failed.is_empty(), failed.join("; ")),
+            ));
+            let object = ObjectRef {
+                profile_id: pid.clone(),
+                bucket: temp.clone(),
+                key: "v.txt".into(),
+            };
+            let first = requests.read_text(FileRef::Remote(object.clone())).await;
+            let etag = first
+                .as_ref()
+                .ok()
+                .and_then(|text| text.etag.clone())
+                .unwrap_or_default();
+            steps.push((
+                "rewrite",
+                requests
+                    .save_text(object.clone(), "two".into(), etag)
+                    .await
+                    .map(|_| ()),
+            ));
+            let rows = requests
+                .list(here.clone(), None, true, crate::listing::Sort::default())
+                .await
+                .unwrap_or_default()
+                .entries;
+            let removed = match plan_deletion(&here, &rows) {
+                Ok(deletion) => requests.delete(deletion).await.map(|_| ()),
+                Err(refusal) => Err(format!("{refusal:?}")),
+            };
+            steps.push(("delete, leaving a delete marker", removed));
+            let history = requests.versions(object.clone(), None).await;
+            let versions = history
+                .as_ref()
+                .map(|h| h.versions.clone())
+                .unwrap_or_default();
+            steps.push((
+                "the history holds two versions and a delete marker",
+                check(
+                    versions.len() == 3
+                        && versions.iter().filter(|v| v.is_delete_marker).count() == 1
+                        && versions.iter().any(|v| v.is_latest && v.is_delete_marker),
+                    format!("{versions:?}"),
+                ),
+            ));
+            // The order is not promised; the two data versions are told
+            // apart by their ETags, the MD5 of "one" and of "two".
+            let marker = versions.iter().find(|v| v.is_delete_marker).cloned();
+            let with_md5 = |md5: &str| {
+                versions
+                    .iter()
+                    .find(|v| {
+                        v.etag
+                            .as_deref()
+                            .is_some_and(|e| e.trim_matches('"').eq_ignore_ascii_case(md5))
+                    })
+                    .cloned()
+            };
+            let one = with_md5("f97c5d29941bfb1b2fdab0874906ab82");
+            let two = with_md5("b8a9f715dbb64fd5c56e7783c6820a61");
+
+            // Restore the first version over the delete marker.
+            if let (Some(one), Some(marker)) = (one.clone(), marker.clone()) {
+                steps.push((
+                    "restore the first version",
+                    requests
+                        .restore_version(
+                            object.clone(),
+                            one.version_id.clone(),
+                            marker.version_id.clone(),
+                        )
+                        .await
+                        .map(|_| ()),
+                ));
+                let failed = settle().await;
+                steps.push((
+                    "the restore finishes",
+                    check(failed.is_empty(), failed.join("; ")),
+                ));
+                let text = requests.read_text(FileRef::Remote(object.clone())).await;
+                steps.push((
+                    "the first version is current again",
+                    check(
+                        matches!(&text, Ok(t) if t.content == "one"),
+                        format!("{:?}", text.map(|t| t.content)),
+                    ),
+                ));
+            } else {
+                steps.push(("the versions were told apart", Err(format!("{versions:?}"))));
+            }
+
+            // Download the second version.
+            if let Some(two) = two.clone() {
+                let path = work.join("two.txt");
+                steps.push((
+                    "download the second version",
+                    requests
+                        .download_version(object.clone(), two.version_id.clone(), path.clone(), 3)
+                        .await
+                        .map(|_| ()),
+                ));
+                let failed = settle().await;
+                steps.push((
+                    "the download finishes",
+                    check(failed.is_empty(), failed.join("; ")),
+                ));
+                let content = std::fs::read_to_string(&path);
+                steps.push((
+                    "it holds the second version",
+                    check(
+                        matches!(&content, Ok(c) if c == "two"),
+                        format!("{content:?}"),
+                    ),
+                ));
+            }
+
+            // Delete the second version for good.
+            let current_of = |history: &Result<supas3_core::s3::versions::History, String>| {
+                history
+                    .as_ref()
+                    .ok()
+                    .and_then(|h| h.versions.iter().find(|v| v.is_latest).cloned())
+            };
+            let history = requests.versions(object.clone(), None).await;
+            if let (Some(two), Some(current)) = (two.clone(), current_of(&history)) {
+                let seen = SeenCurrent {
+                    version_id: current.version_id.clone(),
+                    etag: current.etag.clone(),
+                    is_delete_marker: current.is_delete_marker,
+                };
+                steps.push((
+                    "delete the second version",
+                    requests
+                        .delete_version(object.clone(), two.version_id.clone(), seen, false)
+                        .await,
+                ));
+                let after = requests.versions(object.clone(), None).await;
+                let gone = after
+                    .as_ref()
+                    .is_ok_and(|h| h.versions.iter().all(|v| v.version_id != two.version_id));
+                steps.push((
+                    "it is gone from the history",
+                    check(gone, format!("{:?}", after.map(|h| h.versions))),
+                ));
+            }
+
+            // Policy: none at first; set, read back, remove.
+            let none = requests.bucket_policy(pid.clone(), temp.clone()).await;
+            steps.push((
+                "a new bucket has no policy",
+                check(matches!(none, Ok(None)), format!("{none:?}")),
+            ));
+            let principal = if service == Service::Cos {
+                r#"{"qcs":["qcs::cam::anyone:anyone"]}"#
+            } else {
+                r#"{"AWS":["*"]}"#
+            };
+            let resource = if service == Service::Cos {
+                format!(
+                    "qcs::cos:{}:uid/{}:{temp}/public/*",
+                    draft.region,
+                    existing.rsplit('-').next().unwrap_or_default()
+                )
+            } else {
+                format!("arn:aws:s3:::{temp}/public/*")
+            };
+            let policy = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{principal},"Action":["name/cos:GetObject","s3:GetObject"],"Resource":["{resource}"]}}]}}"#
+            );
+            // COS writes its own form: "version": "2.0" and cos actions.
+            let policy = if service == Service::Cos {
+                policy
+                    .replace(r#""s3:GetObject""#, r#""name/cos:HeadObject""#)
+                    .replace(r#""Version":"2012-10-17""#, r#""version":"2.0""#)
+            } else {
+                policy.replace(r#""name/cos:GetObject","#, "")
+            };
+            let saved = requests
+                .put_bucket_policy(pid.clone(), temp.clone(), Some(policy), None)
+                .await;
+            println!("setting a policy: {saved:?}");
+            steps.push(("set a policy", saved));
+            let read = requests.bucket_policy(pid.clone(), temp.clone()).await;
+            steps.push((
+                "it reads back",
+                check(matches!(&read, Ok(Some(_))), format!("{read:?}")),
+            ));
+            if let Ok(Some(current)) = read {
+                steps.push((
+                    "remove it",
+                    requests
+                        .put_bucket_policy(pid.clone(), temp.clone(), None, Some(current))
+                        .await,
+                ));
+            }
+
+            steps.push((
+                "pause versioning",
+                requests
+                    .set_bucket_versioning(pid.clone(), temp.clone(), false)
+                    .await,
+            ));
+            let versioning = requests.bucket_versioning(pid.clone(), temp.clone()).await;
+            steps.push((
+                "it reads as paused",
+                check(
+                    matches!(versioning, Ok(Versioning::Suspended)),
+                    format!("{versioning:?}"),
+                ),
+            ));
+
+            // Empty the bucket through the app's own paths: delete the
+            // object, then every version that is not current, then the
+            // markers.
+            let rows = requests
+                .list(here.clone(), None, true, crate::listing::Sort::default())
+                .await
+                .unwrap_or_default()
+                .entries;
+            if !rows.is_empty() {
+                if let Ok(deletion) = plan_deletion(&here, &rows) {
+                    let _ = requests.delete(deletion).await;
+                }
+            }
+            for _ in 0..10 {
+                let history = requests.versions(object.clone(), None).await;
+                let Ok(history) = history else { break };
+                if history.versions.is_empty() {
+                    break;
+                }
+                let current = history.versions.iter().find(|v| v.is_latest).cloned();
+                let seen = current.as_ref().map(|c| SeenCurrent {
+                    version_id: c.version_id.clone(),
+                    etag: c.etag.clone(),
+                    is_delete_marker: c.is_delete_marker,
+                });
+                // Data versions first; the markers, current one last.
+                let mut order: Vec<_> = history.versions.clone();
+                order.sort_by_key(|v| (v.is_latest, v.is_delete_marker));
+                for version in order {
+                    if let Some(seen) = seen.clone() {
+                        let _ = requests
+                            .delete_version(
+                                object.clone(),
+                                version.version_id.clone(),
+                                seen,
+                                version.is_delete_marker,
+                            )
+                            .await;
+                    }
+                }
+            }
+            let deleted = requests
+                .delete_bucket(pid.clone(), temp.clone(), temp.clone())
+                .await;
+            steps.push(("delete the emptied bucket", deleted));
+            let _ = requests.delete_profile(pid).await;
+            steps
+        });
+        drop(backend);
+        let _ = std::fs::remove_dir_all(config);
+        let _ = std::fs::remove_dir_all(work);
+        for (step, result) in &report {
+            println!("{step}: {}", if result.is_ok() { "ok" } else { "FAILED" });
+        }
+        let failed: Vec<_> = report
+            .iter()
+            .filter(|(_, result)| result.is_err())
+            .collect();
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    /// Cuts the network in the middle of transfers and checks what the
+    /// automatic retry does. Needs MinIO behind scripts/cutting-proxy.py:
+    /// SUPAS3_RELIABILITY_ENDPOINT (the proxy), SUPAS3_RELIABILITY_CONTROL
+    /// (its control file), SUPAS3_RELIABILITY_ACCESS_KEY and _SECRET_KEY.
+    #[test]
+    #[ignore]
+    fn transfers_recover_from_a_cut_network() {
+        use super::AutoRetry;
+        use crate::connection::{Draft, Service};
+        use crate::object_actions::ObjectRef;
+        use crate::tasks::EventQueue;
+        use crate::transfer_plan::plan;
+        use supas3_core::transfer::TransferStatus;
+        let _serial = super::one_backend_at_a_time();
+        let env = |name: &str| {
+            std::env::var(format!("SUPAS3_RELIABILITY_{name}"))
+                .unwrap_or_else(|_| panic!("SUPAS3_RELIABILITY_{name} is required"))
+        };
+        let control = std::path::PathBuf::from(env("CONTROL"));
+        let _ = std::fs::remove_file(&control);
+        let draft = Draft {
+            name: "reliability".into(),
+            region: "us-east-1".into(),
+            endpoint: env("ENDPOINT"),
+            access_key: env("ACCESS_KEY"),
+            secret_key: env("SECRET_KEY"),
+            ..Draft::new(Service::Generic)
+        };
+        let config = test_dir("reliability");
+        // Large test files go to the home folder: /tmp may be small.
+        let work = dirs::home_dir()
+            .unwrap()
+            .join(format!(".supas3-reliability-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(work.join("up")).unwrap();
+        let pattern = |size: usize| -> Vec<u8> { (0..size).map(|i| (i % 251) as u8).collect() };
+        std::fs::write(work.join("up/small.bin"), pattern(8 << 20)).unwrap();
+        std::fs::write(work.join("up/big.bin"), pattern(150 << 20)).unwrap();
+        let queue = std::sync::Arc::new(EventQueue::default());
+        let backend = Backend::start(config.clone(), queue.sink()).unwrap();
+        let requests = backend.requests().unwrap();
+        let bucket = format!("supas3-reliability-{}", std::process::id());
+
+        let report = futures_lite(async {
+            let mut steps: Vec<(&str, Result<(), String>)> = Vec::new();
+            let check = |ok: bool, detail: String| if ok { Ok(()) } else { Err(detail) };
+            let profile = requests
+                .save_profile(draft.to_profile(None), false)
+                .await
+                .unwrap();
+            let pid = profile.id.clone();
+            steps.push((
+                "make a bucket",
+                requests
+                    .create_bucket(pid.clone(), bucket.clone(), "us-east-1".into())
+                    .await,
+            ));
+            // Slow enough to be cut in the middle.
+            requests
+                .set_transfer_limits(crate::settings::TransferSettings {
+                    concurrency: 4,
+                    bandwidth_kib: 4096,
+                })
+                .await
+                .unwrap();
+            let status_of = |id: String| {
+                let requests = requests.clone();
+                async move {
+                    requests
+                        .transfer_job(id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|job| job.status)
+                }
+            };
+            let wait_until = |ids: Vec<String>, done: fn(&TransferStatus) -> bool| {
+                let requests = requests.clone();
+                async move {
+                    for _ in 0..1500 {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        let mut all = true;
+                        for id in &ids {
+                            let status = requests
+                                .transfer_job(id.clone())
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|job| job.status);
+                            all &= status.as_ref().is_some_and(done);
+                        }
+                        if all {
+                            return true;
+                        }
+                    }
+                    false
+                }
+            };
+            let ended = |status: &TransferStatus| {
+                matches!(
+                    status,
+                    TransferStatus::Completed
+                        | TransferStatus::Failed(_)
+                        | TransferStatus::Cancelled
+                )
+            };
+
+            // Upload two files, and cut the network half way.
+            let local = Location::Local(work.join("up"));
+            let here = Location::objects(&pid, &bucket, "");
+            let rows = requests
+                .list(local.clone(), None, true, crate::listing::Sort::default())
+                .await
+                .unwrap()
+                .entries;
+            let before: std::collections::HashSet<String> = requests
+                .transfers()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|job| job.id)
+                .collect();
+            steps.push((
+                "queue two uploads",
+                requests
+                    .execute(plan(&local, &rows, &here).unwrap())
+                    .await
+                    .map(|_| ()),
+            ));
+            let ids: Vec<String> = requests
+                .transfers()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|job| job.id)
+                .filter(|id| !before.contains(id))
+                .collect();
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            std::fs::write(&control, "cut").unwrap();
+            let failed = wait_until(ids.clone(), ended).await;
+            let statuses: Vec<_> = futures_join(ids.iter().map(|id| status_of(id.clone()))).await;
+            println!("after the cut: {statuses:?}");
+            let all_transient = statuses.iter().all(|status| matches!(status, Some(TransferStatus::Failed(message)) if crate::auto_retry::transient(message)));
+            steps.push((
+                "both fail, as network failures",
+                check(failed && all_transient, format!("{statuses:?}")),
+            ));
+            std::fs::remove_file(&control).unwrap();
+
+            // Retry on their own, as the app would.
+            let mut retried = Vec::new();
+            for id in &ids {
+                match requests.auto_retry(id.clone()).await {
+                    Ok(AutoRetry::Queued(new)) => retried.push(new),
+                    other => steps.push(("a cut upload is retried", Err(format!("{other:?}")))),
+                }
+            }
+            let done = wait_until(retried.clone(), ended).await;
+            let statuses: Vec<_> =
+                futures_join(retried.iter().map(|id| status_of(id.clone()))).await;
+            steps.push((
+                "the retries complete",
+                check(
+                    done && statuses
+                        .iter()
+                        .all(|s| matches!(s, Some(TransferStatus::Completed))),
+                    format!("{statuses:?}"),
+                ),
+            ));
+            for (name, size) in [("small.bin", 8u64 << 20), ("big.bin", 150 << 20)] {
+                let object = ObjectRef {
+                    profile_id: pid.clone(),
+                    bucket: bucket.clone(),
+                    key: name.into(),
+                };
+                let found = requests
+                    .object_properties(object)
+                    .await
+                    .map(|m| m.size as u64);
+                steps.push((
+                    "the object has its whole size",
+                    check(
+                        found.as_ref().is_ok_and(|s| *s == size),
+                        format!("{name}: {found:?}"),
+                    ),
+                ));
+            }
+            let left = requests
+                .unfinished_uploads(pid.clone(), bucket.clone())
+                .await;
+            steps.push((
+                "no unfinished multipart upload is left",
+                check(matches!(left, Ok(0)), format!("{left:?}")),
+            ));
+
+            // An upload whose target appears meanwhile is not retried.
+            std::fs::create_dir_all(work.join("late")).unwrap();
+            std::fs::write(work.join("late/late.txt"), b"mine").unwrap();
+            std::fs::write(&control, "cut").unwrap();
+            let local_late = Location::Local(work.join("late"));
+            let rows = requests
+                .list(
+                    local_late.clone(),
+                    None,
+                    true,
+                    crate::listing::Sort::default(),
+                )
+                .await
+                .unwrap()
+                .entries;
+            let before: std::collections::HashSet<String> = requests
+                .transfers()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|job| job.id)
+                .collect();
+            let _ = requests
+                .execute(plan(&local_late, &rows, &here).unwrap())
+                .await;
+            let late: Vec<String> = requests
+                .transfers()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|job| job.id)
+                .filter(|id| !before.contains(id))
+                .collect();
+            let _ = wait_until(late.clone(), ended).await;
+            std::fs::remove_file(&control).unwrap();
+            // Someone else writes it before the retry.
+            std::fs::create_dir_all(work.join("other")).unwrap();
+            std::fs::write(work.join("other/late.txt"), b"theirs").unwrap();
+            let local_other = Location::Local(work.join("other"));
+            let rows = requests
+                .list(
+                    local_other.clone(),
+                    None,
+                    true,
+                    crate::listing::Sort::default(),
+                )
+                .await
+                .unwrap()
+                .entries;
+            let before: std::collections::HashSet<String> = requests
+                .transfers()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|job| job.id)
+                .collect();
+            let _ = requests
+                .execute(plan(&local_other, &rows, &here).unwrap())
+                .await;
+            let other: Vec<String> = requests
+                .transfers()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|job| job.id)
+                .filter(|id| !before.contains(id))
+                .collect();
+            let _ = wait_until(other, ended).await;
+            let decided = match late.first() {
+                Some(id) => requests.auto_retry(id.clone()).await,
+                None => Err("the upload was not queued".into()),
+            };
+            steps.push((
+                "an upload whose target appeared is not retried",
+                check(
+                    matches!(decided, Ok(AutoRetry::MaybeWritten)),
+                    format!("{decided:?}"),
+                ),
+            ));
+
+            // A download cut off is retried to the same file.
+            std::fs::create_dir_all(work.join("down")).unwrap();
+            let local_down = Location::Local(work.join("down"));
+            let rows: Vec<_> = requests
+                .list(here.clone(), None, true, crate::listing::Sort::default())
+                .await
+                .unwrap()
+                .entries
+                .into_iter()
+                .filter(|e| e.name == "big.bin")
+                .collect();
+            let before: std::collections::HashSet<String> = requests
+                .transfers()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|job| job.id)
+                .collect();
+            let _ = requests
+                .execute(plan(&here, &rows, &local_down).unwrap())
+                .await;
+            let down: Vec<String> = requests
+                .transfers()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|job| job.id)
+                .filter(|id| !before.contains(id))
+                .collect();
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            std::fs::write(&control, "cut").unwrap();
+            let _ = wait_until(down.clone(), ended).await;
+            std::fs::remove_file(&control).unwrap();
+            let mut again = Vec::new();
+            for id in &down {
+                if let Ok(AutoRetry::Queued(new)) = requests.auto_retry(id.clone()).await {
+                    again.push(new);
+                }
+            }
+            let done = wait_until(again.clone(), ended).await;
+            let size = std::fs::metadata(work.join("down/big.bin")).map(|m| m.len());
+            steps.push((
+                "a cut download is retried whole",
+                check(
+                    done && !again.is_empty() && size.as_ref().is_ok_and(|s| *s == 150 << 20),
+                    format!("{again:?} {size:?}"),
+                ),
+            ));
+
+            // Tidy up.
+            let rows = requests
+                .list(here.clone(), None, true, crate::listing::Sort::default())
+                .await
+                .unwrap_or_default()
+                .entries;
+            if let Ok(deletion) = crate::transfer_plan::plan_deletion(&here, &rows) {
+                let _ = requests.delete(deletion).await;
+            }
+            let _ = requests
+                .delete_bucket(pid.clone(), bucket.clone(), bucket.clone())
+                .await;
+            let _ = requests.delete_profile(pid).await;
+            steps
+        });
+        drop(backend);
+        let _ = std::fs::remove_file(&control);
+        let _ = std::fs::remove_dir_all(config);
+        let _ = std::fs::remove_dir_all(&work);
+        for (step, result) in &report {
+            println!("{step}: {}", if result.is_ok() { "ok" } else { "FAILED" });
+        }
+        let failed: Vec<_> = report
+            .iter()
+            .filter(|(_, result)| result.is_err())
+            .collect();
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    /// A download whose connection hangs must fail, as a network failure,
+    /// rather than wait for ever. Same setup as the cut-network test; the
+    /// proxy's control file holds "stall".
+    #[test]
+    #[ignore]
+    fn a_stalled_download_fails() {
+        use crate::connection::{Draft, Service};
+        use crate::tasks::EventQueue;
+        use crate::transfer_plan::plan;
+        use supas3_core::transfer::TransferStatus;
+        let _serial = super::one_backend_at_a_time();
+        let env = |name: &str| std::env::var(format!("SUPAS3_RELIABILITY_{name}")).unwrap();
+        let control = std::path::PathBuf::from(env("CONTROL"));
+        let _ = std::fs::remove_file(&control);
+        let draft = Draft {
+            name: "stall".into(),
+            region: "us-east-1".into(),
+            endpoint: env("ENDPOINT"),
+            access_key: env("ACCESS_KEY"),
+            secret_key: env("SECRET_KEY"),
+            ..Draft::new(Service::Generic)
+        };
+        let config = test_dir("stall");
+        let work = dirs::home_dir()
+            .unwrap()
+            .join(format!(".supas3-stall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(work.join("up")).unwrap();
+        std::fs::create_dir_all(work.join("down")).unwrap();
+        std::fs::write(work.join("up/stall.bin"), vec![7u8; 64 << 20]).unwrap();
+        let queue = std::sync::Arc::new(EventQueue::default());
+        let backend = Backend::start(config.clone(), queue.sink()).unwrap();
+        let requests = backend.requests().unwrap();
+        let bucket = format!("supas3-stall-{}", std::process::id());
+        let outcome = futures_lite(async {
+            let profile = requests
+                .save_profile(draft.to_profile(None), false)
+                .await
+                .unwrap();
+            let pid = profile.id.clone();
+            requests
+                .create_bucket(pid.clone(), bucket.clone(), "us-east-1".into())
+                .await
+                .unwrap();
+            let here = Location::objects(&pid, &bucket, "");
+            let up = Location::Local(work.join("up"));
+            let rows = requests
+                .list(up.clone(), None, true, crate::listing::Sort::default())
+                .await
+                .unwrap()
+                .entries;
+            requests
+                .execute(plan(&up, &rows, &here).unwrap())
+                .await
+                .unwrap();
+            for _ in 0..300 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if requests.transfers().await.unwrap().iter().all(|job| {
+                    !matches!(
+                        job.status,
+                        TransferStatus::Pending | TransferStatus::InProgress
+                    )
+                }) {
+                    break;
+                }
+            }
+            // Slow, so the download is still running when the stall comes.
+            requests
+                .set_transfer_limits(crate::settings::TransferSettings {
+                    concurrency: 2,
+                    bandwidth_kib: 2048,
+                })
+                .await
+                .unwrap();
+            let down = Location::Local(work.join("down"));
+            let rows = requests
+                .list(here.clone(), None, true, crate::listing::Sort::default())
+                .await
+                .unwrap()
+                .entries;
+            let before: std::collections::HashSet<String> = requests
+                .transfers()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|job| job.id)
+                .collect();
+            requests
+                .execute(plan(&here, &rows, &down).unwrap())
+                .await
+                .unwrap();
+            let id = requests
+                .transfers()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|job| job.id)
+                .find(|id| !before.contains(id))
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            std::fs::write(&control, "stall").unwrap();
+            let started = std::time::Instant::now();
+            let mut status = None;
+            while started.elapsed() < std::time::Duration::from_secs(180) {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                status = requests
+                    .transfer_job(id.clone())
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|job| job.status);
+                if !matches!(
+                    status,
+                    Some(TransferStatus::Pending | TransferStatus::InProgress)
+                ) {
+                    break;
+                }
+            }
+            let took = started.elapsed();
+            std::fs::remove_file(&control).unwrap();
+            let rows = requests
+                .list(here.clone(), None, true, crate::listing::Sort::default())
+                .await
+                .unwrap_or_default()
+                .entries;
+            if let Ok(deletion) = crate::transfer_plan::plan_deletion(&here, &rows) {
+                let _ = requests.delete(deletion).await;
+            }
+            let _ = requests
+                .delete_bucket(pid.clone(), bucket.clone(), bucket.clone())
+                .await;
+            let _ = requests.delete_profile(pid).await;
+            (status, took)
+        });
+        drop(backend);
+        let _ = std::fs::remove_file(&control);
+        let _ = std::fs::remove_dir_all(config);
+        let _ = std::fs::remove_dir_all(&work);
+        println!("after the stall: {:?} in {:?}", outcome.0, outcome.1);
+        assert!(
+            matches!(&outcome.0, Some(TransferStatus::Failed(message)) if crate::auto_retry::transient(message)),
+            "{outcome:?}"
+        );
+    }
+
+    async fn futures_join<T>(
+        futures: impl Iterator<Item = impl std::future::Future<Output = T>>,
+    ) -> Vec<T> {
+        let mut out = Vec::new();
+        for future in futures {
+            out.push(future.await);
+        }
+        out
+    }
+
+    /// Moves one large file through a connection: upload, copy within the
+    /// connection, download, and a byte-for-byte comparison. The size in
+    /// MiB comes from SUPAS3_LARGE_MIB (1024 at first); above 5 GiB the copy
+    /// is made in parts. Uses the SUPAS3_PANE1_* variables; run with
+    /// `SUPAS3_SMOKE_TEST=large_files`.
+    #[test]
+    #[ignore]
+    fn large_files_move_whole() {
+        use crate::connection::{Draft, Service};
+        use crate::object_actions::ObjectRef;
+        use crate::tasks::{EventQueue, Tasks};
+        use crate::transfer_plan::{plan, plan_deletion};
+        use std::io::{Read, Write};
+        use std::time::Instant;
+        let _serial = super::one_backend_at_a_time();
+        let key = |field: &str| {
+            let name = format!("SUPAS3_PANE1_{field}");
+            std::env::var(&name).unwrap_or_else(|_| panic!("{name} is required"))
+        };
+        let service = match key("SERVICE").as_str() {
+            "oss" => Service::Oss,
+            "cos" => Service::Cos,
+            "obs" => Service::Obs,
+            "e2" => Service::IdriveE2,
+            _ => Service::Generic,
+        };
+        let mib: u64 = std::env::var("SUPAS3_LARGE_MIB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
+        let draft = Draft {
+            name: "large".into(),
+            region: key("REGION"),
+            endpoint: key("ENDPOINT"),
+            access_key: key("ACCESS_KEY"),
+            secret_key: key("SECRET_KEY"),
+            bucket: key("BUCKET"),
+            ..Draft::new(service)
+        };
+        let config = test_dir("large");
+        let work = dirs::home_dir()
+            .unwrap()
+            .join(format!(".supas3-large-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(work.join("up")).unwrap();
+        std::fs::create_dir_all(work.join("down")).unwrap();
+        // Content that differs along the file, so a misplaced part shows.
+        {
+            let mut file =
+                std::io::BufWriter::new(std::fs::File::create(work.join("up/large.bin")).unwrap());
+            let mut block = vec![0u8; 1 << 20];
+            for index in 0..mib {
+                for (offset, byte) in block.iter_mut().enumerate() {
+                    *byte = ((offset as u64 * 31 + index * 7) % 251) as u8;
+                }
+                file.write_all(&block).unwrap();
+            }
+        }
+        let size = mib << 20;
+        let queue = std::sync::Arc::new(EventQueue::default());
+        let backend = Backend::start(config.clone(), queue.sink()).unwrap();
+        let requests = backend.requests().unwrap();
+        let run = format!("supas3-ui-large/{}/", std::process::id());
+
+        let report = futures_lite(async {
+            let mut steps: Vec<(String, Result<(), String>)> = Vec::new();
+            let check = |ok: bool, detail: String| if ok { Ok(()) } else { Err(detail) };
+            let profile = requests
+                .save_profile(draft.to_profile(None), false)
+                .await
+                .unwrap();
+            let pid = profile.id.clone();
+            let settle = || async {
+                let mut tasks = Tasks::default();
+                for tick in 0..(12 * 3600) {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    if let Ok(jobs) = requests.transfers().await {
+                        if tick % 120 == 0 {
+                            for job in jobs.iter().filter(|job| {
+                                matches!(
+                                    job.status,
+                                    supas3_core::transfer::TransferStatus::InProgress
+                                        | supas3_core::transfer::TransferStatus::Pending
+                                )
+                            }) {
+                                println!(
+                                    "  {:?} {} {}/{} {:?}",
+                                    job.transfer_type,
+                                    job.key,
+                                    job.processed_bytes,
+                                    job.total_bytes,
+                                    job.phase
+                                );
+                            }
+                        }
+                        tasks.merge_snapshot(&jobs);
+                        if tasks.counts().active == 0 {
+                            let failed: Vec<String> = tasks
+                                .list(crate::tasks::TaskFilter::Failed)
+                                .iter()
+                                .map(|task| format!("{}: {:?}", task.name, task.state))
+                                .collect();
+                            return if failed.is_empty() {
+                                Ok(())
+                            } else {
+                                Err(failed.join("; "))
+                            };
+                        }
+                    }
+                }
+                Err("transfers did not finish".to_string())
+            };
+            let size_of = |key: String| {
+                let (requests, pid, bucket) = (requests.clone(), pid.clone(), draft.bucket.clone());
+                async move {
+                    requests
+                        .object_properties(ObjectRef {
+                            profile_id: pid,
+                            bucket,
+                            key,
+                        })
+                        .await
+                        .map(|m| m.size as u64)
+                }
+            };
+
+            let here = Location::objects(&pid, &draft.bucket, &run);
+            let local = Location::Local(work.join("up"));
+            let rows = requests
+                .list(local.clone(), None, true, crate::listing::Sort::default())
+                .await
+                .unwrap()
+                .entries;
+            let started = Instant::now();
+            let queued = requests
+                .execute(plan(&local, &rows, &here).unwrap())
+                .await
+                .map(|_| ());
+            let done = match queued {
+                Ok(()) => settle().await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = &done {
+                // Nothing to copy or download: say why and stop here.
+                println!("upload failed: {error}");
+                steps.push((format!("upload {mib} MiB"), done));
+                let _ = requests.delete_profile(pid).await;
+                return steps;
+            }
+            steps.push((
+                format!("upload {mib} MiB ({:.0?})", started.elapsed()),
+                done,
+            ));
+            let found = size_of(format!("{run}large.bin")).await;
+            steps.push((
+                "the upload has the whole size".into(),
+                check(matches!(found, Ok(s) if s == size), format!("{found:?}")),
+            ));
+
+            // Within the connection: the service copies; in parts above 5 GiB.
+            let copies = Location::objects(&pid, &draft.bucket, &format!("{run}copy/"));
+            let rows: Vec<_> = requests
+                .list(here.clone(), None, true, crate::listing::Sort::default())
+                .await
+                .unwrap_or_default()
+                .entries
+                .into_iter()
+                .filter(|e| e.name == "large.bin")
+                .collect();
+            let started = Instant::now();
+            let copied = requests.execute(plan(&here, &rows, &copies).unwrap()).await;
+            let copied = match copied {
+                Ok(outcome) if outcome.failures.is_empty() => settle().await,
+                Ok(outcome) => Err(outcome.failures.join("; ")),
+                Err(error) => Err(error),
+            };
+            steps.push((
+                format!("copy within the connection ({:.0?})", started.elapsed()),
+                copied,
+            ));
+            let found = size_of(format!("{run}copy/large.bin")).await;
+            steps.push((
+                "the copy has the whole size".into(),
+                check(matches!(found, Ok(s) if s == size), format!("{found:?}")),
+            ));
+
+            // Download the copy and compare it with the original.
+            let local_down = Location::Local(work.join("down"));
+            let rows: Vec<_> = requests
+                .list(copies.clone(), None, true, crate::listing::Sort::default())
+                .await
+                .unwrap_or_default()
+                .entries;
+            let started = Instant::now();
+            let queued = requests
+                .execute(plan(&copies, &rows, &local_down).unwrap())
+                .await
+                .map(|_| ());
+            let done = match queued {
+                Ok(()) => settle().await,
+                Err(error) => Err(error),
+            };
+            steps.push((format!("download ({:.0?})", started.elapsed()), done));
+            let same = (|| -> std::io::Result<bool> {
+                let mut left =
+                    std::io::BufReader::new(std::fs::File::open(work.join("up/large.bin"))?);
+                let mut right =
+                    std::io::BufReader::new(std::fs::File::open(work.join("down/large.bin"))?);
+                let (mut a, mut b) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+                loop {
+                    let n = left.read(&mut a)?;
+                    let mut filled = 0;
+                    while filled < n {
+                        let m = right.read(&mut b[filled..n])?;
+                        if m == 0 {
+                            return Ok(false);
+                        }
+                        filled += m;
+                    }
+                    if n == 0 {
+                        return Ok(right.read(&mut b)? == 0);
+                    }
+                    if a[..n] != b[..n] {
+                        return Ok(false);
+                    }
+                }
+            })();
+            steps.push((
+                "the download matches the original byte for byte".into(),
+                check(matches!(same, Ok(true)), format!("{same:?}")),
+            ));
+
+            let parent = here.parent().unwrap();
+            let rows = requests
+                .list(parent.clone(), None, true, crate::listing::Sort::default())
+                .await
+                .unwrap_or_default()
+                .entries;
+            let own: Vec<_> = rows
+                .into_iter()
+                .filter(|e| e.prefix.as_deref() == Some(run.as_str()))
+                .collect();
+            let deleted = match plan_deletion(&parent, &own) {
+                Ok(deletion) => requests.delete(deletion).await.map(|_| ()),
+                Err(refusal) => Err(format!("{refusal:?}")),
+            };
+            steps.push(("delete".into(), deleted));
+            let _ = requests.delete_profile(pid).await;
+            steps
+        });
+        drop(backend);
+        let _ = std::fs::remove_dir_all(config);
+        let _ = std::fs::remove_dir_all(&work);
+        for (step, result) in &report {
+            println!("{step}: {}", if result.is_ok() { "ok" } else { "FAILED" });
+        }
+        let failed: Vec<_> = report
+            .iter()
+            .filter(|(_, result)| result.is_err())
+            .collect();
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
     /// Changes an object's Content-Type and access on real storage the way
     /// the details panel does. Uses the SUPAS3_PANE1_* variables of the
     /// paging test; run with `SUPAS3_SMOKE_TEST=properties`.
@@ -3260,11 +4760,7 @@ mod tests {
                         permission: grant.permission.as_deref(),
                     })
                     .collect();
-                access_of(
-                    permissions.owner_id.as_deref(),
-                    &grants,
-                    service == Service::IdriveE2,
-                )
+                access_of(permissions.owner_id.as_deref(), &grants, true)
             };
 
             let rows = requests

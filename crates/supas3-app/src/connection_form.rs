@@ -8,6 +8,7 @@ use crate::error_details::ErrorDetails;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::form::{Field, Form};
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Disableable as _, IndexPath};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -357,7 +358,7 @@ impl ConnectionForm {
 }
 
 impl Render for ConnectionForm {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let draft = self.draft(cx);
         let is_aws = self.service == Service::Aws;
         let typed_keys = !draft.uses_aws_profile();
@@ -385,17 +386,27 @@ impl Render for ConnectionForm {
             _ => (None, None),
         };
         let check_failed = check_error.is_some();
+        // The fields take what the window leaves after the dialog's title,
+        // its actions, margins and any result shown under the fields, so
+        // the actions stay in view.
+        let below = 14.
+            + if check_text.is_some() { 2. } else { 0. }
+            + if check_error.is_some() { 5. } else { 0. }
+            + if self.save_error.is_some() { 3. } else { 0. };
+        let fields_height = (window.viewport_size().height
+            - rems(below).to_pixels(window.rem_size()))
+        .max(rems(10.).to_pixels(window.rem_size()))
+        .min(rems(32.).to_pixels(window.rem_size()));
 
         v_flex()
             .gap_4()
             .child(
                 // The fields scroll inside the dialog so the actions below
                 // stay reachable in a short window.
-                div()
-                    .id("connection-fields")
-                    .max_h(rems(26.))
-                    .overflow_y_scroll()
-                    .pr_2()
+                v_flex()
+                    .max_h(fields_height)
+                    .overflow_y_scrollbar()
+                    .pr_3()
                     .child(
                         Form::new()
                             .child(
@@ -546,7 +557,15 @@ impl Render for ConnectionForm {
                     .child(
                         Button::new("save-connection")
                             .primary()
-                            .label(t!("action.save").into_owned())
+                            // A new connection is added; an existing one saved.
+                            .label(
+                                if self.existing.is_some() {
+                                    t!("action.save")
+                                } else {
+                                    t!("action.add")
+                                }
+                                .into_owned(),
+                            )
                             .loading(self.saving)
                             .disabled(busy)
                             .on_click(cx.listener(|form, _, _, cx| form.save(cx))),

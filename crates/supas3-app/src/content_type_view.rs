@@ -76,7 +76,7 @@ impl ContentTypeDialog {
         }
         let typed = self.input.read(cx).value().to_string();
         match validate_content_type(&typed) {
-            Ok(value) if Some(&value) == self.current.as_ref() => {
+            Ok(value) if self.is_current(&value) => {
                 self.problem = Some(t!("content_type.unchanged").into_owned());
             }
             Ok(value) => {
@@ -87,6 +87,15 @@ impl ContentTypeDialog {
             Err(error) => self.problem = Some(error.to_string()),
         }
         cx.notify();
+    }
+
+    /// Whether a checked type is the one the object has, which the service
+    /// may spell in other case, as in "text/plain; charset=UTF-8".
+    fn is_current(&self, value: &str) -> bool {
+        self.current.as_deref().is_some_and(|current| {
+            validate_content_type(current)
+                .map_or_else(|_| current == value, |current| current == value)
+        })
     }
 
     /// The change failed; the dialog stays open.
@@ -110,6 +119,9 @@ impl Render for ContentTypeDialog {
             });
         }
         let muted = cx.theme().muted_foreground;
+        // Nothing to change while the type typed is the one it has.
+        let unchanged = validate_content_type(&self.input.read(cx).value())
+            .is_ok_and(|value| self.is_current(&value));
         v_flex()
             .w_full()
             .gap_3()
@@ -172,7 +184,7 @@ impl Render for ContentTypeDialog {
                             .primary()
                             .label(t!("content_type.save").into_owned())
                             .loading(self.busy)
-                            .disabled(self.busy)
+                            .disabled(self.busy || unchanged)
                             .on_click(cx.listener(|dialog, _, _, cx| dialog.submit(cx))),
                     ),
             )
@@ -218,7 +230,8 @@ mod tests {
                     let dialog = cx.new(|cx| {
                         ContentTypeDialog::new(
                             "notes.md",
-                            Some("application/octet-stream".into()),
+                            // As a service may spell it.
+                            Some("Application/Octet-Stream".into()),
                             window,
                             cx,
                         )

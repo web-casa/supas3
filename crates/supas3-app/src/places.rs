@@ -146,7 +146,13 @@ impl Places {
 
     /// Drops every place in a connection that no longer exists.
     pub fn forget_profile(&mut self, profile_id: &str) {
-        let keep = |location: &Location| location.profile_id() != Some(profile_id);
+        self.forget_where(|location| location.profile_id() == Some(profile_id));
+    }
+
+    /// Drops every place that is `gone`, from the favorites, the recent
+    /// places and the saved tabs.
+    pub fn forget_where(&mut self, gone: impl Fn(&Location) -> bool) {
+        let keep = |location: &Location| !gone(location);
         self.favorites.retain(keep);
         self.recent.retain(keep);
         if let Some(layout) = &mut self.layout {

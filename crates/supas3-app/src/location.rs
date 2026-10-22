@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 /// A place a pane can show. Saved between runs as part of the layout,
 /// favorites and recent places; it holds no secrets.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Location {
     /// A folder on this computer.
@@ -27,6 +27,11 @@ impl Location {
             bucket: bucket.to_string(),
             prefix: normalize_prefix(prefix),
         }
+    }
+
+    /// Whether this location is in `bucket` of the connection `profile_id`.
+    pub fn is_in_bucket(&self, profile_id: &str, bucket: &str) -> bool {
+        matches!(self, Self::Objects { profile_id: p, bucket: b, .. } if p == profile_id && b == bucket)
     }
 
     /// The connection this location belongs to, if it is remote.
@@ -228,13 +233,21 @@ impl History {
     /// Removes every visit to a connection that no longer exists, so Back and
     /// Forward cannot return to it. If nothing is left, starts at `fallback`.
     pub fn forget_profile(&mut self, profile_id: &str, fallback: &Location) {
+        self.forget_where(
+            |location| location.profile_id() == Some(profile_id),
+            fallback,
+        );
+    }
+
+    /// Removes every visit to a place that is `gone`, so Back and Forward
+    /// cannot return to it. If nothing is left, starts at `fallback`.
+    pub fn forget_where(&mut self, gone: impl Fn(&Location) -> bool, fallback: &Location) {
         let current = self.current().clone();
         let before = self.entries[..self.index]
             .iter()
-            .filter(|location| location.profile_id() != Some(profile_id))
+            .filter(|location| !gone(location))
             .count();
-        self.entries
-            .retain(|location| location.profile_id() != Some(profile_id));
+        self.entries.retain(|location| !gone(location));
         // Removing a visit can leave the same place twice in a row.
         self.entries.dedup();
         if self.entries.is_empty() {
@@ -464,5 +477,22 @@ mod tests {
         assert_eq!(*history.current(), objects(""));
         assert!(history.go_forward());
         assert_eq!(*history.current(), objects("a/"));
+    }
+
+    #[test]
+    fn a_deleted_bucket_is_forgotten_from_the_history() {
+        let buckets = Location::Buckets {
+            profile_id: "p".into(),
+        };
+        let gone = Location::objects("p", "old", "a/");
+        let other = Location::objects("p", "kept", "");
+        let mut history = History::new(buckets.clone());
+        history.visit(gone.clone());
+        history.visit(other.clone());
+        history.visit(Location::objects("p", "old", ""));
+        history.forget_where(|location| location.is_in_bucket("p", "old"), &buckets);
+        assert_eq!(history.current(), &other);
+        assert!(!Location::objects("q", "old", "").is_in_bucket("p", "old"));
+        assert!(!buckets.is_in_bucket("p", "old"));
     }
 }

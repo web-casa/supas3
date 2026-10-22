@@ -471,18 +471,18 @@ pub struct Grant<'a> {
     pub permission: Option<&'a str>,
 }
 
-/// Reads an ACL as one of the two choices, or as custom. On IDrive e2
-/// (`e2`), a single full-control grant to a user without an ID is the
-/// owner's, as e2 lists its default ACL that way; elsewhere a grant without
-/// an ID is someone else's.
-pub fn access_of(owner_id: Option<&str>, grants: &[Grant], e2: bool) -> Access {
+/// Reads an ACL as one of the two choices, or as custom. Away from Amazon S3
+/// (`custom_endpoint`), a single full-control grant to a user without an ID
+/// is the owner's, as IDrive e2 and MinIO list their default ACL that way;
+/// otherwise a grant without an ID is someone else's.
+pub fn access_of(owner_id: Option<&str>, grants: &[Grant], custom_endpoint: bool) -> Access {
     let owner_id = owner_id.filter(|id| !id.is_empty());
     let mut public_read = false;
     for grant in grants {
         let to_owner = grant.grantee_type == Some("CanonicalUser")
             && match (grant.id.filter(|id| !id.is_empty()), owner_id) {
                 (Some(id), Some(owner)) => id == owner,
-                (None, _) => e2 && grants.len() == 1,
+                (None, _) => custom_endpoint && grants.len() == 1,
                 (Some(_), None) => false,
             };
         match (to_owner, grant.uri, grant.permission) {

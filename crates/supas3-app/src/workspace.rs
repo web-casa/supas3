@@ -4,7 +4,9 @@
 use crate::app_jobs::{AppJobs, JobContext, JobError, JobLabel};
 use crate::app_state::{AppBackend, Connections};
 use crate::backend::{default_config_dir, Requests};
+use crate::bucket_views::{BucketEvent, CreateBucketDialog, DeleteBucketDialog, PolicyDialog};
 use crate::conflicts::{conflicts, resolve, Choice, Existing};
+use crate::connection::Service;
 use crate::connection_form::{ConnectionForm, ConnectionFormEvent};
 use crate::content_type_view::{ContentTypeDialog, ContentTypeEvent};
 use crate::details_view::{ConnectionInfo, DetailsEvent, DetailsPanel};
@@ -102,6 +104,15 @@ pub struct Workspace {
     storage_notice: Option<String>,
     /// Moves still running; the panes are reloaded when each ends.
     pending_moves: std::collections::HashSet<String>,
+    /// Transfers retried on their own after a network failure, with how
+    /// many retries led to each.
+    retries: std::collections::HashMap<String, u32>,
+    /// The window is too narrow for the full sidebar beside the details
+    /// panel; the sidebar shows icons only, whatever the preference.
+    sidebar_squeezed: bool,
+    /// The user opened the squeezed sidebar anyway; lasts until the window
+    /// has room again or the details panel closes. Not saved.
+    sidebar_unsqueezed: bool,
     /// Counts connection reloads, so only the latest answer is applied.
     reload_generation: u64,
     _subscriptions: Vec<Subscription>,
@@ -208,7 +219,14 @@ pub enum PaneCommand {
     NewFolder,
     Rename,
     Filter,
+    Copy,
+    Move,
 }
+
+/// Dialog widths in rems: confirmations keep the dialog's own width; a
+/// dialog with fields is a form; one with a list or a viewer is wide.
+const FORM_WIDTH: f32 = 32.;
+const WIDE_WIDTH: f32 = 44.;
 
 /// One row of the sidebar.
 #[derive(Clone)]
@@ -312,6 +330,14 @@ impl Workspace {
                         workspace.storage_failed(errors, cx);
                     }
                     TaskCenterEvent::Ended(ended) => {
+                        let failed = ended
+                            .iter()
+                            .filter_map(|(id, state)| match state {
+                                TaskState::Failed(message) => Some((id.clone(), message.clone())),
+                                _ => None,
+                            })
+                            .collect();
+                        workspace.consider_retries(failed, cx);
                         let moved = ended
                             .iter()
                             .filter(|(id, _)| workspace.pending_moves.remove(id))
@@ -381,6 +407,9 @@ impl Workspace {
             places_unsaved: false,
             pending_renames: Default::default(),
             pending_moves: Default::default(),
+            retries: Default::default(),
+            sidebar_squeezed: false,
+            sidebar_unsqueezed: false,
             storage_warned: [false; 2],
             leaving: None,
             window: window.window_handle(),
@@ -512,7 +541,7 @@ impl Workspace {
         let title: SharedString = t!("search.title", query = query.as_str())
             .into_owned()
             .into();
-        let width = rems(46.).to_pixels(window.rem_size());
+        let width = rems(WIDE_WIDTH).to_pixels(window.rem_size());
         window.open_dialog(cx, move |dialog, _, _| {
             dialog.title(title.clone()).width(width).child(view.clone())
         });
@@ -572,7 +601,7 @@ impl Workspace {
         })
         .detach();
         let title: SharedString = t!("folder.new_title").into_owned().into();
-        let width = rems(28.).to_pixels(window.rem_size());
+        let width = rems(FORM_WIDTH).to_pixels(window.rem_size());
         window.open_dialog(cx, move |modal, _, cx| {
             let busy = dialog.read(cx).is_busy();
             modal
@@ -641,7 +670,7 @@ impl Workspace {
         .detach();
         let note: Option<SharedString> =
             remote_folder.then(|| t!("rename.folder_note").into_owned().into());
-        let width = rems(30.).to_pixels(window.rem_size());
+        let width = rems(FORM_WIDTH).to_pixels(window.rem_size());
         window.open_dialog(cx, move |modal, _, cx| {
             let busy = dialog.read(cx).is_busy();
             let muted = cx.theme().muted_foreground;
@@ -785,6 +814,146 @@ impl Workspace {
             // Buckets are not renamed; the dialog is not offered for them.
             Location::Buckets { .. } => window.close_dialog(cx),
         }
+    }
+
+    /// Schedules a retry of a transfer the network cut short, if it is one
+    /// to retry and retries are left.
+    /// Retries, after a wait, failed transfers the network cut short, and
+    /// says so once for all of them.
+    fn consider_retries(&mut self, failed: Vec<(String, String)>, cx: &mut Context<Self>) {
+        let mut candidates = Vec::new();
+        for (id, message) in failed {
+            let done = self.retries.remove(&id).unwrap_or(0);
+            if !crate::auto_retry::transient(&message) || done >= crate::auto_retry::MAX_ATTEMPTS {
+                continue;
+            }
+            let Some(task) = self.task_center.read(cx).task(&id) else {
+                continue;
+            };
+            if task.origin == crate::tasks::TaskOrigin::Transfer
+                && matches!(
+                    task.kind,
+                    TaskKind::Upload | TaskKind::Download | TaskKind::Copy
+                )
+            {
+                candidates.push((id, done + 1, task.name));
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        let Some(requests) = AppBackend::requests(cx) else {
+            return;
+        };
+        cx.spawn(async move |workspace, cx| {
+            // Syncs, imports, restores and moves handle their own failures.
+            let ids = candidates.iter().map(|(id, ..)| id.clone()).collect();
+            let eligible = requests.auto_retry_eligible(ids).await.unwrap_or_default();
+            let chosen: Vec<_> = candidates
+                .into_iter()
+                .filter(|(id, ..)| eligible.contains(id))
+                .map(|(id, attempt, name)| {
+                    // Spread at random, so transfers cut off together do
+                    // not all come back at once.
+                    let jitter = std::hash::BuildHasher::hash_one(
+                        &std::collections::hash_map::RandomState::new(),
+                        &id,
+                    ) as f64
+                        / u64::MAX as f64;
+                    let wait = crate::auto_retry::delay(attempt, jitter);
+                    (id, attempt, name, wait)
+                })
+                .collect();
+            let _ = workspace.update(cx, |workspace, cx| {
+                let message = match chosen.as_slice() {
+                    [] => return,
+                    [(_, attempt, name, wait)] => t!(
+                        "retry.scheduled",
+                        name = name.as_str(),
+                        seconds = wait.as_secs(),
+                        attempt = attempt,
+                        of = crate::auto_retry::MAX_ATTEMPTS
+                    ),
+                    many => t!(
+                        "retry.scheduled_many",
+                        count = many.len(),
+                        seconds = many
+                            .iter()
+                            .map(|(.., wait)| wait.as_secs())
+                            .min()
+                            .unwrap_or(0)
+                    ),
+                };
+                workspace.notify_in_window(NotificationType::Info, message.into_owned(), cx);
+                for (id, attempt, name, wait) in chosen {
+                    workspace.retry_later(id, attempt, name, wait, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Retries one failed transfer after `wait`, unless it was removed from
+    /// the list or retried by hand meanwhile.
+    fn retry_later(
+        &mut self,
+        id: String,
+        attempt: u32,
+        name: String,
+        wait: std::time::Duration,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |workspace, cx| {
+            cx.background_executor().timer(wait).await;
+            let still_listed = workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace.task_center.read(cx).task(&id).is_some()
+                })
+                .unwrap_or(false);
+            let Some(requests) = cx.update(|cx| AppBackend::requests(cx)) else {
+                return;
+            };
+            if !still_listed || !crate::auto_retry::claim(&id) {
+                return;
+            }
+            let result = requests.auto_retry(id.clone()).await;
+            // Queued: the old transfer stays taken, as it is gone.
+            if !matches!(result, Ok(crate::backend::AutoRetry::Queued(_))) {
+                crate::auto_retry::release(&id);
+            }
+            let _ = workspace.update(cx, |workspace, cx| match result {
+                Ok(crate::backend::AutoRetry::Queued(new_id)) => {
+                    workspace.retries.insert(new_id, attempt);
+                    workspace
+                        .task_center
+                        .update(cx, |center, cx| center.forget(&id, cx));
+                }
+                Ok(crate::backend::AutoRetry::MaybeWritten) => {
+                    let message = t!("retry.maybe_written", name = name).into_owned();
+                    workspace.notify_in_window(NotificationType::Warning, message, cx);
+                }
+                Ok(crate::backend::AutoRetry::NotEligible) => {}
+                // The check itself failed. The network again counts as this
+                // attempt; anything else ends the retries, and says why.
+                Err(error) if crate::auto_retry::transient(&error) => {
+                    workspace.retries.insert(id.clone(), attempt);
+                    workspace.consider_retries(vec![(id, error)], cx);
+                }
+                Err(error) => {
+                    let message = t!("retry.gave_up", name = name, error = error).into_owned();
+                    workspace.notify_in_window(NotificationType::Warning, message, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Shows a notification in the workspace's window, from where no
+    /// window is at hand.
+    fn notify_in_window(&self, kind: NotificationType, message: String, cx: &mut Context<Self>) {
+        let _ = self.window.update(cx, |_, window, cx| {
+            Self::notify(kind, message, window, cx);
+        });
     }
 
     /// Says, once for each kind, that the backend could not write to disk.
@@ -974,11 +1143,19 @@ impl Workspace {
             PaneEvent::RowActionRequested(RowAction::Sync, source, entry) => {
                 self.show_sync(side, source, Some(&entry.name), window, cx);
             }
+            PaneEvent::RowActionRequested(
+                RowAction::DeleteBucket,
+                Location::Buckets { profile_id },
+                entry,
+            ) => self.confirm_delete_bucket(profile_id.clone(), entry.name.clone(), window, cx),
             PaneEvent::RowActionRequested(action, source, entry) => {
                 self.show_file(*action, source, entry, window, cx);
             }
             PaneEvent::SyncRequested(source) => self.show_sync(side, source, None, window, cx),
             PaneEvent::ImportRequested(location) => self.show_import(location.clone(), window, cx),
+            PaneEvent::NewBucketRequested(profile_id) => {
+                self.show_create_bucket(side, profile_id.clone(), window, cx)
+            }
             PaneEvent::SelectionChanged => {}
         }
     }
@@ -1047,11 +1224,15 @@ impl Workspace {
             target.bucket,
             target.prefix
         );
-        let title: SharedString = t!(
-            "copy.across_title",
-            count = items.len(),
-            target = target_name
-        )
+        let title: SharedString = if items.len() == 1 {
+            t!("copy.across_title_one", target = target_name)
+        } else {
+            t!(
+                "copy.across_title",
+                count = items.len(),
+                target = target_name
+            )
+        }
         .into_owned()
         .into();
         let body: SharedString = t!("copy.across_body", source = source).into_owned().into();
@@ -1235,7 +1416,7 @@ impl Workspace {
             t!("conflict.replace_note").into_owned().into()
         };
         let workspace = cx.weak_entity();
-        let width = rems(32.).to_pixels(window.rem_size());
+        let width = rems(FORM_WIDTH).to_pixels(window.rem_size());
         window.open_dialog(cx, move |dialog, _, cx| {
             let muted = cx.theme().muted_foreground;
             let choose = |choice: Choice| {
@@ -1276,7 +1457,7 @@ impl Workspace {
                         .justify_end()
                         .child(
                             Button::new("conflict-cancel")
-                                .ghost()
+                                .outline()
                                 .label(t!("action.cancel").into_owned())
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
@@ -1415,7 +1596,7 @@ impl Workspace {
                         .justify_end()
                         .child(
                             Button::new("leave-cancel")
-                                .ghost()
+                                .outline()
                                 .label(t!("action.cancel").into_owned())
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
@@ -1544,7 +1725,7 @@ impl Workspace {
         let body: SharedString = body.into();
         let destination: SharedString = t!("move.to", target = target).into_owned().into();
         let workspace = cx.weak_entity();
-        let width = rems(30.).to_pixels(window.rem_size());
+        let width = rems(FORM_WIDTH).to_pixels(window.rem_size());
         window.open_dialog(cx, move |dialog, _, cx| {
             let muted = cx.theme().muted_foreground;
             let (workspace, planned, source) = (workspace.clone(), planned.clone(), source.clone());
@@ -1907,7 +2088,7 @@ impl Workspace {
         if action == RowAction::Versions {
             let view = cx.new(|cx| VersionsView::new(object, cx));
             let title: SharedString = t!("versions.title", name = name).into_owned().into();
-            let width = rems(46.).to_pixels(window.rem_size());
+            let width = rems(WIDE_WIDTH).to_pixels(window.rem_size());
             window.open_dialog(cx, move |dialog, _, _| {
                 dialog.title(title.clone()).width(width).child(view.clone())
             });
@@ -1940,7 +2121,7 @@ impl Workspace {
                     };
                     let view = cx.new(|cx| ShareView::new(object, early, plain, cx));
                     let title: SharedString = t!("share.title", name = name).into_owned().into();
-                    let width = rems(36.).to_pixels(window.rem_size());
+                    let width = rems(WIDE_WIDTH).to_pixels(window.rem_size());
                     window.open_dialog(cx, move |dialog, _, _| {
                         dialog.title(title.clone()).width(width).child(view.clone())
                     });
@@ -1961,7 +2142,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let name: SharedString = entry.name.clone().into();
-        let width = rems(46.).to_pixels(window.rem_size());
+        let width = rems(WIDE_WIDTH).to_pixels(window.rem_size());
         // Text opens in a tab of the pane it was opened from; images and
         // notes in a dialog.
         let in_tab = matches!(
@@ -2034,7 +2215,7 @@ impl Workspace {
         };
         let view = cx.new(|cx| SyncView::new(pair, window, cx));
         let title: SharedString = t!("sync.title").into_owned().into();
-        let width = rems(40.).to_pixels(window.rem_size());
+        let width = rems(WIDE_WIDTH).to_pixels(window.rem_size());
         window.open_dialog(cx, move |dialog, _, cx| {
             let enter = view.clone();
             // Once a sync is being started it goes ahead; the dialog stays
@@ -2145,6 +2326,17 @@ impl Workspace {
                 let (profile_id, bucket, prefix) =
                     (profile_id.clone(), bucket.clone(), prefix.clone());
                 self.confirm_folder_access(profile_id, bucket, prefix, *to, window, cx);
+            }
+            DetailsEvent::SetVersioning {
+                profile_id,
+                bucket,
+                enabled,
+            } => {
+                let (profile_id, bucket) = (profile_id.clone(), bucket.clone());
+                self.confirm_versioning(profile_id, bucket, *enabled, window, cx);
+            }
+            DetailsEvent::EditPolicy { profile_id, bucket } => {
+                self.show_policy(profile_id.clone(), bucket.clone(), window, cx);
             }
             DetailsEvent::EditMetadata { object, seen } => {
                 self.show_metadata(object.clone(), seen.clone(), window, cx);
@@ -2316,7 +2508,7 @@ impl Workspace {
         })
         .detach();
         let title: SharedString = t!("content_type.title", name = name).into_owned().into();
-        let width = rems(30.).to_pixels(window.rem_size());
+        let width = rems(FORM_WIDTH).to_pixels(window.rem_size());
         window.open_dialog(cx, move |modal, _, cx| {
             let busy = dialog.read(cx).is_busy();
             modal
@@ -2352,6 +2544,11 @@ impl Workspace {
         else {
             return;
         };
+        let on_oss = self
+            .connections
+            .read(cx)
+            .get(&profile_id)
+            .is_some_and(|profile| Service::of(profile) == Service::Oss);
         cx.spawn_in(window, async move |workspace, cx| {
             let mut listed = requests
                 .list_keys(profile_id.clone(), bucket.clone(), prefix.clone())
@@ -2411,8 +2608,10 @@ impl Workspace {
                     })
                     .into_owned(),
                     t!("folder_access.replaced").into_owned(),
-                    t!("access.inherit_note").into_owned(),
                 ];
+                if on_oss {
+                    lines.push(t!("access.inherit_note").into_owned());
+                }
                 lines.dedup();
                 let (title, confirm): (SharedString, SharedString) = match to {
                     Access::PublicRead => (
@@ -2432,6 +2631,8 @@ impl Workspace {
                         (profile_id.clone(), bucket.clone(), prefix.clone());
                     dialog
                         .title(title.clone())
+                        // Enter does not change who may read data.
+                        .on_ok(|_, _, _| false)
                         .child(
                             v_flex()
                                 .gap_2()
@@ -2452,7 +2653,7 @@ impl Workspace {
                                 )
                                 .child(
                                     Button::new("confirm-folder-access")
-                                        .primary()
+                                        .when(to == Access::PublicRead, |this| this.danger())
                                         .label(confirm.clone())
                                         .on_click(move |_, window, cx| {
                                             window.close_dialog(cx);
@@ -2560,6 +2761,370 @@ impl Workspace {
         );
     }
 
+    /// Asks for a new bucket's name and makes it.
+    fn show_create_bucket(
+        &mut self,
+        side: Side,
+        profile_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self.connections.read(cx).get(&profile_id).cloned() else {
+            return;
+        };
+        let service = Service::of(&profile);
+        let region = profile.region.clone().unwrap_or_default();
+        let dialog = cx.new(|cx| CreateBucketDialog::new(service, &region, window, cx));
+        cx.subscribe_in(
+            &dialog,
+            window,
+            move |workspace, dialog, event, window, cx| {
+                let BucketEvent::Create(name, region) = event else {
+                    return;
+                };
+                let Some(requests) = AppBackend::requests(cx) else {
+                    return;
+                };
+                let (dialog, name, region, profile_id) = (
+                    dialog.clone(),
+                    name.clone(),
+                    region.clone(),
+                    profile_id.clone(),
+                );
+                let _ = workspace;
+                cx.spawn_in(window, async move |workspace, cx| {
+                    let result = requests
+                        .create_bucket(profile_id.clone(), name.clone(), region)
+                        .await;
+                    let _ = workspace.update_in(cx, |workspace, window, cx| match result {
+                        Ok(()) => {
+                            window.close_dialog(cx);
+                            let buckets = Location::Buckets { profile_id };
+                            workspace.pane(side).clone().update(cx, |pane, cx| {
+                                pane.location_changed(Some(&buckets), true, cx)
+                            });
+                            let message = t!("bucket.created", name = name).into_owned();
+                            Self::notify(NotificationType::Success, message, window, cx);
+                        }
+                        Err(error) => dialog.update(cx, |dialog, cx| dialog.failed(error, cx)),
+                    });
+                })
+                .detach();
+            },
+        )
+        .detach();
+        let title: SharedString = t!("bucket.new_title").into_owned().into();
+        let width = rems(FORM_WIDTH).to_pixels(window.rem_size());
+        window.open_dialog(cx, move |modal, _, cx| {
+            let busy = dialog.read(cx).is_busy();
+            modal
+                .title(title.clone())
+                .width(width)
+                .keyboard(!busy)
+                .overlay_closable(!busy)
+                .close_button(!busy)
+                .on_ok(|_, _, _| false)
+                .child(dialog.clone())
+        });
+    }
+
+    /// Asks for a bucket's name to be typed, then deletes the bucket, if
+    /// nothing in supaS3 is still working in it.
+    fn confirm_delete_bucket(
+        &mut self,
+        profile_id: String,
+        bucket: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let unsaved = self.unsaved_editors(cx).into_iter().any(|(_, view)| {
+            matches!(view.read(cx).file(), FileRef::Remote(object)
+                if object.profile_id == profile_id && object.bucket == bucket)
+        });
+        let busy = self.task_center.read(cx).active_in_bucket(&bucket);
+        if unsaved || busy {
+            let key = if unsaved {
+                "bucket.delete_unsaved"
+            } else {
+                "bucket.delete_busy"
+            };
+            Self::notify(NotificationType::Info, t!(key).into_owned(), window, cx);
+            return;
+        }
+        let dialog = cx.new(|cx| DeleteBucketDialog::new(bucket.clone(), window, cx));
+        let title: SharedString = t!("bucket.delete_title", name = bucket.as_str())
+            .into_owned()
+            .into();
+        cx.subscribe_in(&dialog, window, move |_, dialog, event, window, cx| {
+            let BucketEvent::Delete(typed) = event else {
+                return;
+            };
+            let Some(requests) = AppBackend::requests(cx) else {
+                return;
+            };
+            let (dialog, typed, profile_id, bucket) = (
+                dialog.clone(),
+                typed.clone(),
+                profile_id.clone(),
+                bucket.clone(),
+            );
+            cx.spawn_in(window, async move |workspace, cx| {
+                let result = requests
+                    .delete_bucket(profile_id.clone(), bucket.clone(), typed)
+                    .await
+                    .map_err(|error| {
+                        if error.contains("BucketNotEmpty") {
+                            t!("bucket.not_empty").into_owned()
+                        } else {
+                            error
+                        }
+                    });
+                let _ = workspace.update_in(cx, |workspace, window, cx| match result {
+                    Ok(()) => {
+                        window.close_dialog(cx);
+                        workspace.bucket_deleted(&profile_id, &bucket, window, cx);
+                    }
+                    Err(error) => dialog.update(cx, |dialog, cx| dialog.failed(error, cx)),
+                });
+            })
+            .detach();
+        })
+        .detach();
+        let width = rems(FORM_WIDTH).to_pixels(window.rem_size());
+        window.open_dialog(cx, move |modal, _, cx| {
+            let busy = dialog.read(cx).is_busy();
+            modal
+                .title(title.clone())
+                .width(width)
+                .keyboard(!busy)
+                .overlay_closable(!busy)
+                .close_button(!busy)
+                .on_ok(|_, _, _| false)
+                .child(dialog.clone())
+        });
+    }
+
+    /// A bucket is gone: no tab, history, favorite or recent place leads
+    /// there any more, and editors of its objects close.
+    fn bucket_deleted(
+        &mut self,
+        profile_id: &str,
+        bucket: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let gone = |location: &Location| location.is_in_bucket(profile_id, bucket);
+        let buckets = Location::Buckets {
+            profile_id: profile_id.to_string(),
+        };
+        self.places.update(cx, |places, cx| {
+            places.forget_where(gone);
+            cx.notify();
+        });
+        for pane in [self.left.clone(), self.right.clone()] {
+            pane.update(cx, |pane, cx| {
+                pane.drop_editors(
+                    |view, _| {
+                        matches!(view.file(), FileRef::Remote(object)
+                            if object.profile_id == profile_id && object.bucket == bucket)
+                    },
+                    cx,
+                );
+                pane.leave_where(gone, &buckets, cx);
+                pane.location_changed(Some(&buckets), true, cx);
+            });
+        }
+        let default = self
+            .connections
+            .read(cx)
+            .get(profile_id)
+            .and_then(|profile| profile.compat.default_bucket.clone());
+        let message = if default.as_deref() == Some(bucket) {
+            t!("bucket.deleted_default", name = bucket).into_owned()
+        } else {
+            t!("bucket.deleted", name = bucket).into_owned()
+        };
+        Self::notify(NotificationType::Success, message, window, cx);
+        self.refresh_details(cx);
+    }
+
+    /// Says what turning versioning on or pausing it means, then does it.
+    fn confirm_versioning(
+        &mut self,
+        profile_id: String,
+        bucket: String,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = cx.weak_entity();
+        let (title, body, confirm): (SharedString, SharedString, SharedString) = if enabled {
+            (
+                t!("bucket.versioning_enable_title", name = bucket.as_str())
+                    .into_owned()
+                    .into(),
+                t!("bucket.versioning_enable_body").into_owned().into(),
+                t!("bucket.versioning_enable").into_owned().into(),
+            )
+        } else {
+            (
+                t!("bucket.versioning_suspend_title", name = bucket.as_str())
+                    .into_owned()
+                    .into(),
+                t!("bucket.versioning_suspend_body").into_owned().into(),
+                t!("bucket.versioning_suspend").into_owned().into(),
+            )
+        };
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (workspace, profile_id, bucket) =
+                (workspace.clone(), profile_id.clone(), bucket.clone());
+            dialog
+                .title(title.clone())
+                // Enter does not change how the bucket keeps versions.
+                .on_ok(|_, _, _| false)
+                .child(div().text_sm().whitespace_normal().child(body.clone()))
+                .footer(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("cancel-versioning")
+                                .outline()
+                                .label(t!("action.cancel").into_owned())
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("confirm-versioning")
+                                .label(confirm.clone())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let (profile_id, bucket) = (profile_id.clone(), bucket.clone());
+                                    let _ = workspace.update(cx, |_, cx| {
+                                        let Some(requests) = AppBackend::requests(cx) else {
+                                            return;
+                                        };
+                                        cx.spawn_in(window, async move |workspace, cx| {
+                                            let result = requests
+                                                .set_bucket_versioning(profile_id, bucket, enabled)
+                                                .await;
+                                            let _ =
+                                                workspace.update_in(cx, |workspace, window, cx| {
+                                                    if let Err(error) = result {
+                                                        let message = t!(
+                                                            "bucket.versioning_failed",
+                                                            detail = brief_error(&error)
+                                                        )
+                                                        .into_owned();
+                                                        Self::notify(
+                                                            NotificationType::Error,
+                                                            message,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
+                                                    workspace.details.update(cx, |details, cx| {
+                                                        details.reload(cx)
+                                                    });
+                                                });
+                                        })
+                                        .detach();
+                                    });
+                                }),
+                        ),
+                )
+        });
+    }
+
+    /// Reads a bucket's policy and opens it for editing.
+    fn show_policy(
+        &mut self,
+        profile_id: String,
+        bucket: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(requests) = AppBackend::requests(cx) else {
+            return;
+        };
+        cx.spawn_in(window, async move |_, cx| {
+            let read = requests
+                .bucket_policy(profile_id.clone(), bucket.clone())
+                .await;
+            let _ = cx.update(|window, cx| {
+                let original = match read {
+                    Ok(policy) => policy,
+                    Err(error) => {
+                        let message =
+                            t!("policy.unreadable", detail = brief_error(&error)).into_owned();
+                        Self::notify(NotificationType::Error, message, window, cx);
+                        return;
+                    }
+                };
+                let dialog = cx.new(|cx| PolicyDialog::new(original, window, cx));
+                let requests = requests.clone();
+                let subscription_dialog = dialog.clone();
+                let (profile_id, bucket2) = (profile_id.clone(), bucket.clone());
+                window
+                    .subscribe(
+                        &subscription_dialog,
+                        cx,
+                        move |dialog, event: &BucketEvent, window, cx| {
+                            let BucketEvent::SavePolicy(policy) = event else {
+                                return;
+                            };
+                            let expected = dialog.read(cx).original();
+                            let (requests, policy, profile_id, bucket) = (
+                                requests.clone(),
+                                policy.clone(),
+                                profile_id.clone(),
+                                bucket2.clone(),
+                            );
+                            let dialog = dialog.clone();
+                            window
+                                .spawn(cx, async move |cx| {
+                                    let result = requests
+                                        .put_bucket_policy(profile_id, bucket, policy, expected)
+                                        .await;
+                                    let _ = cx.update(|window, cx| match result {
+                                        Ok(()) => {
+                                            window.close_dialog(cx);
+                                            let message = t!("policy.saved").into_owned();
+                                            Self::notify(
+                                                NotificationType::Success,
+                                                message,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                        Err(error) => {
+                                            dialog.update(cx, |dialog, cx| dialog.failed(error, cx))
+                                        }
+                                    });
+                                })
+                                .detach();
+                        },
+                    )
+                    .detach();
+                let title: SharedString = t!("policy.title", name = bucket.as_str())
+                    .into_owned()
+                    .into();
+                let width = rems(WIDE_WIDTH).to_pixels(window.rem_size());
+                window.open_dialog(cx, move |modal, _, cx| {
+                    let busy = dialog.read(cx).is_busy();
+                    modal
+                        .title(title.clone())
+                        .width(width)
+                        .keyboard(!busy)
+                        .overlay_closable(!busy)
+                        .close_button(!busy)
+                        .on_ok(|_, _, _| false)
+                        .child(dialog.clone())
+                });
+            });
+        })
+        .detach();
+    }
+
     /// Asks for web addresses and queues their import into `location`.
     fn show_import(&mut self, location: Location, window: &mut Window, cx: &mut Context<Self>) {
         let Location::Objects {
@@ -2570,7 +3135,8 @@ impl Workspace {
         else {
             return;
         };
-        let dialog = cx.new(|cx| ImportDialog::new(window, cx));
+        let place = self.describe(&location, cx);
+        let dialog = cx.new(|cx| ImportDialog::new(place, window, cx));
         cx.subscribe_in(&dialog, window, move |_, dialog, event, window, cx| {
             let ImportEvent::Submitted(items, max_bytes) = event;
             let Some(requests) = AppBackend::requests(cx) else {
@@ -2596,10 +3162,8 @@ impl Workspace {
             .detach();
         })
         .detach();
-        let title: SharedString = t!("import.title", place = self.describe(&location, cx))
-            .into_owned()
-            .into();
-        let width = rems(36.).to_pixels(window.rem_size());
+        let title: SharedString = t!("import.title").into_owned().into();
+        let width = rems(WIDE_WIDTH).to_pixels(window.rem_size());
         window.open_dialog(cx, move |modal, _, cx| {
             let busy = dialog.read(cx).is_busy();
             modal
@@ -2676,7 +3240,7 @@ impl Workspace {
         })
         .detach();
         let title: SharedString = t!("metadata.title", name = name).into_owned().into();
-        let width = rems(36.).to_pixels(window.rem_size());
+        let width = rems(WIDE_WIDTH).to_pixels(window.rem_size());
         window.open_dialog(cx, move |modal, _, cx| {
             let busy = dialog.read(cx).is_busy();
             modal
@@ -2702,10 +3266,28 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let workspace = cx.weak_entity();
+        let name = object
+            .key
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
         let (title, confirm) = match to {
-            Access::PublicRead => (t!("access.public_title"), t!("access.make_public")),
-            _ => (t!("access.private_title"), t!("access.make_private")),
+            Access::PublicRead => (
+                t!("access.public_title", name = name),
+                t!("access.make_public"),
+            ),
+            _ => (
+                t!("access.private_title", name = name),
+                t!("access.make_private"),
+            ),
         };
+        // Only Alibaba Cloud OSS has objects follow their bucket's ACL.
+        let on_oss = self
+            .connections
+            .read(cx)
+            .get(&object.profile_id)
+            .is_some_and(|profile| Service::of(profile) == Service::Oss);
         let mut lines = vec![t!(if to == Access::PublicRead {
             "access.public_body"
         } else {
@@ -2715,7 +3297,9 @@ impl Workspace {
         if current == Access::Custom {
             lines.push(t!("access.custom_replaced").into_owned());
         }
-        lines.push(t!("access.inherit_note").into_owned());
+        if on_oss {
+            lines.push(t!("access.inherit_note").into_owned());
+        }
         let (title, confirm): (SharedString, SharedString) =
             (title.into_owned().into(), confirm.into_owned().into());
         let address = object.display();
@@ -2724,6 +3308,8 @@ impl Workspace {
             let muted = cx.theme().muted_foreground;
             dialog
                 .title(title.clone())
+                // Enter does not change who may read data.
+                .on_ok(|_, _, _| false)
                 .child(
                     v_flex()
                         .gap_2()
@@ -2742,7 +3328,7 @@ impl Workspace {
                         )
                         .child(
                             Button::new("confirm-access")
-                                .primary()
+                                .when(to == Access::PublicRead, |this| this.danger())
                                 .label(confirm.clone())
                                 .on_click(move |_, window, cx| {
                                     window.close_dialog(cx);
@@ -2772,13 +3358,11 @@ impl Workspace {
             Self::notify(NotificationType::Error, message, window, cx);
             return;
         };
-        let idrive_e2 = self
+        let custom_endpoint = self
             .connections
             .read(cx)
             .get(&object.profile_id)
-            .is_some_and(|profile| {
-                profile.compat.provider == supas3_core::credentials::Provider::IdriveE2
-            });
+            .is_some_and(|profile| Service::of(profile) != Service::Aws);
         self.details
             .update(cx, |details, cx| details.access_changing(cx));
         cx.spawn_in(window, async move |workspace, cx| {
@@ -2794,7 +3378,7 @@ impl Workspace {
                         permission: grant.permission.as_deref(),
                     })
                     .collect();
-                if access_of(now.owner_id.as_deref(), &grants, idrive_e2) != current {
+                if access_of(now.owner_id.as_deref(), &grants, custom_endpoint) != current {
                     return Err(t!("access.changed_meanwhile").into_owned());
                 }
                 if let Some(etag) = etag {
@@ -2866,6 +3450,13 @@ impl Workspace {
 
     /// Shows the sidebar as icons only, or in full.
     pub fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Folded only for want of room: open or fold it for now, leaving
+        // the preference as it is.
+        if !self.settings.sidebar_collapsed && self.narrow_with_details(window) {
+            self.sidebar_unsqueezed = !self.sidebar_unsqueezed;
+            cx.notify();
+            return;
+        }
         self.store_settings(
             |settings| settings.sidebar_collapsed = !settings.sidebar_collapsed,
             window,
@@ -2925,7 +3516,7 @@ impl Workspace {
         })
         .detach();
         let title: SharedString = t!("transfers.title").into_owned().into();
-        let width = rems(30.).to_pixels(window.rem_size());
+        let width = rems(FORM_WIDTH).to_pixels(window.rem_size());
         window.open_dialog(cx, move |modal, _, cx| {
             let busy = dialog.read(cx).is_busy();
             modal
@@ -2943,7 +3534,7 @@ impl Workspace {
         const SOURCE: &str = env!("CARGO_PKG_REPOSITORY");
         const UPSTREAM: &str = "https://github.com/rgcsekaraa/brows3";
         const LICENSE_TEXT: &str = "https://www.gnu.org/licenses/agpl-3.0.html";
-        let width = rems(30.).to_pixels(window.rem_size());
+        let width = rems(FORM_WIDTH).to_pixels(window.rem_size());
         window.open_dialog(cx, move |dialog, _, cx| {
             let muted = cx.theme().muted_foreground;
             dialog
@@ -3049,7 +3640,7 @@ impl Workspace {
         .detach();
         self.form = Some(form.clone());
         let workspace = cx.weak_entity();
-        let width = rems(34.).to_pixels(window.rem_size());
+        let width = rems(FORM_WIDTH).to_pixels(window.rem_size());
         window.open_dialog(cx, move |dialog, _, _| {
             let submit = form.clone();
             let (closed_form, closed_workspace) = (form.clone(), workspace.clone());
@@ -3221,6 +3812,8 @@ impl Workspace {
             PaneCommand::NewFolder => pane.new_folder(cx),
             PaneCommand::Rename => pane.rename_selected(cx),
             PaneCommand::Filter => pane.open_filter(window, cx),
+            PaneCommand::Copy => pane.copy_selection(cx),
+            PaneCommand::Move => pane.move_selection(cx),
         });
     }
 
@@ -3456,7 +4049,7 @@ impl Workspace {
         keyboard_here: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let collapsed = self.settings.sidebar_collapsed;
+        let collapsed = self.sidebar_collapsed();
         let (label, icon, full) = self.sidebar_row_text(row, cx);
         let active = match row {
             SidebarRow::Home => matches!(active_location, Location::Local(_)),
@@ -3489,8 +4082,10 @@ impl Workspace {
             })
             .when(collapsed, |this| this.justify_center())
             .when(active, |this| this.bg(accent).text_color(accent_text))
-            .hover(move |style| style.bg(accent))
-            .cursor_pointer()
+            // Hovering is lighter than being where the pane is.
+            .when(!active, |this| {
+                this.hover(move |style| style.bg(accent.opacity(0.5)))
+            })
             .child(
                 gpui_kit::component::Icon::new(icon)
                     .size_4()
@@ -3575,10 +4170,22 @@ impl Workspace {
         }
     }
 
+    /// Whether the sidebar shows icons only: as chosen, or for want of room.
+    /// Whether the details panel is open in a window too narrow for it, the
+    /// two panes and the full sidebar together.
+    fn narrow_with_details(&self, window: &Window) -> bool {
+        self.settings.details_open
+            && window.viewport_size().width < rems(90.).to_pixels(window.rem_size())
+    }
+
+    fn sidebar_collapsed(&self) -> bool {
+        self.settings.sidebar_collapsed || self.sidebar_squeezed
+    }
+
     fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_location = self.pane(self.active).read(cx).location().clone();
         let settings = self.settings;
-        let collapsed = settings.sidebar_collapsed;
+        let collapsed = self.sidebar_collapsed();
         let workspace = cx.weak_entity();
         let rows = self.sidebar_rows(cx);
         let keyboard = self.sidebar_focus.is_focused(window);
@@ -3646,7 +4253,7 @@ impl Workspace {
             .on_key_down(cx.listener(Self::on_sidebar_key))
             .h_full()
             .flex_shrink_0()
-            .w(if collapsed { px(48.) } else { px(240.) })
+            .w(if collapsed { rems(3.) } else { rems(15.) })
             .bg(theme.sidebar)
             .text_color(theme.sidebar_foreground)
             .border_r_1()
@@ -3776,9 +4383,10 @@ impl Workspace {
     }
 
     fn render_pane(&self, side: Side, cx: &mut Context<Self>) -> impl IntoElement {
-        // The active pane is outlined; sidebar choices open there.
+        // The active pane is outlined; sidebar choices open there. The
+        // focus ring's color stays for the keyboard focus.
         let outline = if self.active == side {
-            cx.theme().ring
+            cx.theme().list_active_border
         } else {
             cx.theme().transparent
         };
@@ -3810,6 +4418,14 @@ impl Render for Workspace {
         // Narrower than this, a pane's navigation bar no longer fits.
         let min_pane = rems(18.).to_pixels(window.rem_size());
         let details_open = self.settings.details_open;
+        // Two panes, the details panel and the full sidebar need about
+        // 90rem to leave each pane room; below that the sidebar gives way
+        // first.
+        let narrow = self.narrow_with_details(window);
+        if !narrow {
+            self.sidebar_unsqueezed = false;
+        }
+        self.sidebar_squeezed = narrow && !self.sidebar_unsqueezed;
         let details_width = rems(20.).to_pixels(window.rem_size());
         let (min_details, max_details) = (
             rems(15.).to_pixels(window.rem_size()),

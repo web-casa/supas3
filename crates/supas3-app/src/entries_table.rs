@@ -55,6 +55,8 @@ pub enum RowAction {
     Properties,
     /// Give the file or folder a new name.
     Rename,
+    /// Delete the bucket, which must be empty.
+    DeleteBucket,
 }
 
 /// Carries a row command to the owning pane.
@@ -440,6 +442,7 @@ impl TableDelegate for EntriesDelegate {
                     (RowAction::Rename, "action.rename_ellipsis"),
                 ],
                 EntryKind::Folder if remote => &[(RowAction::Rename, "action.rename_ellipsis")],
+                EntryKind::Bucket => &[(RowAction::DeleteBucket, "bucket.delete_ellipsis")],
                 _ => &[],
             };
             for (action, label) in actions.iter().copied() {

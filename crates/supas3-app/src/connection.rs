@@ -346,7 +346,7 @@ impl Draft {
 }
 
 /// COS bucket names are `<name>-<APPID>`, where APPID is all digits.
-fn ends_with_app_id(bucket: &str) -> bool {
+pub fn ends_with_app_id(bucket: &str) -> bool {
     bucket.rsplit_once('-').is_some_and(|(name, app_id)| {
         !name.is_empty() && !app_id.is_empty() && app_id.bytes().all(|byte| byte.is_ascii_digit())
     })

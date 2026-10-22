@@ -479,6 +479,9 @@ impl ObjectView {
                 div()
                     .id("image-area")
                     .relative()
+                    // A white picture shows its edges on a tinted ground.
+                    .bg(cx.theme().muted)
+                    .rounded(cx.theme().radius)
                     .h(height)
                     .w_full()
                     .overflow_scroll()

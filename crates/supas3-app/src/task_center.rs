@@ -163,6 +163,12 @@ impl TaskCenter {
         let Some(requests) = AppBackend::requests(cx) else {
             return;
         };
+        // A retry the app has under way for this transfer comes first.
+        if action == TaskAction::Retry && !crate::auto_retry::claim(&id) {
+            self.error = Some(t!("retry.in_progress").into_owned());
+            cx.notify();
+            return;
+        }
         self.error = None;
         cx.spawn(async move |center, cx| {
             let result = match action {
@@ -180,6 +186,11 @@ impl TaskCenter {
                 },
                 TaskAction::Remove => requests.remove_transfer(id.clone()).await.map(|_| true),
             };
+            // Retried: the transfer stays taken, so the app does not
+            // retry it again.
+            if action == TaskAction::Retry && result.is_err() {
+                crate::auto_retry::release(&id);
+            }
             let _ = center.update(cx, |center, cx| {
                 match result {
                     Ok(_) if action == TaskAction::Remove => center.tasks.remove(&id),
@@ -193,6 +204,37 @@ impl TaskCenter {
             });
         })
         .detach();
+    }
+
+    /// The task with this id, as the list shows it.
+    pub fn task(&self, id: &str) -> Option<crate::tasks::Task> {
+        self.tasks.get(id).cloned()
+    }
+
+    /// Drops a task from the list, as when it was queued again under a
+    /// new id.
+    pub fn forget(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.tasks.remove(id);
+        cx.notify();
+    }
+
+    /// Whether a transfer or job still waiting or running reads from or
+    /// writes to a bucket of this name. Transfer rows name buckets without
+    /// their connection, so a bucket of the same name elsewhere counts too.
+    pub fn active_in_bucket(&self, bucket: &str) -> bool {
+        let place = format!("s3://{bucket}/");
+        // How the app's own jobs, such as moves, name a place in storage.
+        let job_place = format!(" / {bucket}/");
+        self.tasks
+            .list(crate::tasks::TaskFilter::Current)
+            .iter()
+            .any(|task| {
+                task.state.is_active()
+                    && [&task.source, &task.target].iter().any(|place_of| {
+                        place_of.starts_with(&place)
+                            || (task.origin == TaskOrigin::App && place_of.contains(&job_place))
+                    })
+            })
     }
 
     /// Cancels everything that is waiting or running.

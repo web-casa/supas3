@@ -10,7 +10,7 @@ use aws_sdk_s3::Client;
 static POLICY_WRITES: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-async fn selected_client(
+pub(crate) async fn selected_client(
     expected_profile_id: &str,
     region: Option<&str>,
     profiles: &ProfileState,
@@ -27,11 +27,9 @@ async fn selected_client(
         ));
     }
     let sdk = crate::s3::client::load_sdk_config(&profile, region.map(str::to_string)).await;
-    let custom = matches!(
-        profile.credential_type,
-        crate::credentials::CredentialType::CustomEndpoint { .. }
-    ) || sdk.endpoint_url().is_some();
     let client = crate::s3::client::client_from_sdk_config(&sdk, &profile);
+    // Any endpoint not AWS's, including one set in the environment.
+    let custom = crate::s3::guard::Protection::of(&client) != crate::s3::guard::Protection::Native;
     Ok((profile, client, custom))
 }
 
@@ -172,9 +170,12 @@ async fn read_policy(client: &Client, bucket: &str) -> Result<Option<String>> {
     .map_err(|_| AppError::S3Error("Reading bucket policy timed out.".into()))?;
     match response {
         Ok(output) => Ok(output.policy),
+        // Tencent COS answers a bucket without a policy with "NotFound".
         Err(error)
-            if error.as_service_error().and_then(|error| error.code())
-                == Some("NoSuchBucketPolicy") =>
+            if matches!(
+                error.as_service_error().and_then(|error| error.code()),
+                Some("NoSuchBucketPolicy" | "NotFound")
+            ) =>
         {
             Ok(None)
         }

@@ -53,6 +53,8 @@ pub enum PaneEvent {
     SyncRequested(Location),
     /// Import web addresses into this location of a bucket.
     ImportRequested(Location),
+    /// Make a bucket in this connection.
+    NewBucketRequested(String),
     /// The tabs or what they show changed; the layout is worth saving.
     Moved,
     /// Create a folder in the location shown.
@@ -78,6 +80,9 @@ struct PaneTab {
     sort: Sort,
     /// Keep loading pages until the location is complete.
     load_all: bool,
+    /// The location last listed here. Reloading it keeps the table in
+    /// place instead of showing the first-load spinner.
+    listed: Option<Location>,
     table: Entity<TableState<EntriesDelegate>>,
     _table_events: Subscription,
 }
@@ -266,6 +271,7 @@ impl Pane {
             stale: false,
             sort,
             load_all: false,
+            listed: None,
             table,
             _table_events: table_events,
         });
@@ -317,6 +323,28 @@ impl Pane {
         for tab in &mut self.tabs {
             let was_showing = tab.history.current().profile_id() == Some(profile_id);
             tab.history.forget_profile(profile_id, fallback);
+            if was_showing {
+                reload.push(tab.id);
+            }
+        }
+        for id in reload {
+            self.load(id, false, cx);
+        }
+        cx.notify();
+    }
+
+    /// Forgets every visit to a place that is `gone`, such as a deleted
+    /// bucket; a tab left with nowhere to be shows `fallback`.
+    pub fn leave_where(
+        &mut self,
+        gone: impl Fn(&Location) -> bool,
+        fallback: &Location,
+        cx: &mut Context<Self>,
+    ) {
+        let mut reload = Vec::new();
+        for tab in &mut self.tabs {
+            let was_showing = gone(tab.history.current());
+            tab.history.forget_where(&gone, fallback);
             if was_showing {
                 reload.push(tab.id);
             }
@@ -796,6 +824,7 @@ impl Pane {
         let Some(rows) = self.tabs[index].listing.finish(generation, result) else {
             return;
         };
+        self.tabs[index].listed = Some(self.tabs[index].history.current().clone());
         self.tabs[index]
             .table
             .update(cx, |table, _| table.delegate_mut().append(rows));
@@ -905,6 +934,28 @@ impl Pane {
         });
         cx.emit(PaneEvent::SelectionChanged);
         cx.notify();
+    }
+
+    /// Asks to copy the marked rows, or the selected one, to the other pane.
+    pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.rows_in_front() {
+            return;
+        }
+        let rows = self.selection(cx);
+        if !rows.entries.is_empty() {
+            cx.emit(PaneEvent::CopyRequested(rows));
+        }
+    }
+
+    /// Asks to move the marked rows, or the selected one, to the other pane.
+    pub fn move_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.rows_in_front() {
+            return;
+        }
+        let rows = self.selection(cx);
+        if !rows.entries.is_empty() {
+            cx.emit(PaneEvent::MoveRequested(rows));
+        }
     }
 
     /// How many rows the tab in front shows, out of how many it loaded.
@@ -1338,7 +1389,33 @@ impl Pane {
                 .text_color(cx.theme().muted_foreground)
                 .child(Icon::new(IconName::Inbox).large())
                 .child(t!("list.empty").into_owned())
+                .when(can_hold_folders(tab.history.current()), |this| {
+                    this.child(
+                        Button::new(self.id("empty-new-folder"))
+                            .small()
+                            .outline()
+                            .icon(Icon::default().path("icons/folder-plus.svg"))
+                            .label(t!("action.new_folder_ellipsis").into_owned())
+                            .on_click(cx.listener(|pane, _, _, cx| pane.new_folder(cx))),
+                    )
+                })
                 .into_any_element(),
+            // Nothing loaded here yet: say so where the rows will be. A
+            // reload of the same place keeps the table, so it does not flash.
+            LoadState::Idle | LoadState::Loading
+                if empty && tab.listed.as_ref() != Some(tab.history.current()) =>
+            {
+                v_flex()
+                    .track_focus(&focus)
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(gpui_kit::component::spinner::Spinner::new())
+                    .child(t!("status.loading").into_owned())
+                    .into_any_element()
+            }
             _ => DataTable::new(&tab.table)
                 .stripe(false)
                 .bordered(false)
@@ -1367,6 +1444,7 @@ impl Pane {
             LoadState::Loaded if tab.listing.has_more() => {
                 (t!("status.items_more", count = count).into_owned(), false)
             }
+            LoadState::Loaded if count == 1 => (t!("status.items_one").into_owned(), false),
             LoadState::Loaded => (t!("status.items", count = count).into_owned(), false),
         };
         let can_load_more = tab.listing.has_more() && !tab.listing.is_busy();
@@ -1408,7 +1486,8 @@ impl Pane {
             } else {
                 cx.theme().muted_foreground
             })
-            .child(div().flex_1().min_w_0().truncate().child(text))
+            // The count keeps room for itself; the commands give way.
+            .child(div().flex_1().min_w(rems(4.5)).truncate().child(text))
             .when_some(more_failure, |this, error| {
                 this.child(
                     Button::new(self.id("failure-details"))
@@ -1440,7 +1519,7 @@ impl Pane {
                     Button::new(self.id("new-folder"))
                         .ghost()
                         .xsmall()
-                        .icon(IconName::FolderOpen)
+                        .icon(Icon::default().path("icons/folder-plus.svg"))
                         .tooltip(t!("action.new_folder_ellipsis").into_owned())
                         .on_click(cx.listener(|pane, _, _, cx| {
                             let location = pane.location().clone();
@@ -1448,6 +1527,23 @@ impl Pane {
                         })),
                 )
             })
+            .when_some(
+                match tab.history.current() {
+                    Location::Buckets { profile_id } => Some(profile_id.clone()),
+                    _ => None,
+                },
+                |this, profile_id| {
+                    this.child(
+                        Button::new(self.id("new-bucket"))
+                            .ghost()
+                            .xsmall()
+                            .label(t!("bucket.new_ellipsis").into_owned())
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(PaneEvent::NewBucketRequested(profile_id.clone()));
+                            })),
+                    )
+                },
+            )
             .when(
                 matches!(tab.history.current(), Location::Objects { .. }),
                 |this| {

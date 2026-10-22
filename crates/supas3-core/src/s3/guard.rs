@@ -127,10 +127,13 @@ pub(crate) fn without_e2_metadata(
     })
 }
 
-/// Whether the client talks to IDrive e2, whose objects' default ACL names
-/// the owner without an ID.
+/// Whether a lone full-control grant without a grantee ID is the default
+/// ACL for this client.
 pub(crate) fn owner_grant_without_id_is_default(client: &Client) -> bool {
-    Protection::of(client) == Protection::Custom(WriteGuard::IdriveE2)
+    // Measured on IDrive e2 and MinIO: the default ACL is one full-control
+    // grant whose grantee has no ID. It can only be the owner's, and holds
+    // nothing to carry over. Amazon S3 always names the grantee.
+    matches!(Protection::of(client), Protection::Custom(_))
 }
 
 /// What the interface needs to know about how a client writes.
@@ -209,7 +212,7 @@ pub(crate) async fn before_write(
 /// lower case elsewhere, so values that are hex digests (optionally with a
 /// multipart `-N` suffix) compare without case. Empty and weak ETags never
 /// match: neither identifies content precisely.
-pub(crate) fn same_etag(left: &str, right: &str) -> bool {
+pub fn same_etag(left: &str, right: &str) -> bool {
     fn strong(etag: &str) -> Option<&str> {
         let etag = etag.trim();
         if etag.starts_with("W/") {

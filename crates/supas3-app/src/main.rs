@@ -6,8 +6,11 @@
 
 mod app_jobs;
 mod app_state;
+mod auto_retry;
 mod aws_profiles;
 mod backend;
+mod bucket_views;
+mod buckets;
 mod conflicts;
 mod connection;
 mod connection_form;
@@ -47,6 +50,27 @@ use gpui_kit::*;
 use settings::Settings;
 use workspace::Workspace;
 
+// The default icon set leaves out a few icons shown here.
+gpui_kit::assets::icon_assets!(ExtraIcons, [FolderPlus]);
+
+/// The default icons, and the extra ones above.
+struct AppAssets;
+
+impl gpui_kit::AssetSource for AppAssets {
+    fn load(&self, path: &str) -> gpui_kit::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        match ExtraIcons.load(path)? {
+            Some(icon) => Ok(Some(icon)),
+            None => gpui_kit::assets::Assets.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> gpui_kit::Result<Vec<gpui_kit::SharedString>> {
+        let mut found = gpui_kit::assets::Assets.list(path)?;
+        found.extend(ExtraIcons.list(path)?);
+        Ok(found)
+    }
+}
+
 rust_i18n::i18n!("locales", fallback = "en");
 
 actions!(
@@ -60,7 +84,9 @@ actions!(
         ToggleDetails,
         NewFolder,
         RenameSelection,
-        FilterRows
+        FilterRows,
+        CopyToOther,
+        MoveToOther
     ]
 );
 
@@ -142,6 +168,9 @@ pub fn set_app_menus(cx: &mut App) {
         Menu::new(t!("menu.file").into_owned()).items([
             MenuItem::action(t!("menu.new_folder").into_owned(), NewFolder),
             MenuItem::action(t!("menu.rename").into_owned(), RenameSelection),
+            MenuItem::separator(),
+            MenuItem::action(t!("action.copy_to_other").into_owned(), CopyToOther),
+            MenuItem::action(t!("action.move_to_other").into_owned(), MoveToOther),
         ]),
         Menu::new(t!("menu.edit").into_owned()).items([
             MenuItem::os_action(t!("menu.undo").into_owned(), Undo, OsAction::Undo),
@@ -201,7 +230,7 @@ fn main() {
         backend.apply_transfer_limits(settings.transfers);
     }
 
-    let application = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    let application = gpui_kit::application().with_assets(AppAssets);
     // macOS keeps a program in the Dock while it is ending. If its icon is
     // clicked while no window is left, show the window again when the backend
     // still runs, and otherwise finish quitting so the next click starts anew.
@@ -276,6 +305,8 @@ fn main() {
         cx.on_action(|_: &NewFolder, cx| on_pane(cx, workspace::PaneCommand::NewFolder));
         cx.on_action(|_: &RenameSelection, cx| on_pane(cx, workspace::PaneCommand::Rename));
         cx.on_action(|_: &FilterRows, cx| on_pane(cx, workspace::PaneCommand::Filter));
+        cx.on_action(|_: &CopyToOther, cx| on_pane(cx, workspace::PaneCommand::Copy));
+        cx.on_action(|_: &MoveToOther, cx| on_pane(cx, workspace::PaneCommand::Move));
         cx.on_action(|_: &Minimize, cx| {
             with_front_window(cx, |window, _| window.minimize_window());
         });
@@ -327,6 +358,16 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-n", NewFolder, None),
         KeyBinding::new("f2", RenameSelection, None),
         KeyBinding::new("secondary-f", FilterRows, None),
+        KeyBinding::new(
+            "secondary-shift-c",
+            CopyToOther,
+            Some("Workspace && !Input"),
+        ),
+        KeyBinding::new(
+            "secondary-shift-m",
+            MoveToOther,
+            Some("Workspace && !Input"),
+        ),
         KeyBinding::new("tab", workspace::FocusNextRegion, Some("Workspace")),
         KeyBinding::new(
             "shift-tab",
@@ -388,4 +429,33 @@ fn install_panic_log() {
         }
         previous(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::AssetSource as _;
+
+    /// Every icon the sources name by path is one the program carries.
+    #[test]
+    fn the_icons_named_by_path_are_bundled() {
+        let sources = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut named = Vec::new();
+        for file in std::fs::read_dir(sources).unwrap() {
+            let text = std::fs::read_to_string(file.unwrap().path()).unwrap_or_default();
+            for (at, _) in text.match_indices("\"icons/") {
+                let rest = &text[at + 1..];
+                let path = &rest[..rest.find('"').unwrap()];
+                if path.ends_with(".svg") {
+                    named.push(path.to_string());
+                }
+            }
+        }
+        assert!(!named.is_empty());
+        for path in named {
+            assert!(
+                matches!(super::AppAssets.load(&path), Ok(Some(_))),
+                "{path} is not bundled"
+            );
+        }
+    }
 }
