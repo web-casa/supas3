@@ -47,7 +47,8 @@ fn open_with(
     })
 }
 
-/// Where the keyboard is: 0 the sidebar, 1 the left pane, 2 the right one.
+/// Where the keyboard is: 0 the sidebar, 1 the left pane, 2 the right one,
+/// 3 the transfer list, 4 the details panel.
 fn region(
     cx: &mut TestAppContext,
     window: AnyWindowHandle,
@@ -61,6 +62,20 @@ fn region(
             Some(1)
         } else if workspace.right.read(cx).contains_focus(window, cx) {
             Some(2)
+        } else if workspace
+            .task_center
+            .read(cx)
+            .focus_handle()
+            .contains_focused(window, cx)
+        {
+            Some(3)
+        } else if workspace
+            .details
+            .read(cx)
+            .focus_handle()
+            .contains_focused(window, cx)
+        {
+            Some(4)
         } else {
             None
         }
@@ -87,16 +102,39 @@ async fn tab_moves_between_the_sidebar_and_the_panes(cx: &mut TestAppContext) {
         cx.run_until_parked();
         region(cx, window, &workspace)
     };
-    // Tab goes round: sidebar, left pane, right pane.
-    let forwards: Vec<_> = (1..=3).map(|step| Some((start + step) % 3)).collect();
-    let seen: Vec<_> = (0..3).map(|_| press(cx, "tab")).collect();
+    // Tab goes round: sidebar, left pane, right pane, transfer list.
+    let forwards: Vec<_> = (1..=4).map(|step| Some((start + step) % 4)).collect();
+    let seen: Vec<_> = (0..4).map(|_| press(cx, "tab")).collect();
     assert_eq!(seen, forwards);
-    let backwards: Vec<_> = (1..=3).map(|step| Some((start + 3 - step) % 3)).collect();
-    let seen: Vec<_> = (0..3).map(|_| press(cx, "shift-tab")).collect();
+    let backwards: Vec<_> = (1..=4).map(|step| Some((start + 4 - step) % 4)).collect();
+    let seen: Vec<_> = (0..4).map(|_| press(cx, "shift-tab")).collect();
     assert_eq!(seen, backwards);
+    // With the details panel open, it is on the way too, after the panes.
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.toggle_details(window, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let mut seen = Vec::new();
+    while seen.last() != Some(&Some(2)) {
+        assert!(seen.len() < 10, "never reached the right pane: {seen:?}");
+        seen.push(press(cx, "tab"));
+    }
+    assert_eq!(press(cx, "tab"), Some(4));
+    assert_eq!(press(cx, "tab"), Some(3));
+    assert_eq!(press(cx, "shift-tab"), Some(4));
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.toggle_details(window, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
 
     // Moving into a pane makes it the active one.
-    while press(cx, "tab") != Some(1) {}
+    let mut seen = Vec::new();
+    while seen.last() != Some(&Some(1)) {
+        assert!(seen.len() < 10, "never reached the left pane: {seen:?}");
+        seen.push(press(cx, "tab"));
+    }
     cx.update(|cx| assert_eq!(workspace.read(cx).active, Side::Left));
     assert_eq!(press(cx, "tab"), Some(2));
     cx.update(|cx| assert_eq!(workspace.read(cx).active, Side::Right));
@@ -164,6 +202,32 @@ async fn on_this_computer_filter_new_folder_and_move_work(cx: &mut TestAppContex
     until(cx, "the left folder to list", |cx| {
         shown(cx, Side::Left) == (3, 3)
     });
+    let dialog_open = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            use gpui_kit::component::WindowExt as _;
+            window.has_active_dialog(cx)
+        })
+        .unwrap()
+    };
+
+    // Shift+F10 opens the selected row's menu, as a list in a dialog.
+    cx.update(|cx| workspace.update(cx, |workspace, _| workspace.active = Side::Left));
+    cx.update_window(window, |_, window, cx| {
+        let left = workspace.read(cx).left.clone();
+        left.update(cx, |pane, cx| pane.focus(window, cx));
+        window.render_frame(cx);
+        window.press("shift-f10", cx);
+    })
+    .unwrap();
+    until(cx, "the row menu", |cx| dialog_open(cx));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        // Open, Rename, then the commands for everything selected.
+        window.find(("row-menu", 0usize));
+        window.press("escape", cx);
+    })
+    .unwrap();
+    until(cx, "the row menu to close", |cx| !dialog_open(cx));
 
     // Filter: only the loaded rows whose names match stay.
     cx.update(|cx| workspace.update(cx, |workspace, _| workspace.active = Side::Left));
@@ -192,13 +256,6 @@ async fn on_this_computer_filter_new_folder_and_move_work(cx: &mut TestAppContex
     })
     .unwrap();
     until(cx, "the new folder", |_| left_dir.join("made").is_dir());
-    let dialog_open = |cx: &mut TestAppContext| {
-        cx.update_window(window, |_, window, cx| {
-            use gpui_kit::component::WindowExt as _;
-            window.has_active_dialog(cx)
-        })
-        .unwrap()
-    };
     until(cx, "the name dialog to close", |cx| !dialog_open(cx));
 
     // Move a file to the other pane: asked first, then done.

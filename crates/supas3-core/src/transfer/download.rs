@@ -60,14 +60,10 @@ impl DownloadDestination {
         Self::new(Self::open_root(parent)?, PathBuf::from(name), overwrite)
     }
 
-    pub fn begin(&self) -> io::Result<PendingDownload> {
-        let relative_parent = self.relative_path.parent().unwrap_or(Path::new(""));
-        let parent = if relative_parent.as_os_str().is_empty() {
-            self.root.try_clone()?
-        } else {
-            self.root.create_dir_all(relative_parent)?;
-            self.root.open_dir(relative_parent)?
-        };
+    /// The folder the download goes into, created if missing, and the name
+    /// it gets there; refused when that name is taken and not to be replaced.
+    fn parent_and_name(&self) -> io::Result<(Dir, OsString)> {
+        let parent = self.parent()?;
         let final_name = self
             .relative_path
             .file_name()
@@ -81,6 +77,29 @@ impl DownloadDestination {
                 "The download destination already exists",
             ));
         }
+        Ok((parent, final_name))
+    }
+
+    fn parent(&self) -> io::Result<Dir> {
+        let relative_parent = self.relative_path.parent().unwrap_or(Path::new(""));
+        if relative_parent.as_os_str().is_empty() {
+            self.root.try_clone()
+        } else {
+            self.root.create_dir_all(relative_parent)?;
+            self.root.open_dir(relative_parent)
+        }
+    }
+
+    /// supaS3: removes a temporary file kept for a later attempt, if it is
+    /// still the one that was kept.
+    pub fn discard(&self, temporary_name: &str, identity: crate::fsutil::FileIdentity) {
+        if let Ok(parent) = self.parent() {
+            let _ = remove_kept(&parent, temporary_name, identity);
+        }
+    }
+
+    pub fn begin(&self) -> io::Result<PendingDownload> {
+        let (parent, final_name) = self.parent_and_name()?;
         let temporary_name = format!(".supas3-{}.part", uuid::Uuid::new_v4());
         let file = parent.open_with(
             &temporary_name,
@@ -93,8 +112,91 @@ impl DownloadDestination {
             final_name,
             overwrite: self.overwrite,
             replace_only_if: self.replace_only_if.clone(),
+            kept: false,
         })
     }
+
+    /// supaS3: opens the temporary file an earlier attempt kept, cut back to
+    /// `bytes`, to write the rest after it. Refused unless it is still a
+    /// plain file with the identity it was kept with.
+    pub async fn resume(
+        &self,
+        temporary_name: &str,
+        bytes: u64,
+        identity: crate::fsutil::FileIdentity,
+    ) -> io::Result<PendingDownload> {
+        let mut pending = self.begin_named(temporary_name)?;
+        if crate::fsutil::FileIdentity::in_dir(&pending.parent, temporary_name.as_ref())?
+            != identity
+        {
+            // Not ours to remove: it is not the file that was kept.
+            pending.kept = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "The kept part of the download changed since",
+            ));
+        }
+        let file = pending
+            .file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Download is closed"))?;
+        file.set_len(bytes).await?;
+        tokio::io::AsyncSeekExt::seek(file, io::SeekFrom::Start(bytes)).await?;
+        Ok(pending)
+    }
+
+    fn begin_named(&self, temporary_name: &str) -> io::Result<PendingDownload> {
+        if !(temporary_name.starts_with(".supas3-") && temporary_name.ends_with(".part"))
+            || temporary_name.contains(['/', '\\'])
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Not a download's temporary file",
+            ));
+        }
+        let (parent, final_name) = self.parent_and_name()?;
+        let metadata = parent.symlink_metadata(temporary_name)?;
+        if !metadata.is_file() {
+            return Err(io::Error::other(
+                "The kept part of the download is not a file",
+            ));
+        }
+        let file = parent.open_with(temporary_name, OpenOptions::new().write(true))?;
+        Ok(PendingDownload {
+            file: Some(tokio::fs::File::from_std(file.into_std())),
+            final_name,
+            parent,
+            temporary_name: temporary_name.to_string(),
+            overwrite: self.overwrite,
+            replace_only_if: self.replace_only_if.clone(),
+            kept: false,
+        })
+    }
+}
+
+/// supaS3: removes `temporary_name` from `folder` if it is a download's
+/// temporary file, a plain file, and still has `identity`.
+pub fn remove_kept(
+    folder: &Dir,
+    temporary_name: &str,
+    identity: crate::fsutil::FileIdentity,
+) -> io::Result<()> {
+    if !(temporary_name.starts_with(".supas3-") && temporary_name.ends_with(".part"))
+        || temporary_name.contains(['/', '\\'])
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Not a download's temporary file",
+        ));
+    }
+    if !folder.symlink_metadata(temporary_name)?.is_file()
+        || crate::fsutil::FileIdentity::in_dir(folder, temporary_name.as_ref())? != identity
+    {
+        return Err(io::Error::other(
+            "The kept part of the download changed since",
+        ));
+    }
+    folder.remove_file(temporary_name)
 }
 
 pub struct PendingDownload {
@@ -104,9 +206,37 @@ pub struct PendingDownload {
     final_name: OsString,
     overwrite: bool,
     replace_only_if: Option<(PathBuf, crate::fsutil::FileIdentity)>,
+    /// supaS3: kept for a later attempt, so not removed when dropped.
+    kept: bool,
 }
 
 impl PendingDownload {
+    /// supaS3: keeps the temporary file for a later attempt: writes out what
+    /// is buffered and says what was kept, as its name, length and identity.
+    pub async fn keep(mut self) -> io::Result<(String, u64, crate::fsutil::FileIdentity)> {
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Download is closed"))?;
+        file.flush().await?;
+        file.sync_data().await?;
+        self.file.take();
+        let identity =
+            crate::fsutil::FileIdentity::in_dir(&self.parent, self.temporary_name.as_ref())?;
+        self.kept = true;
+        Ok((self.temporary_name.clone(), identity.size, identity))
+    }
+
+    /// How much of the download the temporary file holds.
+    pub async fn written(&mut self) -> io::Result<u64> {
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Download is closed"))?;
+        file.flush().await?;
+        Ok(file.metadata().await?.len())
+    }
+
     pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
         let file = self
             .file
@@ -173,6 +303,9 @@ impl PendingDownload {
 impl Drop for PendingDownload {
     fn drop(&mut self) {
         self.file.take();
+        if self.kept {
+            return;
+        }
         if let Err(error) = self.parent.remove_file(&self.temporary_name) {
             if error.kind() != io::ErrorKind::NotFound {
                 log::warn!("Could not remove download temporary file: {error}");

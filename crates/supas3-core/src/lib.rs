@@ -153,8 +153,20 @@ impl Core {
             let _ = scheduler.await;
         }
 
+        // Transfers that can go on later are paused, keeping what they sent;
+        // the rest are cancelled.
         for job in self.transfers.list_jobs().await {
-            self.transfers.cancel_job(&job.id).await;
+            // Paused ones stay paused, keeping what they sent.
+            if !matches!(
+                job.status,
+                crate::transfer::TransferStatus::Pending
+                    | crate::transfer::TransferStatus::InProgress
+            ) {
+                continue;
+            }
+            if !self.transfers.pause_job(&job.id).await {
+                self.transfers.cancel_job(&job.id).await;
+            }
         }
         let deadline = tokio::time::Instant::now() + grace;
         let unfinished = loop {

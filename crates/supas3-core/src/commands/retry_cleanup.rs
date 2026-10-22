@@ -49,13 +49,15 @@ pub async fn object_etag(
 
 /// Aborts the unfinished multipart uploads of exactly `key` (every key
 /// when it is empty) that were started since `since_millis` (the
-/// transfer's creation), give or take the clock margin. Returns how many
-/// were aborted.
+/// transfer's creation), give or take the clock margin, except `keep`: the
+/// one the transfer kept to go on with. Returns how many were aborted.
+#[allow(clippy::too_many_arguments)]
 pub async fn abort_unfinished_uploads(
     bucket: String,
     region: Option<String>,
     key: String,
     since_millis: i64,
+    keep: Option<String>,
     expected_profile_id: String,
     profile_state: State<'_, ProfileState>,
 ) -> Result<usize> {
@@ -87,7 +89,10 @@ pub async fn abort_unfinished_uploads(
             continue;
         };
         // An empty key stands for every key of the bucket.
-        if (!key.is_empty() && found != key) || started < since_millis - CLOCK_MARGIN_MILLIS {
+        if (!key.is_empty() && found != key)
+            || started < since_millis - CLOCK_MARGIN_MILLIS
+            || keep.as_deref() == Some(upload_id)
+        {
             continue;
         }
         client
@@ -106,4 +111,43 @@ pub async fn abort_unfinished_uploads(
         aborted += 1;
     }
     Ok(aborted)
+}
+
+/// Aborts one unfinished multipart upload, one a stopped transfer kept.
+/// One the service no longer has counts as aborted.
+pub async fn abort_upload(
+    bucket: String,
+    region: Option<String>,
+    key: String,
+    upload_id: String,
+    expected_profile_id: String,
+    profile_state: State<'_, ProfileState>,
+) -> Result<()> {
+    let (_, client, _) =
+        selected_client(&expected_profile_id, region.as_deref(), &profile_state).await?;
+    let answer = tokio::time::timeout(
+        Duration::from_secs(30),
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(&key)
+            .upload_id(&upload_id)
+            .send(),
+    )
+    .await
+    .map_err(|_| AppError::S3Error("Aborting the kept upload timed out.".into()))?;
+    match answer {
+        Ok(_) => Ok(()),
+        Err(error)
+            if error
+                .raw_response()
+                .is_some_and(|r| r.status().as_u16() == 404) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(AppError::S3Error(format!(
+            "Could not abort the kept upload: {}",
+            DisplayErrorContext(&error)
+        ))),
+    }
 }

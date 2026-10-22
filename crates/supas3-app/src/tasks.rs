@@ -63,9 +63,9 @@ impl TaskState {
         matches!(self, Self::Queued | Self::Running | Self::Paused)
     }
 
-    /// Waiting or running: the backend can cancel it.
+    /// Waiting, running or paused: the backend can cancel it.
     pub fn can_cancel(&self) -> bool {
-        matches!(self, Self::Queued | Self::Running)
+        matches!(self, Self::Queued | Self::Running | Self::Paused)
     }
 
     /// Stopped without finishing.
@@ -100,6 +100,10 @@ pub struct Task {
     /// earlier run has lost what it needs for that (where a download was
     /// going, or the source of a copy), so it has to be started afresh.
     pub retryable: bool,
+    /// Whether it can be paused and gone on with later.
+    pub pausable: bool,
+    /// Whether it kept what it sent: a retry goes on from there.
+    pub kept: bool,
     pub origin: TaskOrigin,
     pub created_at: i64,
 }
@@ -154,6 +158,8 @@ impl Task {
             group: job.parent_group_id.clone(),
             group_name: job.group_name.clone(),
             retryable,
+            pausable: supas3_core::transfer::TransferManager::can_pause(job),
+            kept: job.resume.is_some(),
             origin: TaskOrigin::Transfer,
             created_at: job.created_at,
         }
@@ -372,7 +378,30 @@ impl Tasks {
             task.total = event.total_bytes;
         }
         task.bytes_per_second = event.bytes_per_second;
+        task.pausable = event.pausable;
+        task.kept = event.kept;
         true
+    }
+
+    /// Follows again a transfer that ended and is about to go on under its
+    /// own id (one that kept what it sent), so its updates apply. Returns
+    /// how it had ended, to put back with [`Self::restore`] if it does not
+    /// go on after all.
+    pub fn requeue(&mut self, id: &str) -> Option<TaskState> {
+        let task = self.by_id.get_mut(id)?;
+        if task.state.is_active() {
+            return None;
+        }
+        Some(std::mem::replace(&mut task.state, TaskState::Queued))
+    }
+
+    /// Puts back how a task had ended, after [`Self::requeue`].
+    pub fn restore(&mut self, id: &str, state: TaskState) {
+        if let Some(task) = self.by_id.get_mut(id) {
+            if task.state == TaskState::Queued {
+                task.state = state;
+            }
+        }
     }
 
     /// Forgets a transfer the user removed.
@@ -659,6 +688,8 @@ mod tests {
             total_bytes: 100,
             status,
             finished_at: None,
+            pausable: false,
+            kept: false,
         }
     }
 
@@ -857,7 +888,36 @@ mod tests {
             ["cancelled", "done"],
             "failures are kept"
         );
-        assert_eq!(sorted(tasks.cancellable_ids()), ["running", "waiting"]);
+        // Paused transfers hold on to what they sent; cancelling lets go.
+        assert_eq!(
+            sorted(tasks.cancellable_ids()),
+            ["paused", "running", "waiting"]
+        );
+    }
+
+    #[test]
+    fn a_transfer_that_goes_on_under_its_own_id_is_followed_again() {
+        let mut tasks = Tasks::default();
+        tasks.add(&job("a", TransferType::Download, "a", 1));
+        tasks.update(&update("a", TransferStatus::Failed("cut".into()), 40));
+        assert_eq!(tasks.take_ended().len(), 1);
+        // Ended: further updates are old news...
+        tasks.update(&update("a", TransferStatus::InProgress, 50));
+        assert!(matches!(tasks.by_id["a"].state, TaskState::Failed(_)));
+        // ...until it is followed again, before it goes on.
+        let before = tasks.requeue("a");
+        assert!(matches!(before, Some(TaskState::Failed(_))));
+        assert_eq!(tasks.requeue("a"), None, "already followed");
+        tasks.update(&update("a", TransferStatus::InProgress, 60));
+        assert_eq!(tasks.by_id["a"].state, TaskState::Running);
+        tasks.update(&update("a", TransferStatus::Completed, 100));
+        assert_eq!(tasks.take_ended(), vec![("a".into(), TaskState::Completed)]);
+        // One that did not go on after all is put back as it ended.
+        tasks.add(&job("b", TransferType::Upload, "b", 2));
+        tasks.update(&update("b", TransferStatus::Failed("cut".into()), 10));
+        let before = tasks.requeue("b").unwrap();
+        tasks.restore("b", before.clone());
+        assert_eq!(tasks.by_id["b"].state, before);
     }
 
     #[test]

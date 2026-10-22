@@ -4,7 +4,7 @@ A native desktop application for browsing object storage and moving files betwee
 
 [简体中文](README.zh-CN.md)
 
-> **Status:** version 0.2.0. It has been tested against real buckets on the services listed below, but it is new software: keep a copy of anything you cannot afford to lose.
+> **Status:** version 0.3.0. It has been tested against real buckets on the services listed below, but it is new software: keep a copy of anything you cannot afford to lose.
 
 ## What it does
 
@@ -13,6 +13,7 @@ A native desktop application for browsing object storage and moving files betwee
 - Move items to the other pane, from the menu or by dragging with Command held on macOS or Shift on Windows and Linux. Each original is removed only after its copy has been checked; anything that cannot be checked keeps its original.
 - New folder and rename, in storage and on this computer. A folder in storage is renamed object by object, in the background.
 - A transfer list with progress, cancel and retry. Uploads, downloads and copies cut off by the network are retried on their own, up to three times; an upload only while its target is still as it was.
+- Pause and continue downloads and large uploads. One cut off by the network, paused, or stopped by quitting goes on from where it stopped, while the local file and the object are unchanged.
 - Delete files and folders, after a confirmation. On this computer they go to the recycle bin.
 - Sort by name, size or date, filter the rows shown, and search names below a location in a bucket.
 - Open text files of up to 8 MiB in a tab to read or edit them, and view PNG, JPEG and simple WebP images with zoom. Quitting or closing the window asks about unsaved edits.

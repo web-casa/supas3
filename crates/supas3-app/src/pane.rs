@@ -11,6 +11,7 @@ use crate::places::{is_memorable, PaneLayout, Places};
 use gpui_kit::component::breadcrumb::{Breadcrumb, BreadcrumbItem};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::{
@@ -98,6 +99,9 @@ struct EditorTab {
 pub struct Pane {
     /// Distinguishes the two panes' element ids.
     side: &'static str,
+    /// The status bar was too narrow for all its commands when last drawn;
+    /// the minor ones go into a "More" menu.
+    status_narrow: std::rc::Rc<std::cell::Cell<bool>>,
     /// Files open in tabs after the location tabs. They are not part of the
     /// saved layout.
     editors: Vec<EditorTab>,
@@ -145,6 +149,7 @@ impl Pane {
             side,
             editors: Vec::new(),
             front_editor: None,
+            status_narrow: Default::default(),
             connections,
             places,
             tabs: Vec::new(),
@@ -855,6 +860,48 @@ impl Pane {
         });
     }
 
+    /// The selected row's menu as a list of buttons: GPUI Kit opens context
+    /// menus only from the pointer.
+    fn show_row_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::entries_table::MenuEntry;
+        let table = self.tabs[self.active].table.read(cx);
+        let Some(row) = table.selected_row() else {
+            return;
+        };
+        let delegate = table.delegate();
+        let entries = delegate.menu_entries(row);
+        let commands = delegate.commands();
+        let name = delegate
+            .entry(row)
+            .map(|entry| entry.name.clone())
+            .unwrap_or_default();
+        let width = rems(crate::workspace::FORM_WIDTH).to_pixels(window.rem_size());
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let border = cx.theme().border;
+            let mut list = v_flex().gap_1();
+            for (index, entry) in entries.iter().enumerate() {
+                list = match entry {
+                    MenuEntry::Separator => list.child(div().h_px().my_1().bg(border)),
+                    MenuEntry::Item(label, command) => {
+                        let (commands, command) = (commands.clone(), command.clone());
+                        list.child(
+                            Button::new(("row-menu", index))
+                                .ghost()
+                                .w_full()
+                                .justify_start()
+                                .label(label.clone())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    commands(command.clone(), window, cx);
+                                }),
+                        )
+                    }
+                };
+            }
+            dialog.title(name.clone()).w(width).child(list)
+        });
+    }
+
     /// Keyboard navigation for the pane. Keys reach here only when the focused
     /// control (the table, a button) did not use them itself.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -877,6 +924,11 @@ impl Pane {
                 }
             }
             "backspace" if plain => self.go_up(cx),
+            // The row menu, from the keyboard.
+            "f10" if keystroke.modifiers.shift && !keystroke.modifiers.secondary() => {
+                self.show_row_menu(window, cx)
+            }
+            "menu" | "contextmenu" if plain => self.show_row_menu(window, cx),
             "space" if plain => {
                 let table = self.tabs[self.active].table.clone();
                 table.update(cx, |table, cx| {
@@ -1467,13 +1519,35 @@ impl Pane {
             text
         };
         let is_local = matches!(tab.history.current(), Location::Local(_));
+        let narrow = self.status_narrow.get();
+        let bucket_list = match tab.history.current() {
+            Location::Buckets { profile_id } => Some(profile_id.clone()),
+            _ => None,
+        };
+        let in_bucket = matches!(tab.history.current(), Location::Objects { .. });
+        let holds_folders = can_hold_folders(tab.history.current());
         // The arrow points at the other pane.
         let copy_icon = if self.side == "left" {
             IconName::ArrowRight
         } else {
             IconName::ArrowLeft
         };
+        // Measured as it is drawn: whether everything fits.
+        let measured = self.status_narrow.clone();
+        let fits = canvas(
+            move |bounds, window, _| {
+                let narrow = bounds.size.width < rems(28.).to_pixels(window.rem_size());
+                if measured.replace(narrow) != narrow {
+                    window.refresh();
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
         h_flex()
+            .relative()
+            .child(fits)
             .w_full()
             .h_7()
             .px_3()
@@ -1514,7 +1588,7 @@ impl Pane {
                         .on_click(cx.listener(move |pane, _, _, cx| pane.load_more(id, cx))),
                 )
             })
-            .when(can_hold_folders(tab.history.current()), |this| {
+            .when(holds_folders && !narrow, |this| {
                 this.child(
                     Button::new(self.id("new-folder"))
                         .ghost()
@@ -1528,10 +1602,7 @@ impl Pane {
                 )
             })
             .when_some(
-                match tab.history.current() {
-                    Location::Buckets { profile_id } => Some(profile_id.clone()),
-                    _ => None,
-                },
+                bucket_list.clone().filter(|_| !narrow),
                 |this, profile_id| {
                     this.child(
                         Button::new(self.id("new-bucket"))
@@ -1544,23 +1615,20 @@ impl Pane {
                     )
                 },
             )
-            .when(
-                matches!(tab.history.current(), Location::Objects { .. }),
-                |this| {
-                    this.child(
-                        Button::new(self.id("import"))
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Globe)
-                            .tooltip(t!("import.button").into_owned())
-                            .on_click(cx.listener(|pane, _, _, cx| {
-                                let location = pane.location().clone();
-                                cx.emit(PaneEvent::ImportRequested(location));
-                            })),
-                    )
-                },
-            )
-            .when(is_local, |this| {
+            .when(in_bucket && !narrow, |this| {
+                this.child(
+                    Button::new(self.id("import"))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Globe)
+                        .tooltip(t!("import.button").into_owned())
+                        .on_click(cx.listener(|pane, _, _, cx| {
+                            let location = pane.location().clone();
+                            cx.emit(PaneEvent::ImportRequested(location));
+                        })),
+                )
+            })
+            .when(is_local && !narrow, |this| {
                 this.child(
                     Button::new(self.id("sync"))
                         .ghost()
@@ -1584,17 +1652,93 @@ impl Pane {
                         cx.emit(PaneEvent::CopyRequested(rows));
                     })),
             )
-            .child(
-                Button::new(self.id("delete"))
-                    .ghost()
-                    .xsmall()
-                    .label(t!("action.delete_ellipsis").into_owned())
-                    .disabled(!has_selection)
-                    .on_click(cx.listener(|pane, _, _, cx| {
-                        let rows = pane.selection(cx);
-                        cx.emit(PaneEvent::DeleteRequested(rows));
-                    })),
-            )
+            .when(!narrow, |this| {
+                this.child(
+                    Button::new(self.id("delete"))
+                        .ghost()
+                        .xsmall()
+                        .label(t!("action.delete_ellipsis").into_owned())
+                        .disabled(!has_selection)
+                        .on_click(cx.listener(|pane, _, _, cx| {
+                            let rows = pane.selection(cx);
+                            cx.emit(PaneEvent::DeleteRequested(rows));
+                        })),
+                )
+            })
+            .when(narrow, |this| {
+                let pane = cx.weak_entity();
+                this.child(
+                    Button::new(self.id("status-more"))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Ellipsis)
+                        .tooltip(t!("details.more").into_owned())
+                        .dropdown_menu(move |menu, _, _| {
+                            let emit = |make: fn(&Pane, &App) -> Option<PaneEvent>| {
+                                let pane = pane.clone();
+                                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                                    let _ = pane.update(cx, |pane, cx| {
+                                        if let Some(event) = make(pane, cx) {
+                                            cx.emit(event);
+                                        }
+                                    });
+                                }
+                            };
+                            menu.when(holds_folders, |menu| {
+                                menu.item(
+                                    PopupMenuItem::new(
+                                        t!("action.new_folder_ellipsis").into_owned(),
+                                    )
+                                    .on_click(emit(
+                                        |pane, _| {
+                                            Some(PaneEvent::NewFolderRequested(
+                                                pane.location().clone(),
+                                            ))
+                                        },
+                                    )),
+                                )
+                            })
+                            .when(bucket_list.is_some(), |menu| {
+                                menu.item(
+                                    PopupMenuItem::new(t!("bucket.new_ellipsis").into_owned())
+                                        .on_click(emit(|pane, _| match pane.location() {
+                                            Location::Buckets { profile_id } => Some(
+                                                PaneEvent::NewBucketRequested(profile_id.clone()),
+                                            ),
+                                            _ => None,
+                                        })),
+                                )
+                            })
+                            .when(in_bucket, |menu| {
+                                menu.item(
+                                    PopupMenuItem::new(t!("import.button").into_owned()).on_click(
+                                        emit(|pane, _| {
+                                            Some(PaneEvent::ImportRequested(
+                                                pane.location().clone(),
+                                            ))
+                                        }),
+                                    ),
+                                )
+                            })
+                            .when(is_local, |menu| {
+                                menu.item(
+                                    PopupMenuItem::new(t!("action.sync_ellipsis").into_owned())
+                                        .on_click(emit(|pane, _| {
+                                            Some(PaneEvent::SyncRequested(pane.location().clone()))
+                                        })),
+                                )
+                            })
+                            .separator()
+                            .item(
+                                PopupMenuItem::new(t!("action.delete_ellipsis").into_owned())
+                                    .disabled(!has_selection)
+                                    .on_click(emit(|pane, cx| {
+                                        Some(PaneEvent::DeleteRequested(pane.selection(cx)))
+                                    })),
+                            )
+                        }),
+                )
+            })
     }
 }
 

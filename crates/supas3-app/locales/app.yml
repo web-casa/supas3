@@ -1645,3 +1645,21 @@ connection.unsaved_edits:
 versions.unsafe_name:
   en: "“%{name}” cannot be used as a file name on this computer, so this version was not downloaded."
   zh-CN: "“%{name}”不能用作本机的文件名，因此没有下载这个版本。"
+resume.release_failed:
+  en: "What this transfer kept could not be let go of yet; it stays listed until it can: %{error}. A rule in the bucket can also remove unfinished uploads after some days."
+  zh-CN: "暂时无法释放该传输保留的数据，它会留在列表中直到可以释放：%{error}。也可以在存储桶上设置规则，几天后自动清除未完成的上传。"
+tasks.pause:
+  en: Pause
+  zh-CN: 暂停
+tasks.continue:
+  en: Continue
+  zh-CN: 继续
+tasks.state_paused_at:
+  en: "Paused at %{percent}%"
+  zh-CN: "已暂停（%{percent}%）"
+tasks.cannot_pause:
+  en: This transfer can no longer be paused.
+  zh-CN: 该传输已无法暂停。
+tasks.cannot_continue:
+  en: This transfer cannot go on from where it stopped; retry it to start again.
+  zh-CN: 该传输无法从中断处继续，请重试以重新开始。

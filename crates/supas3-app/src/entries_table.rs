@@ -295,6 +295,94 @@ impl EntriesDelegate {
     }
 }
 
+/// One entry of a row's menu.
+#[derive(Debug, Clone)]
+pub enum MenuEntry {
+    Item(String, RowCommand),
+    Separator,
+}
+
+impl EntriesDelegate {
+    /// What the row menu offers for the row at `row_ix` and whatever else
+    /// is marked: the right-click menu shows it, and the keyboard opens it
+    /// as a list (Shift+F10 or the Menu key). What it acts on is fixed now,
+    /// while the user is looking at it.
+    pub fn menu_entries(&self, row_ix: usize) -> Vec<MenuEntry> {
+        let taken = self.taken(Some(row_ix));
+        let remote = matches!(self.location, Location::Objects { .. });
+        let local = matches!(self.location, Location::Local(_));
+        let mut entries = Vec::new();
+        // Actions for the row under the pointer alone.
+        if let Some(entry) = self.entries.get(row_ix) {
+            let actions: &[(RowAction, &str)] = match entry.kind {
+                EntryKind::File if remote => &[
+                    (RowAction::Open, "action.open"),
+                    (RowAction::Share, "action.share_ellipsis"),
+                    (RowAction::Versions, "action.versions_ellipsis"),
+                    (RowAction::Properties, "action.properties_ellipsis"),
+                    (RowAction::Rename, "action.rename_ellipsis"),
+                ],
+                EntryKind::File => &[
+                    (RowAction::Open, "action.open"),
+                    (RowAction::Rename, "action.rename_ellipsis"),
+                ],
+                EntryKind::Folder if local => &[
+                    (RowAction::Sync, "action.sync_ellipsis"),
+                    (RowAction::Rename, "action.rename_ellipsis"),
+                ],
+                EntryKind::Folder if remote => &[(RowAction::Rename, "action.rename_ellipsis")],
+                EntryKind::Bucket => &[(RowAction::DeleteBucket, "bucket.delete_ellipsis")],
+                _ => &[],
+            };
+            for (action, label) in actions.iter().copied() {
+                entries.push(MenuEntry::Item(
+                    t!(label).into_owned(),
+                    RowCommand::One(action, self.location.clone(), entry.clone()),
+                ));
+            }
+            if !actions.is_empty() {
+                entries.push(MenuEntry::Separator);
+            }
+        }
+        entries.push(MenuEntry::Item(
+            t!("action.copy_to_other").into_owned(),
+            RowCommand::Copy(taken.clone()),
+        ));
+        entries.push(MenuEntry::Item(
+            t!("action.move_to_other").into_owned(),
+            RowCommand::Move(taken.clone()),
+        ));
+        entries.push(MenuEntry::Separator);
+        entries.push(MenuEntry::Item(
+            t!("action.copy_address").into_owned(),
+            RowCommand::CopyAddresses {
+                rows: taken.clone(),
+                public: false,
+            },
+        ));
+        if remote {
+            entries.push(MenuEntry::Item(
+                t!("action.copy_public_address").into_owned(),
+                RowCommand::CopyAddresses {
+                    rows: taken.clone(),
+                    public: true,
+                },
+            ));
+        }
+        entries.push(MenuEntry::Separator);
+        entries.push(MenuEntry::Item(
+            t!("action.delete_ellipsis").into_owned(),
+            RowCommand::Delete(taken),
+        ));
+        entries
+    }
+
+    /// Where the menu's commands go, to run one as the menu would.
+    pub fn commands(&self) -> Rc<dyn Fn(RowCommand, &mut Window, &mut App)> {
+        self.commands.clone()
+    }
+}
+
 impl TableDelegate for EntriesDelegate {
     fn columns_count(&self, _: &App) -> usize {
         4
@@ -412,94 +500,20 @@ impl TableDelegate for EntriesDelegate {
         _: &mut Window,
         _: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
-        // What the menu acts on is fixed now, while the user is looking at it.
-        let taken = self.taken(Some(row_ix));
-        let (copy, delete) = (self.commands.clone(), self.commands.clone());
-        let send_move = self.commands.clone();
-        let (address, public) = (self.commands.clone(), self.commands.clone());
-        let (addressed, published) = (taken.clone(), taken.clone());
-        let (copied, moved, deleted) = (taken.clone(), taken.clone(), taken);
-        let remote = matches!(self.location, Location::Objects { .. });
-        // Actions for the row under the pointer alone.
         let mut menu = menu;
-        if let Some(entry) = self.entries.get(row_ix) {
-            let remote = matches!(self.location, Location::Objects { .. });
-            let local = matches!(self.location, Location::Local(_));
-            let actions: &[(RowAction, &str)] = match entry.kind {
-                EntryKind::File if remote => &[
-                    (RowAction::Open, "action.open"),
-                    (RowAction::Share, "action.share_ellipsis"),
-                    (RowAction::Versions, "action.versions_ellipsis"),
-                    (RowAction::Properties, "action.properties_ellipsis"),
-                    (RowAction::Rename, "action.rename_ellipsis"),
-                ],
-                EntryKind::File => &[
-                    (RowAction::Open, "action.open"),
-                    (RowAction::Rename, "action.rename_ellipsis"),
-                ],
-                EntryKind::Folder if local => &[
-                    (RowAction::Sync, "action.sync_ellipsis"),
-                    (RowAction::Rename, "action.rename_ellipsis"),
-                ],
-                EntryKind::Folder if remote => &[(RowAction::Rename, "action.rename_ellipsis")],
-                EntryKind::Bucket => &[(RowAction::DeleteBucket, "bucket.delete_ellipsis")],
-                _ => &[],
-            };
-            for (action, label) in actions.iter().copied() {
-                let commands = self.commands.clone();
-                let (location, entry) = (self.location.clone(), entry.clone());
-                menu = menu.item(PopupMenuItem::new(t!(label).into_owned()).on_click(
-                    move |_, window, cx| {
-                        let command = RowCommand::One(action, location.clone(), entry.clone());
-                        commands(command, window, cx)
-                    },
-                ));
-            }
-            if !actions.is_empty() {
-                menu = menu.separator();
-            }
-        }
-        menu.item(
-            PopupMenuItem::new(t!("action.copy_to_other").into_owned())
-                .on_click(move |_, window, cx| copy(RowCommand::Copy(copied.clone()), window, cx)),
-        )
-        .item(
-            PopupMenuItem::new(t!("action.move_to_other").into_owned()).on_click(
-                move |_, window, cx| send_move(RowCommand::Move(moved.clone()), window, cx),
-            ),
-        )
-        .separator()
-        .item(
-            PopupMenuItem::new(t!("action.copy_address").into_owned()).on_click(
-                move |_, window, cx| {
-                    let rows = addressed.clone();
-                    address(
-                        RowCommand::CopyAddresses {
-                            rows,
-                            public: false,
-                        },
-                        window,
-                        cx,
+        for entry in self.menu_entries(row_ix) {
+            menu = match entry {
+                MenuEntry::Separator => menu.separator(),
+                MenuEntry::Item(label, command) => {
+                    let commands = self.commands.clone();
+                    menu.item(
+                        PopupMenuItem::new(label)
+                            .on_click(move |_, window, cx| commands(command.clone(), window, cx)),
                     )
-                },
-            ),
-        )
-        .when(remote, |menu| {
-            menu.item(
-                PopupMenuItem::new(t!("action.copy_public_address").into_owned()).on_click(
-                    move |_, window, cx| {
-                        let rows = published.clone();
-                        public(RowCommand::CopyAddresses { rows, public: true }, window, cx)
-                    },
-                ),
-            )
-        })
-        .separator()
-        .item(
-            PopupMenuItem::new(t!("action.delete_ellipsis").into_owned()).on_click(
-                move |_, window, cx| delete(RowCommand::Delete(deleted.clone()), window, cx),
-            ),
-        )
+                }
+            };
+        }
+        menu
     }
 
     fn render_td(

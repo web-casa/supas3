@@ -1,21 +1,23 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - Copy the address of files, folders and buckets, or the public web address of files, to the clipboard.
 - Edit an object's user metadata; entries left as they are stay as they are.
 - Make every object in a folder private or public at once, as a task that can be cancelled.
 - Import files into a bucket from web addresses.
-- A download cut off by closing supaS3 can be retried, from the start, to the same file.
+- A download cut off by closing supaS3 can be retried to the same file.
 - AppImage and RPM packages for Linux, x64 and ARM64.
 - Create and delete buckets. Deleting asks for the bucket's name and refuses while editors or transfers in it are open.
 - Turn versioning on or pause it, and edit the bucket policy as JSON, from the details panel of a bucket. Services that refuse these show why.
 - Version history, restore, download and delete of versions are now tested on Tencent Cloud COS and MinIO.
-- Uploads, downloads and copies that fail on a network error are retried up to three times. An upload is retried only while the target is still as it was before, and its unfinished parts are removed first.
+- Uploads, downloads and copies that fail on a network error are retried up to three times. An upload is retried only while the target is still as it was before.
+- Pause and continue downloads and uploads of 100 MiB or more. A large upload or a download cut off by the network, paused, or stopped by quitting goes on from where it stopped: parts already sent and data already downloaded are kept, as long as the local file and the object are unchanged. Cancelling or removing the transfer lets go of what it kept.
 - Copy and move to the other pane with Cmd/Ctrl+Shift+C and Cmd/Ctrl+Shift+M.
 - Files under 100 MiB upload many times faster to distant services: they are read in 1 MiB pieces instead of 4 KiB.
 - Uploads of large files no longer fail when the network pauses for a few seconds.
 - The sidebar folds to icons when the details panel leaves little room; dialogs have consistent widths; field errors show beside their field.
+- Shift+F10 or the Menu key opens the selected row's menu; Tab also reaches the details panel and the transfer list; notices can be closed; in a narrow pane, less used commands move into a More menu.
 
 ## 0.2.0
 

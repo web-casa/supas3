@@ -36,6 +36,8 @@ pub enum TaskCenterEvent {
 }
 
 pub struct TaskCenter {
+    /// Taken when Tab moves through the window's regions.
+    focus: FocusHandle,
     tasks: Tasks,
     filter: TaskFilter,
     expanded: bool,
@@ -117,6 +119,7 @@ impl TaskCenter {
         })
         .detach();
         Self {
+            focus: cx.focus_handle(),
             tasks: Tasks::default(),
             filter: TaskFilter::default(),
             expanded: false,
@@ -155,7 +158,7 @@ impl TaskCenter {
                     }
                 }
                 TaskAction::Remove => self.tasks.remove(&id),
-                TaskAction::Retry => {}
+                TaskAction::Retry | TaskAction::Pause | TaskAction::Continue => {}
             }
             cx.notify();
             return;
@@ -170,13 +173,28 @@ impl TaskCenter {
             return;
         }
         self.error = None;
+        // One that kept what it sent goes on under its own id: it is
+        // followed again from now, so its updates apply.
+        let ended_as =
+            if action == TaskAction::Retry && self.tasks.get(&id).is_some_and(|task| task.kept) {
+                self.tasks.requeue(&id)
+            } else {
+                None
+            };
+        cx.notify();
         cx.spawn(async move |center, cx| {
+            // For a retry: whether it goes on under its own id.
+            let mut same = false;
             let result = match action {
                 TaskAction::Cancel => requests.cancel_transfer(id.clone()).await.map(|_| true),
                 // `None`: the backend has nothing to retry it with.
                 TaskAction::Retry => match requests.retry_transfer(id.clone()).await {
-                    // A download from an earlier run is queued afresh and
-                    // its old record dropped; its row goes too.
+                    Ok(Some(new_id)) if new_id == id => {
+                        same = true;
+                        Ok(true)
+                    }
+                    // Queued anew. A download from an earlier run drops its
+                    // old record; its row goes too.
                     Ok(Some(_)) => {
                         let gone = matches!(requests.transfer_job(id.clone()).await, Ok(None));
                         Ok(!gone)
@@ -185,16 +203,28 @@ impl TaskCenter {
                     Err(error) => Err(error),
                 },
                 TaskAction::Remove => requests.remove_transfer(id.clone()).await.map(|_| true),
+                TaskAction::Pause => requests.pause_transfer(id.clone()).await,
+                TaskAction::Continue => requests.continue_transfer(id.clone()).await,
             };
-            // Retried: the transfer stays taken, so the app does not
-            // retry it again.
-            if action == TaskAction::Retry && result.is_err() {
+            // Retried anew: the old transfer stays taken, so the app does
+            // not retry it again. One that goes on under its own id may
+            // need retrying again later.
+            if action == TaskAction::Retry && (result.is_err() || same) {
                 crate::auto_retry::release(&id);
             }
             let _ = center.update(cx, |center, cx| {
+                if let Some(state) = ended_as.clone().filter(|_| !same) {
+                    center.tasks.restore(&id, state);
+                }
                 match result {
                     Ok(_) if action == TaskAction::Remove => center.tasks.remove(&id),
                     Ok(true) => {}
+                    Ok(false) if action == TaskAction::Pause => {
+                        center.error = Some(t!("tasks.cannot_pause").into_owned())
+                    }
+                    Ok(false) if action == TaskAction::Continue => {
+                        center.error = Some(t!("tasks.cannot_continue").into_owned())
+                    }
                     // Retried as a new transfer, whose own row follows.
                     Ok(false) if action == TaskAction::Retry => center.tasks.remove(&id),
                     Ok(false) => center.error = Some(t!("tasks.cannot_retry").into_owned()),
@@ -204,6 +234,24 @@ impl TaskCenter {
             });
         })
         .detach();
+    }
+
+    /// Follows again a transfer about to go on under its own id; see
+    /// [`crate::tasks::Tasks::requeue`].
+    pub fn requeue(&mut self, id: &str, cx: &mut Context<Self>) -> Option<crate::tasks::TaskState> {
+        let ended_as = self.tasks.requeue(id);
+        cx.notify();
+        ended_as
+    }
+
+    /// Puts back how a task had ended; see [`crate::tasks::Tasks::restore`].
+    pub fn restore(&mut self, id: &str, state: crate::tasks::TaskState, cx: &mut Context<Self>) {
+        self.tasks.restore(id, state);
+        cx.notify();
+    }
+
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
     }
 
     /// The task with this id, as the list shows it.
@@ -282,13 +330,15 @@ impl TaskCenter {
         let ids: Vec<String> = ids.into_iter().map(|(id, _)| id).collect();
         self.error = None;
         cx.spawn(async move |center, cx| {
-            let result = requests.remove_transfers(ids.clone()).await;
+            let result = requests.remove_transfers(ids).await;
             let _ = center.update(cx, |center, cx| {
                 match result {
-                    Ok(_) => {
-                        for id in &ids {
+                    // Those that could not let go of what they kept stay.
+                    Ok((removed, kept)) => {
+                        for id in &removed {
                             center.tasks.remove(id);
                         }
+                        center.error = kept;
                     }
                     Err(error) => center.error = Some(error),
                 }
@@ -432,7 +482,17 @@ impl TaskCenter {
                 },
                 false,
             ),
-            TaskState::Paused => (t!("tasks.state_paused").into_owned(), false),
+            TaskState::Paused => (
+                match task.fraction() {
+                    Some(fraction) => t!(
+                        "tasks.state_paused_at",
+                        percent = format!("{:.0}", fraction * 100.0)
+                    )
+                    .into_owned(),
+                    None => t!("tasks.state_paused").into_owned(),
+                },
+                false,
+            ),
             TaskState::Completed => (t!("tasks.state_completed").into_owned(), false),
             TaskState::Cancelled => (t!("tasks.state_cancelled").into_owned(), false),
             TaskState::Failed(message) => {
@@ -514,6 +574,26 @@ impl TaskCenter {
             .child(
                 h_flex()
                     .gap_1()
+                    .when(
+                        task.pausable
+                            && matches!(task.state, TaskState::Queued | TaskState::Running),
+                        |this| {
+                            this.child(action(
+                                "pause",
+                                t!("tasks.pause").into_owned(),
+                                TaskAction::Pause,
+                                cx,
+                            ))
+                        },
+                    )
+                    .when(task.state == TaskState::Paused, |this| {
+                        this.child(action(
+                            "continue",
+                            t!("tasks.continue").into_owned(),
+                            TaskAction::Continue,
+                            cx,
+                        ))
+                    })
                     .when(task.state.can_cancel(), |this| {
                         this.child(action(
                             "cancel",
@@ -547,10 +627,12 @@ enum TaskAction {
     Cancel,
     Retry,
     Remove,
+    Pause,
+    Continue,
 }
 
 impl Render for TaskCenter {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Nothing below the header is built while the strip is collapsed.
         let (rows, hidden): (Vec<AnyElement>, usize) = if self.expanded {
             let listed = self.tasks.list(self.filter);
@@ -567,8 +649,24 @@ impl Render for TaskCenter {
         let empty = rows.is_empty();
 
         v_flex()
+            .track_focus(&self.focus)
+            // Enter or Space shows or hides the list while the strip has focus.
+            .on_key_down(cx.listener(|center, event: &KeyDownEvent, window, cx| {
+                let keystroke = &event.keystroke;
+                // Not when a button inside it took the key.
+                if center.focus.is_focused(window)
+                    && !keystroke.modifiers.modified()
+                    && matches!(keystroke.key.as_str(), "enter" | "space")
+                {
+                    center.expanded = !center.expanded;
+                    cx.notify();
+                }
+            }))
             .w_full()
             .bg(cx.theme().background)
+            .when(self.focus.is_focused(window), |this| {
+                this.border_t_1().border_color(cx.theme().ring)
+            })
             .child(self.render_header(cx))
             .when_some(self.error.clone(), |this, error| {
                 this.child(

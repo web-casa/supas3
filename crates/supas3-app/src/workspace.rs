@@ -225,7 +225,7 @@ pub enum PaneCommand {
 
 /// Dialog widths in rems: confirmations keep the dialog's own width; a
 /// dialog with fields is a form; one with a list or a viewer is wide.
-const FORM_WIDTH: f32 = 32.;
+pub(crate) const FORM_WIDTH: f32 = 32.;
 const WIDE_WIDTH: f32 = 44.;
 
 /// One row of the sidebar.
@@ -306,7 +306,7 @@ impl Workspace {
             )
         });
         let task_center = cx.new(|cx| TaskCenter::new(events, cx));
-        let details = cx.new(|_| DetailsPanel::new());
+        let details = cx.new(DetailsPanel::new);
         let subscriptions = vec![
             cx.subscribe_in(&details, window, |workspace, _, event, window, cx| {
                 workspace.on_details_event(event, window, cx);
@@ -905,28 +905,63 @@ impl Workspace {
     ) {
         cx.spawn(async move |workspace, cx| {
             cx.background_executor().timer(wait).await;
-            let still_listed = workspace
+            // Removed or retried by hand meanwhile: the user took it over.
+            let still_failed = workspace
                 .read_with(cx, |workspace, cx| {
-                    workspace.task_center.read(cx).task(&id).is_some()
+                    workspace
+                        .task_center
+                        .read(cx)
+                        .task(&id)
+                        .is_some_and(|task| matches!(task.state, TaskState::Failed(_)))
                 })
                 .unwrap_or(false);
             let Some(requests) = cx.update(|cx| AppBackend::requests(cx)) else {
                 return;
             };
-            if !still_listed || !crate::auto_retry::claim(&id) {
+            if !still_failed || !crate::auto_retry::claim(&id) {
                 return;
             }
+            // One that kept what it sent goes on under its own id: follow
+            // it again from now.
+            let ended_as = workspace
+                .update(cx, |workspace, cx| {
+                    let kept = workspace
+                        .task_center
+                        .read(cx)
+                        .task(&id)
+                        .is_some_and(|task| task.kept);
+                    kept.then(|| {
+                        workspace
+                            .task_center
+                            .update(cx, |center, cx| center.requeue(&id, cx))
+                    })
+                    .flatten()
+                })
+                .ok()
+                .flatten();
             let result = requests.auto_retry(id.clone()).await;
-            // Queued: the old transfer stays taken, as it is gone.
-            if !matches!(result, Ok(crate::backend::AutoRetry::Queued(_))) {
+            // Queued anew: the old transfer stays taken, as it is gone. One
+            // that goes on under its own id may need retrying again.
+            let same =
+                matches!(&result, Ok(crate::backend::AutoRetry::Queued(new_id)) if *new_id == id);
+            if !matches!(result, Ok(crate::backend::AutoRetry::Queued(_))) || same {
                 crate::auto_retry::release(&id);
             }
+            let _ = workspace.update(cx, |workspace, cx| {
+                if let Some(state) = ended_as.filter(|_| !same) {
+                    workspace
+                        .task_center
+                        .update(cx, |center, cx| center.restore(&id, state, cx));
+                }
+            });
             let _ = workspace.update(cx, |workspace, cx| match result {
                 Ok(crate::backend::AutoRetry::Queued(new_id)) => {
                     workspace.retries.insert(new_id, attempt);
-                    workspace
-                        .task_center
-                        .update(cx, |center, cx| center.forget(&id, cx));
+                    if !same {
+                        workspace
+                            .task_center
+                            .update(cx, |center, cx| center.forget(&id, cx));
+                    }
                 }
                 Ok(crate::backend::AutoRetry::MaybeWritten) => {
                     let message = t!("retry.maybe_written", name = name).into_owned();
@@ -2293,12 +2328,29 @@ impl Workspace {
 
     /// Shows or hides the details panel.
     pub fn toggle_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.store_settings(
-            |settings| settings.details_open = !settings.details_open,
-            window,
-            cx,
-        );
+        if self.settings.details_open {
+            self.close_details(window, cx);
+            return;
+        }
+        self.store_settings(|settings| settings.details_open = true, window, cx);
         self.refresh_details(cx);
+    }
+
+    /// Closes the details panel. The keyboard, if it was there, goes back to
+    /// the active pane rather than stay with a panel no longer shown.
+    fn close_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let had_focus = self
+            .details
+            .read(cx)
+            .focus_handle()
+            .contains_focused(window, cx);
+        self.store_settings(|settings| settings.details_open = false, window, cx);
+        if had_focus {
+            let side = self.active;
+            self.pane(side)
+                .clone()
+                .update(cx, |pane, cx| pane.focus(window, cx));
+        }
     }
 
     fn on_details_event(
@@ -2308,9 +2360,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
-            DetailsEvent::Close => {
-                self.store_settings(|settings| settings.details_open = false, window, cx);
-            }
+            DetailsEvent::Close => self.close_details(window, cx),
             DetailsEvent::Row(action, source, entry) => {
                 self.show_file(*action, source, entry, window, cx);
             }
@@ -3820,26 +3870,51 @@ impl Workspace {
     /// Tab and Shift+Tab move the keyboard between the sidebar and the two
     /// panes.
     fn focus_region(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
-        // 0 is the sidebar, 1 the left pane, 2 the right pane.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Region {
+            Sidebar,
+            Left,
+            Right,
+            Details,
+            Tasks,
+        }
+        let mut regions = vec![Region::Sidebar, Region::Left, Region::Right];
+        if self.settings.details_open {
+            regions.push(Region::Details);
+        }
+        regions.push(Region::Tasks);
+        let details = self.details.read(cx).focus_handle();
+        let tasks = self.task_center.read(cx).focus_handle();
         let current = if self.sidebar_focus.contains_focused(window, cx) {
-            Some(0)
+            Some(Region::Sidebar)
         } else if self.left.read(cx).contains_focus(window, cx) {
-            Some(1)
+            Some(Region::Left)
         } else if self.right.read(cx).contains_focus(window, cx) {
-            Some(2)
+            Some(Region::Right)
+        } else if details.contains_focused(window, cx) {
+            Some(Region::Details)
+        } else if tasks.contains_focused(window, cx) {
+            Some(Region::Tasks)
         } else {
             None
         };
-        let next = match (current, backwards) {
-            (None, false) => 0,
-            (None, true) => 2,
-            (Some(at), false) => (at + 1) % 3,
-            (Some(at), true) => (at + 2) % 3,
+        let count = regions.len();
+        let next = match current.and_then(|at| regions.iter().position(|region| *region == at)) {
+            None if backwards => count - 1,
+            None => 0,
+            Some(at) if backwards => (at + count - 1) % count,
+            Some(at) => (at + 1) % count,
         };
-        match next {
-            0 => window.focus(&self.sidebar_focus, cx),
+        match regions[next] {
+            Region::Sidebar => window.focus(&self.sidebar_focus, cx),
+            Region::Details => window.focus(&details, cx),
+            Region::Tasks => window.focus(&tasks, cx),
             side => {
-                let side = if side == 1 { Side::Left } else { Side::Right };
+                let side = if side == Region::Left {
+                    Side::Left
+                } else {
+                    Side::Right
+                };
                 if self.activate(side, cx) {
                     self.remember_layout(side, cx);
                     self.refresh_details(cx);
@@ -4451,28 +4526,31 @@ impl Render for Workspace {
                 v_flex()
                     .flex_1()
                     .min_w_0()
+                    // Lasting problems, until the user has read them.
                     .when_some(self.notice.clone(), |this, notice| {
+                        let workspace = cx.weak_entity();
                         this.child(
-                            div()
-                                .px_3()
-                                .py_2()
-                                .border_b_1()
-                                .border_color(cx.theme().border)
-                                .text_sm()
-                                .text_color(cx.theme().danger)
-                                .child(notice),
+                            gpui_kit::component::alert::Alert::error("workspace-notice", notice)
+                                .banner()
+                                .on_close(move |_, _, cx| {
+                                    let _ = workspace.update(cx, |workspace, cx| {
+                                        workspace.notice = None;
+                                        cx.notify();
+                                    });
+                                }),
                         )
                     })
                     .when_some(self.storage_notice.clone(), |this, notice| {
+                        let workspace = cx.weak_entity();
                         this.child(
-                            div()
-                                .px_3()
-                                .py_2()
-                                .border_b_1()
-                                .border_color(cx.theme().border)
-                                .text_sm()
-                                .text_color(cx.theme().danger)
-                                .child(notice),
+                            gpui_kit::component::alert::Alert::error("storage-notice", notice)
+                                .banner()
+                                .on_close(move |_, _, cx| {
+                                    let _ = workspace.update(cx, |workspace, cx| {
+                                        workspace.storage_notice = None;
+                                        cx.notify();
+                                    });
+                                }),
                         )
                     })
                     .child(

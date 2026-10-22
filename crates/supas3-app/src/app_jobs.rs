@@ -67,6 +67,8 @@ impl JobContext {
             group: None,
             group_name: None,
             retryable: false,
+            pausable: false,
+            kept: false,
             origin: TaskOrigin::App,
             created_at: self.created_at,
         };

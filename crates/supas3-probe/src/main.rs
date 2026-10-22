@@ -1502,6 +1502,206 @@ async fn seed(t: &Target, env: &HashMap<String, String>, count: usize) {
 }
 
 /// Awaits a batch of requests concurrently.
+/// What resuming needs: ranged GETs (with and without If-Match, and past the
+/// end), ListParts with paging, and ListParts of an aborted upload.
+async fn resume(t: &Target, env: &HashMap<String, String>, run_id: &str) {
+    let rep = Report(&t.name);
+    let c = client(t, env, false).await;
+    let key = format!("supas3-probe/{run_id}/resume/r.bin");
+    let body: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let size = body.len() as i64;
+    let put = c
+        .put_object()
+        .bucket(&t.bucket)
+        .key(&key)
+        .body(ByteStream::from(body.clone()))
+        .send()
+        .await;
+    rep.row("put 6 MiB", outcome(&put));
+    let etag = put.ok().and_then(|o| o.e_tag().map(str::to_string));
+    let ranged = |if_match: Option<String>, from: i64| {
+        c.get_object()
+            .bucket(&t.bucket)
+            .key(&key)
+            .range(format!("bytes={from}-"))
+            .set_if_match(if_match)
+            .send()
+    };
+    for (label, if_match, from) in [
+        ("range 1000-", None, 1000),
+        ("range 1000- If-Match right ETag", etag.clone(), 1000),
+        (
+            "range 1000- If-Match wrong ETag",
+            Some("\"0000\"".to_string()),
+            1000,
+        ),
+        ("range from the end", None, size),
+    ] {
+        match ranged(if_match, from).await {
+            Ok(o) => {
+                let range = o.content_range().map(str::to_string);
+                let same = o.e_tag().map(str::to_string) == etag;
+                let first = o.body.collect().await.map(|b| b.into_bytes());
+                let right = first.as_ref().is_ok_and(|b| {
+                    b.len() as i64 == size - from && b.first() == body.get(from as usize)
+                });
+                rep.row(
+                    label,
+                    format!("OK range={range:?} same_etag={same} bytes_right={right}"),
+                );
+            }
+            Err(e) => rep.row(label, outcome::<(), _>(&Err(e))),
+        }
+    }
+
+    // Two parts, then ListParts one per page.
+    let mp_key = format!("supas3-probe/{run_id}/resume/mp.bin");
+    let created = c
+        .create_multipart_upload()
+        .bucket(&t.bucket)
+        .key(&mp_key)
+        .send()
+        .await;
+    rep.row("create multipart", outcome(&created));
+    let Some(upload_id) = created.ok().and_then(|o| o.upload_id().map(str::to_string)) else {
+        return;
+    };
+    let mut parts = Vec::new();
+    for (number, range) in [(1, 0..5 * 1024 * 1024), (2, 5 * 1024 * 1024..body.len())] {
+        let sent = c
+            .upload_part()
+            .bucket(&t.bucket)
+            .key(&mp_key)
+            .upload_id(&upload_id)
+            .part_number(number)
+            .body(ByteStream::from(body[range].to_vec()))
+            .send()
+            .await;
+        rep.row(&format!("upload part {number}"), outcome(&sent));
+        if let Ok(o) = sent {
+            parts.push((number, o.e_tag().map(str::to_string)));
+        }
+    }
+    let mut marker: Option<String> = None;
+    let mut listed = Vec::new();
+    for page in 1..=3 {
+        let answer = c
+            .list_parts()
+            .bucket(&t.bucket)
+            .key(&mp_key)
+            .upload_id(&upload_id)
+            .max_parts(1)
+            .set_part_number_marker(marker.clone())
+            .send()
+            .await;
+        match answer {
+            Ok(o) => {
+                for p in o.parts() {
+                    listed.push((p.part_number(), p.e_tag().map(str::to_string), p.size()));
+                }
+                rep.row(
+                    &format!("list parts page {page}"),
+                    format!(
+                        "OK parts={} truncated={:?} next={:?}",
+                        o.parts().len(),
+                        o.is_truncated(),
+                        o.next_part_number_marker()
+                    ),
+                );
+                if o.is_truncated() != Some(true) {
+                    break;
+                }
+                marker = o.next_part_number_marker().map(str::to_string);
+            }
+            Err(e) => {
+                rep.row(
+                    &format!("list parts page {page}"),
+                    outcome::<(), _>(&Err(e)),
+                );
+                break;
+            }
+        }
+    }
+    let agree = listed.len() == parts.len()
+        && listed
+            .iter()
+            .zip(&parts)
+            .all(|((n, e, _), (m, f))| *n == Some(*m) && e == f);
+    rep.row("listed parts match the sent ones", agree.to_string());
+    let completed = c
+        .complete_multipart_upload()
+        .bucket(&t.bucket)
+        .key(&mp_key)
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(
+                    parts
+                        .iter()
+                        .map(|(n, e)| {
+                            CompletedPart::builder()
+                                .part_number(*n)
+                                .set_e_tag(e.clone())
+                                .build()
+                        })
+                        .collect(),
+                ))
+                .build(),
+        )
+        .send()
+        .await;
+    rep.row("complete multipart", outcome(&completed));
+    let mp_etag = completed.ok().and_then(|o| o.e_tag().map(str::to_string));
+    match c
+        .get_object()
+        .bucket(&t.bucket)
+        .key(&mp_key)
+        .range("bytes=6000000-")
+        .send()
+        .await
+    {
+        Ok(o) => rep.row(
+            "range on the multipart object",
+            format!(
+                "OK range={:?} same_etag={}",
+                o.content_range(),
+                o.e_tag().map(str::to_string) == mp_etag
+            ),
+        ),
+        Err(e) => rep.row("range on the multipart object", outcome::<(), _>(&Err(e))),
+    }
+
+    // An aborted upload, then ListParts of it.
+    if let Ok(o) = c
+        .create_multipart_upload()
+        .bucket(&t.bucket)
+        .key(&mp_key)
+        .send()
+        .await
+    {
+        let id = o.upload_id().unwrap_or_default().to_string();
+        let aborted = c
+            .abort_multipart_upload()
+            .bucket(&t.bucket)
+            .key(&mp_key)
+            .upload_id(&id)
+            .send()
+            .await;
+        rep.row("abort multipart", outcome(&aborted));
+        let after = c
+            .list_parts()
+            .bucket(&t.bucket)
+            .key(&mp_key)
+            .upload_id(&id)
+            .send()
+            .await;
+        rep.row("list parts after abort", outcome(&after));
+    }
+    for k in [&key, &mp_key] {
+        let _ = c.delete_object().bucket(&t.bucket).key(k).send().await;
+    }
+}
+
 async fn futures_join<F: std::future::Future>(futures: impl Iterator<Item = F>) -> Vec<F::Output> {
     let handles: Vec<_> = futures.map(Box::pin).collect();
     let mut results = Vec::with_capacity(handles.len());
@@ -1519,6 +1719,8 @@ async fn main() {
     only.retain(|a| a != "--round2");
     let detailed = only.iter().any(|a| a == "--conditions");
     only.retain(|a| a != "--conditions");
+    let resuming = only.iter().any(|a| a == "--resume");
+    only.retain(|a| a != "--resume");
     // `--seed N target...` writes demo data instead of probing.
     let seed_count = only.iter().position(|a| a == "--seed").map(|index| {
         only.remove(index);
@@ -1538,6 +1740,8 @@ async fn main() {
         if only.is_empty() || only.contains(&t.name) {
             if let Some(count) = seed_count {
                 seed(t, &env, count).await;
+            } else if resuming {
+                resume(t, &env, &run_id).await
             } else if detailed {
                 conditions(t, &env, &run_id).await
             } else if second {

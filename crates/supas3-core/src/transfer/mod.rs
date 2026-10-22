@@ -3,6 +3,7 @@ pub mod download;
 pub mod manager;
 pub mod public_url;
 pub mod remote;
+pub mod resume;
 mod speed;
 pub mod sync;
 pub mod sync_state;
@@ -70,6 +71,13 @@ pub struct TransferJob {
     pub result_etag: Option<String>,
     #[serde(default)]
     pub bandwidth_limit: Option<u64>,
+    /// supaS3: what a paused or failed transfer kept, to go on from there.
+    #[serde(default)]
+    pub resume: Option<resume::ResumeState>,
+    /// supaS3: set for transfers the user started directly, which may keep
+    /// what they sent when they stop; see [`resume::may_keep`].
+    #[serde(default)]
+    pub resumable: bool,
     #[serde(skip)]
     pub download_destination: Option<std::sync::Arc<download::DownloadDestination>>,
     pub transfer_type: TransferType,
@@ -97,6 +105,12 @@ pub struct TransferEvent {
     pub total_bytes: u64,
     pub status: TransferStatus,
     pub finished_at: Option<i64>,
+    /// supaS3: whether it can be paused and gone on with later.
+    #[serde(default)]
+    pub pausable: bool,
+    /// supaS3: whether it kept what it sent, to go on from there.
+    #[serde(default)]
+    pub kept: bool,
 }
 
 impl TransferJob {
@@ -139,6 +153,8 @@ impl TransferJob {
             replace_etag: None,
             result_etag: None,
             bandwidth_limit: None,
+            resume: None,
+            resumable: false,
             download_destination: None,
             transfer_type,
             status: TransferStatus::Pending,

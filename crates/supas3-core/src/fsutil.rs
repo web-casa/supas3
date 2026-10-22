@@ -84,7 +84,7 @@ pub fn file_md5_hex(path: &Path) -> io::Result<String> {
 /// replaced by another under the same name, or written to, has another
 /// identity. The change time cannot be set by programs, so a rewrite that
 /// restores the modification time is still seen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileIdentity {
     pub size: u64,
     pub modified_nanos: u128,

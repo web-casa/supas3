@@ -21,18 +21,19 @@ use supas3_core::commands::operations::{ObjectMetadata, ObjectPermissions, SeenP
 use supas3_core::commands::sync::Preview as SyncPreview;
 use supas3_core::commands::{
     bucket_admin, bucket_management, buckets, objects, operations, preview, profiles, replace,
-    retry_cleanup, sync, transfer, urls, version_ops, versions,
+    resume as resume_cmd, retry_cleanup, sync, transfer, urls, version_ops, versions,
 };
 use supas3_core::credentials::{with_profile, Profile};
 use supas3_core::host::EventSink;
 use supas3_core::s3::versions::{Cursor, History};
 use supas3_core::s3::WriteTraits;
 use supas3_core::transfer::controls::SyncOptions;
+use supas3_core::transfer::resume::ResumeState;
 use supas3_core::transfer::{TransferJob, TransferType};
 use supas3_core::{Core, CoreOptions};
 
-/// How long quitting waits for transfers to cancel and clean up.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+/// How long quitting waits for transfers to pause or cancel and clean up.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// How many objects one request asks a storage service for.
 const PAGE_SIZE: i32 = 500;
@@ -93,8 +94,9 @@ impl Backend {
         })
     }
 
-    /// Stops scheduled work, cancels transfers, waits briefly for their
-    /// cleanup, then stops the runtime. Safe to call more than once.
+    /// Stops scheduled work, pauses the transfers that can go on later and
+    /// cancels the rest, waits briefly for them to stop, then stops the
+    /// runtime. Safe to call more than once.
     pub fn shutdown(&mut self) {
         let Some(runtime) = self.runtime.take() else {
             return;
@@ -109,10 +111,11 @@ impl Backend {
     }
 }
 
-/// Queues a download from an earlier run again, from the start, to the
-/// file it was going to, if the connection is still the one it was added
-/// with. The old record goes once the new one is queued.
-async fn redownload(core: &Core, job: TransferJob) -> Result<String, String> {
+/// Where a download from an earlier run may go again: its own file, while
+/// the connection is the one it was added with, the folder is there, and
+/// no file has appeared under its name (nothing is downloaded over one,
+/// including a file it was to replace).
+async fn redownload_target(core: &Core, job: &TransferJob) -> Result<PathBuf, String> {
     let profiles = profiles::list_profiles(core.profiles()).await?;
     let current = profiles
         .iter()
@@ -127,12 +130,69 @@ async fn redownload(core: &Core, job: TransferJob) -> Result<String, String> {
         let folder = folder.display().to_string();
         return Err(rust_i18n::t!("redownload.folder_gone", folder = folder).into_owned());
     }
-    // A download that was to replace a file, or a file that appeared
-    // since: nothing is downloaded over it.
     if path.exists() {
         let file = path.display().to_string();
         return Err(rust_i18n::t!("redownload.exists", file = file).into_owned());
     }
+    Ok(path)
+}
+
+/// Goes on with a paused transfer, or a failed one that kept what it sent;
+/// a download from an earlier run goes back to its own file.
+async fn continue_kept(core: &Core, job: &TransferJob) -> Result<bool, String> {
+    let destination = if matches!(job.transfer_type, TransferType::Download)
+        && job.download_destination.is_none()
+    {
+        Some(redownload_target(core, job).await?)
+    } else {
+        None
+    };
+    resume_cmd::continue_transfer(
+        job.id.clone(),
+        destination,
+        core.profiles(),
+        core.s3(),
+        core.transfers(),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Lets go of what a stopped transfer kept, through its own connection.
+async fn release_kept(core: &Core, id: &str) -> Result<(), String> {
+    let Some(job) = core.transfers().get_job(id).await else {
+        return Ok(());
+    };
+    if job.resume.is_none() {
+        return Ok(());
+    }
+    let released = with_profile(
+        job.profile_id.clone(),
+        resume_cmd::release_kept(id.to_string(), core.profiles(), core.transfers()),
+    )
+    .await
+    .map_err(|error| error.to_string());
+    match released {
+        Ok(()) => Ok(()),
+        // Offline or a busy service: the record keeps it until it can go.
+        Err(error) if crate::auto_retry::transient(&error) => {
+            Err(rust_i18n::t!("resume.release_failed", error = error).into_owned())
+        }
+        // Refused for good (the connection was deleted, or the keys may not
+        // do this): nothing will ever let go of it from here.
+        Err(error) => {
+            log::warn!("Gave up letting go of what transfer {id} kept: {error}");
+            core.transfers().take_resume(id).await;
+            Ok(())
+        }
+    }
+}
+
+/// Queues a download from an earlier run again, from the start, to the
+/// file it was going to, if the connection is still the one it was added
+/// with. The old record goes once the new one is queued.
+async fn redownload(core: &Core, job: TransferJob) -> Result<String, String> {
+    let path = redownload_target(core, &job).await?;
     let profile_id = job.profile_id.clone();
     let queued = match job.version_id.clone() {
         Some(version_id) => {
@@ -175,6 +235,9 @@ async fn redownload(core: &Core, job: TransferJob) -> Result<String, String> {
         }
     }
     .map_err(|error| error.to_string())?;
+    if job.resumable {
+        core.transfers().mark_resumable(&[queued.clone()]).await;
+    }
     let _ = transfer::remove_transfer(job.id, core.transfers()).await;
     Ok(queued)
 }
@@ -364,6 +427,35 @@ impl Requests {
     pub async fn execute(&self, plan: Plan) -> Result<Outcome, String> {
         self.run(move |core| async move {
             let mut outcome = Outcome::default();
+            // Uploads and downloads the user starts may keep what they sent
+            // when they stop, to go on later; see `transfer::resume`.
+            let direct = matches!(plan, Plan::Upload { .. } | Plan::Download { .. });
+            // What the plan's transfers look like, to tell them from others
+            // queued meanwhile (by a move, a retry, another window).
+            let (sources, targets): (Vec<PathBuf>, Vec<(String, String)>) = match &plan {
+                Plan::Upload { items, target } => (
+                    items.iter().map(|item| item.path.clone()).collect(),
+                    vec![(target.bucket.clone(), target.prefix.clone())],
+                ),
+                Plan::Download { items, folder, .. } => (
+                    vec![folder.clone()],
+                    items
+                        .iter()
+                        .map(|item| (item.bucket.clone(), item.key.clone()))
+                        .collect(),
+                ),
+                _ => Default::default(),
+            };
+            let before: std::collections::HashSet<String> = if direct {
+                core.transfers()
+                    .list_jobs()
+                    .await
+                    .into_iter()
+                    .map(|job| job.id)
+                    .collect()
+            } else {
+                Default::default()
+            };
             match plan {
                 // Run by the application itself, as a job; see the workspace.
                 Plan::CopyLocal { .. } => {
@@ -606,6 +698,26 @@ impl Requests {
                     }
                 }
             }
+            if direct {
+                let added: Vec<String> = core
+                    .transfers()
+                    .list_jobs()
+                    .await
+                    .into_iter()
+                    .filter(|job| {
+                        !before.contains(&job.id)
+                            && job.remote_source.is_none()
+                            && sources.iter().any(|source| {
+                                std::path::Path::new(&job.local_path).starts_with(source)
+                            })
+                            && targets.iter().any(|(bucket, key)| {
+                                job.bucket == *bucket && job.key.starts_with(key.as_str())
+                            })
+                    })
+                    .map(|job| job.id)
+                    .collect();
+                core.transfers().mark_resumable(&added).await;
+            }
             Ok(outcome)
         })
         .await
@@ -680,9 +792,33 @@ impl Requests {
 
     pub async fn cancel_transfer(&self, id: String) -> Result<bool, String> {
         self.run(move |core| async move {
-            transfer::cancel_transfer(id, core.transfers())
+            let cancelled = transfer::cancel_transfer(id.clone(), core.transfers())
+                .await
+                .map_err(|error| error.to_string())?;
+            // A paused transfer held on to what it sent; it goes now.
+            release_kept(&core, &id).await?;
+            Ok(cancelled)
+        })
+        .await
+    }
+
+    /// Pauses a transfer that can go on later, keeping what it sent.
+    pub async fn pause_transfer(&self, id: String) -> Result<bool, String> {
+        self.run(move |core| async move {
+            resume_cmd::pause_transfer(id, core.transfers())
                 .await
                 .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Goes on with a paused transfer from where it stopped.
+    pub async fn continue_transfer(&self, id: String) -> Result<bool, String> {
+        self.run(move |core| async move {
+            match core.transfers().get_job(&id).await {
+                Some(job) => continue_kept(&core, &job).await,
+                None => Ok(false),
+            }
         })
         .await
     }
@@ -697,6 +833,14 @@ impl Requests {
                 matches!(job.transfer_type, TransferType::Download)
                     && job.download_destination.is_none()
             }) {
+                // One that kept part of the file goes on with it; if it
+                // cannot, what it kept goes and it starts afresh.
+                if matches!(job.resume, Some(ResumeState::Download(_))) {
+                    if continue_kept(&core, &job).await? {
+                        return Ok(Some(id));
+                    }
+                    release_kept(&core, &id).await?;
+                }
                 return redownload(&core, job).await.map(Some);
             }
             transfer::retry_transfer(id, core.app(), core.profiles(), core.s3(), core.transfers())
@@ -732,7 +876,10 @@ impl Requests {
             let Some(job) = core.transfers().get_job(&id).await else {
                 return Ok(AutoRetry::NotEligible);
             };
-            if !retry_on_its_own(&job) {
+            // Retried by hand meanwhile, perhaps going on under its own id.
+            if !retry_on_its_own(&job)
+                || !matches!(job.status, supas3_core::transfer::TransferStatus::Failed(_))
+            {
                 return Ok(AutoRetry::NotEligible);
             }
             if matches!(job.transfer_type, TransferType::Upload) {
@@ -763,6 +910,11 @@ impl Requests {
                 // list unfinished uploads leave them to the bucket's rules.
                 let in_parts = job.total_bytes == 0
                     || job.total_bytes >= supas3_core::s3::MULTIPART_UPLOAD_THRESHOLD;
+                // The upload the transfer kept to go on with stays.
+                let kept = match &job.resume {
+                    Some(ResumeState::Upload(kept)) => Some(kept.upload_id.clone()),
+                    _ => None,
+                };
                 if in_parts {
                     let cleaned = with_profile(
                         profile_id.clone(),
@@ -771,6 +923,7 @@ impl Requests {
                             Some(region),
                             job.key.clone(),
                             job.created_at,
+                            kept,
                             profile_id,
                             core.profiles(),
                         ),
@@ -797,8 +950,11 @@ impl Requests {
                 return Ok(AutoRetry::NotEligible);
             };
             // The new transfer stands for the old one, which goes, so a
-            // later start does not list both.
-            let _ = transfer::remove_transfer(id, core.transfers()).await;
+            // later start does not list both. One that kept what it sent
+            // goes on under its own id.
+            if new_id != id {
+                let _ = transfer::remove_transfer(id, core.transfers()).await;
+            }
             Ok(AutoRetry::Queued(new_id))
         })
         .await
@@ -821,6 +977,7 @@ impl Requests {
                     Some(region),
                     String::new(),
                     0,
+                    None,
                     profile_id,
                     core.profiles(),
                 ),
@@ -836,13 +993,20 @@ impl Requests {
     pub async fn cancel_transfers(&self, ids: Vec<String>) -> Result<usize, String> {
         self.run(move |core| async move {
             let mut cancelled = 0;
+            let mut unreleased = None;
             for id in ids {
-                let done = transfer::cancel_transfer(id, core.transfers())
+                let done = transfer::cancel_transfer(id.clone(), core.transfers())
                     .await
                     .map_err(|error| error.to_string())?;
                 cancelled += usize::from(done);
+                if let Err(error) = release_kept(&core, &id).await {
+                    unreleased = Some(error);
+                }
             }
-            Ok(cancelled)
+            match unreleased {
+                Some(error) => Err(error),
+                None => Ok(cancelled),
+            }
         })
         .await
     }
@@ -850,22 +1014,34 @@ impl Requests {
     /// Removes the listed transfers from the backend's list. Used to clear
     /// completed and cancelled transfers while keeping failed ones, which the
     /// backend's own "clear completed" would remove too.
-    pub async fn remove_transfers(&self, ids: Vec<String>) -> Result<usize, String> {
+    /// Returns the transfers removed, and why any were kept.
+    pub async fn remove_transfers(
+        &self,
+        ids: Vec<String>,
+    ) -> Result<(Vec<String>, Option<String>), String> {
         self.run(move |core| async move {
-            let mut removed = 0;
+            let mut removed = Vec::new();
+            let mut unreleased = None;
             for id in ids {
-                let done = transfer::remove_transfer(id, core.transfers())
+                // What a record kept goes with it; one that cannot let go
+                // of it yet stays listed.
+                if let Err(error) = release_kept(&core, &id).await {
+                    unreleased = Some(error);
+                    continue;
+                }
+                transfer::remove_transfer(id.clone(), core.transfers())
                     .await
                     .map_err(|error| error.to_string())?;
-                removed += usize::from(done);
+                removed.push(id);
             }
-            Ok(removed)
+            Ok((removed, unreleased))
         })
         .await
     }
 
     pub async fn remove_transfer(&self, id: String) -> Result<bool, String> {
         self.run(move |core| async move {
+            release_kept(&core, &id).await?;
             transfer::remove_transfer(id, core.transfers())
                 .await
                 .map_err(|error| error.to_string())
@@ -4265,6 +4441,750 @@ mod tests {
         });
         drop(backend);
         let _ = std::fs::remove_file(&control);
+        let _ = std::fs::remove_dir_all(config);
+        let _ = std::fs::remove_dir_all(&work);
+        for (step, result) in &report {
+            println!("{step}: {}", if result.is_ok() { "ok" } else { "FAILED" });
+        }
+        let failed: Vec<_> = report
+            .iter()
+            .filter(|(_, result)| result.is_err())
+            .collect();
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    /// Uploads in parts and downloads go on where they stopped: after a cut
+    /// network, after a pause, and after quitting; and start over when the
+    /// local file or the object changed. Same setup as the cut-network test;
+    /// the proxy's byte counts show how much each attempt sent again.
+    #[test]
+    #[ignore]
+    fn transfers_go_on_where_they_stopped() {
+        use crate::connection::{Draft, Service};
+        use crate::object_actions::ObjectRef;
+        use crate::tasks::EventQueue;
+        use crate::transfer_plan::{plan, plan_deletion};
+        use supas3_core::transfer::resume::ResumeState;
+        use supas3_core::transfer::TransferStatus;
+        let _serial = super::one_backend_at_a_time();
+        let env = |name: &str| {
+            std::env::var(format!("SUPAS3_RELIABILITY_{name}"))
+                .unwrap_or_else(|_| panic!("SUPAS3_RELIABILITY_{name} is required"))
+        };
+        let control = std::path::PathBuf::from(env("CONTROL"));
+        let counts = std::path::PathBuf::from(format!("{}.bytes", control.display()));
+        let _ = std::fs::remove_file(&control);
+        let draft = Draft {
+            name: "resume".into(),
+            region: "us-east-1".into(),
+            endpoint: env("ENDPOINT"),
+            access_key: env("ACCESS_KEY"),
+            secret_key: env("SECRET_KEY"),
+            ..Draft::new(Service::Generic)
+        };
+        let config = test_dir("resume");
+        let work = dirs::home_dir()
+            .unwrap()
+            .join(format!(".supas3-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        for folder in ["up", "up2", "down", "down2"] {
+            std::fs::create_dir_all(work.join(folder)).unwrap();
+        }
+        const MIB: u64 = 1 << 20;
+        let size = 300 * MIB;
+        let pattern = |seed: u64| -> Vec<u8> {
+            (0..size)
+                .map(|i| ((i / 4096 * 7 + i + seed) % 251) as u8)
+                .collect()
+        };
+        std::fs::write(work.join("up/big.bin"), pattern(0)).unwrap();
+        std::fs::write(work.join("up2/big.bin"), pattern(1)).unwrap();
+        let bucket = format!("supas3-resume-{}", std::process::id());
+        // Bytes the proxy passed up and down so far.
+        let passed = || -> (u64, u64) {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            let text = std::fs::read_to_string(&counts).unwrap_or_default();
+            let mut fields = text.split_whitespace().map(|n| n.parse().unwrap_or(0));
+            (fields.next().unwrap_or(0), fields.next().unwrap_or(0))
+        };
+        let mut steps: Vec<(String, Result<(), String>)> = Vec::new();
+        let check = |ok: bool, detail: String| if ok { Ok(()) } else { Err(detail) };
+
+        let queue = std::sync::Arc::new(EventQueue::default());
+        let backend = Backend::start(config.clone(), queue.sink()).unwrap();
+        let requests = backend.requests().unwrap();
+        let (pid, paused_download, paused_upload) = futures_lite(async {
+            let profile = requests
+                .save_profile(draft.to_profile(None), false)
+                .await
+                .unwrap();
+            let pid = profile.id.clone();
+            steps.push((
+                "make a bucket".into(),
+                requests
+                    .create_bucket(pid.clone(), bucket.clone(), "us-east-1".into())
+                    .await,
+            ));
+            // 128 MiB parts at 32 MiB/s: one part every 4 s.
+            requests
+                .set_transfer_limits(crate::settings::TransferSettings {
+                    concurrency: 2,
+                    bandwidth_kib: 32 * 1024,
+                })
+                .await
+                .unwrap();
+            let job_of = |id: String| {
+                let requests = requests.clone();
+                async move { requests.transfer_job(id).await.ok().flatten() }
+            };
+            let wait_for = |id: String, done: fn(&TransferStatus) -> bool| {
+                let requests = requests.clone();
+                async move {
+                    for _ in 0..1500 {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        if let Ok(Some(job)) = requests.transfer_job(id.clone()).await {
+                            if done(&job.status) {
+                                return Some(job);
+                            }
+                        }
+                    }
+                    None
+                }
+            };
+            let ended = |status: &TransferStatus| {
+                matches!(
+                    status,
+                    TransferStatus::Completed
+                        | TransferStatus::Failed(_)
+                        | TransferStatus::Cancelled
+                )
+            };
+            let completed = |status: &TransferStatus| *status == TransferStatus::Completed;
+            let paused = |status: &TransferStatus| *status == TransferStatus::Paused;
+            // Queues a plan and gives the id of the one transfer it added.
+            let start = |from: Location, to: Location| {
+                let requests = requests.clone();
+                async move {
+                    let before: std::collections::HashSet<String> = requests
+                        .transfers()
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .map(|job| job.id)
+                        .collect();
+                    let rows = requests
+                        .list(from.clone(), None, true, crate::listing::Sort::default())
+                        .await
+                        .unwrap()
+                        .entries
+                        .into_iter()
+                        .filter(|row| row.name == "big.bin")
+                        .collect::<Vec<_>>();
+                    requests
+                        .execute(plan(&from, &rows, &to).unwrap())
+                        .await
+                        .unwrap();
+                    requests
+                        .transfers()
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .map(|job| job.id)
+                        .find(|id| !before.contains(id))
+                        .unwrap()
+                }
+            };
+            let kept_parts = |job: &Option<supas3_core::transfer::TransferJob>| match job
+                .as_ref()
+                .and_then(|job| job.resume.clone())
+            {
+                Some(ResumeState::Upload(upload)) => upload.parts.len(),
+                _ => 0,
+            };
+            let kept_bytes = |job: &Option<supas3_core::transfer::TransferJob>| match job
+                .as_ref()
+                .and_then(|job| job.resume.clone())
+            {
+                Some(ResumeState::Download(download)) => download.bytes,
+                _ => 0,
+            };
+            let size_of = |key: &str| {
+                let (requests, pid, bucket, key) = (
+                    requests.clone(),
+                    pid.clone(),
+                    bucket.clone(),
+                    key.to_string(),
+                );
+                async move {
+                    requests
+                        .object_properties(ObjectRef {
+                            profile_id: pid,
+                            bucket,
+                            key,
+                        })
+                        .await
+                        .map(|m| m.size as u64)
+                }
+            };
+            let root = Location::objects(&pid, &bucket, "");
+            let a = Location::objects(&pid, &bucket, "a/");
+            let b = Location::objects(&pid, &bucket, "b/");
+
+            // 1. An upload cut off after its first part goes on from there.
+            let id = start(Location::Local(work.join("up")), a.clone()).await;
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            std::fs::write(&control, "cut").unwrap();
+            let failed = wait_for(id.clone(), ended).await;
+            let parts = kept_parts(&failed);
+            steps.push((
+                format!("a cut upload keeps its sent parts ({parts})"),
+                check(parts >= 1, format!("{:?}", failed.map(|job| job.status))),
+            ));
+            std::fs::remove_file(&control).unwrap();
+            let (up_before, _) = passed();
+            let retried = requests.retry_transfer(id.clone()).await;
+            steps.push((
+                "the retry goes on under the same id".into(),
+                check(retried == Ok(Some(id.clone())), format!("{retried:?}")),
+            ));
+            let done = wait_for(id.clone(), ended).await;
+            let (up_after, _) = passed();
+            let sent = (up_after - up_before) / MIB;
+            steps.push((
+                format!("it completes, sending only the rest ({sent} MiB)"),
+                check(
+                    done.as_ref()
+                        .is_some_and(|job| job.status == TransferStatus::Completed)
+                        && sent < 300 - 128 * parts as u64 + 20,
+                    format!("{:?}", done.map(|job| job.status)),
+                ),
+            ));
+            let found = size_of("a/big.bin").await;
+            steps.push((
+                "the object is whole".into(),
+                check(found == Ok(size), format!("{found:?}")),
+            ));
+
+            // 2. Paused, then continued.
+            let id = start(Location::Local(work.join("up")), b.clone()).await;
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            let pause = requests.pause_transfer(id.clone()).await;
+            let stopped = wait_for(id.clone(), paused).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let stopped = job_of(id.clone()).await.or(stopped);
+            let parts = kept_parts(&stopped);
+            steps.push((
+                format!("a paused upload keeps its parts ({parts})"),
+                check(pause == Ok(true) && parts >= 1, format!("{pause:?}")),
+            ));
+            let (up_before, _) = passed();
+            let continued = requests.continue_transfer(id.clone()).await;
+            let done = wait_for(id.clone(), ended).await;
+            let (up_after, _) = passed();
+            let sent = (up_after - up_before) / MIB;
+            steps.push((
+                format!("continued, it sends only the rest ({sent} MiB)"),
+                check(
+                    continued == Ok(true)
+                        && done
+                            .as_ref()
+                            .is_some_and(|job| job.status == TransferStatus::Completed)
+                        && sent < 300 - 128 * parts as u64 + 20,
+                    format!("{continued:?} {:?}", done.map(|job| job.status)),
+                ),
+            ));
+
+            // 3. A local file changed in between: started over.
+            let id = start(Location::Local(work.join("up2")), root.clone()).await;
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            let _ = requests.pause_transfer(id.clone()).await;
+            let _ = wait_for(id.clone(), paused).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            std::fs::write(work.join("up2/big.bin"), pattern(2)).unwrap();
+            let (up_before, _) = passed();
+            let _ = requests.continue_transfer(id.clone()).await;
+            let done = wait_for(id.clone(), ended).await;
+            let (up_after, _) = passed();
+            let sent = (up_after - up_before) / MIB;
+            steps.push((
+                format!("a changed file is sent whole ({sent} MiB)"),
+                check(
+                    done.as_ref()
+                        .is_some_and(|job| job.status == TransferStatus::Completed)
+                        && sent >= 300,
+                    format!("{:?}", done.map(|job| job.status)),
+                ),
+            ));
+            let unfinished = requests
+                .unfinished_uploads(pid.clone(), bucket.clone())
+                .await;
+            steps.push((
+                "no unfinished upload is left".into(),
+                check(unfinished == Ok(0), format!("{unfinished:?}")),
+            ));
+
+            // 4. A download cut off goes on from where it stopped.
+            let id = start(a.clone(), Location::Local(work.join("down"))).await;
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            std::fs::write(&control, "cut").unwrap();
+            let failed = wait_for(id.clone(), ended).await;
+            let kept = kept_bytes(&failed);
+            steps.push((
+                format!("a cut download keeps its file ({} MiB)", kept / MIB),
+                check(kept > 0, format!("{:?}", failed.map(|job| job.status))),
+            ));
+            std::fs::remove_file(&control).unwrap();
+            let (_, down_before) = passed();
+            let retried = requests.retry_transfer(id.clone()).await;
+            let done = wait_for(id.clone(), ended).await;
+            let (_, down_after) = passed();
+            let fetched = (down_after - down_before) / MIB;
+            steps.push((
+                format!("it completes, fetching only the rest ({fetched} MiB)"),
+                check(
+                    retried == Ok(Some(id.clone()))
+                        && done
+                            .as_ref()
+                            .is_some_and(|job| job.status == TransferStatus::Completed)
+                        && fetched < (size - kept) / MIB + 10,
+                    format!("{retried:?} {:?}", done.map(|job| job.status)),
+                ),
+            ));
+            let same = std::fs::read(work.join("down/big.bin")).ok() == Some(pattern(0));
+            steps.push((
+                "the download is byte for byte the object".into(),
+                check(same, String::new()),
+            ));
+
+            // 5. Paused while the object is replaced: started over, new content.
+            let id = start(root.clone(), Location::Local(work.join("down2"))).await;
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            let _ = requests.pause_transfer(id.clone()).await;
+            let stopped = wait_for(id.clone(), paused).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let stopped = job_of(id.clone()).await.or(stopped);
+            steps.push((
+                "a paused download keeps its file".into(),
+                check(kept_bytes(&stopped) > 0, String::new()),
+            ));
+            let rows: Vec<_> = requests
+                .list(root.clone(), None, true, crate::listing::Sort::default())
+                .await
+                .unwrap()
+                .entries
+                .into_iter()
+                .filter(|row| row.name == "big.bin")
+                .collect();
+            let _ = requests.delete(plan_deletion(&root, &rows).unwrap()).await;
+            std::fs::write(work.join("up2/big.bin"), pattern(3)).unwrap();
+            let replaced = start(Location::Local(work.join("up2")), root.clone()).await;
+            let _ = wait_for(replaced, completed).await;
+            let _ = requests.continue_transfer(id.clone()).await;
+            let done = wait_for(id.clone(), ended).await;
+            let fresh = std::fs::read(work.join("down2/big.bin")).ok() == Some(pattern(3));
+            steps.push((
+                "a replaced object is downloaded afresh".into(),
+                check(
+                    fresh && done.is_some_and(|job| job.status == TransferStatus::Completed),
+                    String::new(),
+                ),
+            ));
+
+            // 6. Removing or cancelling a paused transfer lets go of what it kept.
+            let id = start(
+                Location::Local(work.join("up")),
+                Location::objects(&pid, &bucket, "c/"),
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            let _ = requests.pause_transfer(id.clone()).await;
+            let _ = wait_for(id.clone(), paused).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let cancelled = requests.cancel_transfer(id.clone()).await;
+            let unfinished = requests
+                .unfinished_uploads(pid.clone(), bucket.clone())
+                .await;
+            steps.push((
+                "cancelling a paused upload aborts its parts".into(),
+                check(
+                    cancelled.is_ok() && unfinished == Ok(0),
+                    format!("{cancelled:?} {unfinished:?}"),
+                ),
+            ));
+            std::fs::remove_dir_all(work.join("down2")).unwrap();
+            std::fs::create_dir_all(work.join("down2")).unwrap();
+            let id = start(a.clone(), Location::Local(work.join("down2"))).await;
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            let _ = requests.pause_transfer(id.clone()).await;
+            let _ = wait_for(id.clone(), paused).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let removed = requests.cancel_transfer(id.clone()).await;
+            let left: Vec<_> = std::fs::read_dir(work.join("down2"))
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name())
+                .collect();
+            steps.push((
+                "cancelling a paused download removes its file".into(),
+                check(
+                    removed.is_ok() && left.is_empty(),
+                    format!("{removed:?} {left:?}"),
+                ),
+            ));
+
+            // 7. An upload paused before quitting stays paused; a download
+            // running when the app quits is paused. Both go on after the
+            // next start.
+            let upload = start(
+                Location::Local(work.join("up")),
+                Location::objects(&pid, &bucket, "d/"),
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            let _ = requests.pause_transfer(upload.clone()).await;
+            let _ = wait_for(upload.clone(), paused).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let id = start(a.clone(), Location::Local(work.join("down2"))).await;
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            (pid, id, upload)
+        });
+        // Quitting pauses it.
+        drop(requests);
+        drop(backend);
+        let queue = std::sync::Arc::new(EventQueue::default());
+        let backend = Backend::start(config.clone(), queue.sink()).unwrap();
+        let requests = backend.requests().unwrap();
+        futures_lite(async {
+            let job = requests
+                .transfer_job(paused_download.clone())
+                .await
+                .ok()
+                .flatten();
+            let kept = matches!(job.as_ref().and_then(|job| job.resume.clone()), Some(ResumeState::Download(kept)) if kept.bytes > 0);
+            steps.push((
+                "after quitting, the download is paused and kept its file".into(),
+                check(
+                    kept && job
+                        .as_ref()
+                        .is_some_and(|job| job.status == TransferStatus::Paused),
+                    format!("{:?}", job.map(|job| job.status)),
+                ),
+            ));
+            let continued = requests.continue_transfer(paused_download.clone()).await;
+            let mut done = None;
+            for _ in 0..1500 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let job = requests
+                    .transfer_job(paused_download.clone())
+                    .await
+                    .ok()
+                    .flatten();
+                if job.as_ref().is_some_and(|job| {
+                    matches!(
+                        job.status,
+                        TransferStatus::Completed
+                            | TransferStatus::Failed(_)
+                            | TransferStatus::Cancelled
+                    )
+                }) {
+                    done = job;
+                    break;
+                }
+            }
+            let same = std::fs::read(work.join("down2/big.bin")).ok() == Some(pattern(0));
+            steps.push((
+                "after the next start it goes on and completes".into(),
+                check(
+                    continued == Ok(true)
+                        && same
+                        && done.is_some_and(|job| job.status == TransferStatus::Completed),
+                    format!("{continued:?}"),
+                ),
+            ));
+            let job = requests
+                .transfer_job(paused_upload.clone())
+                .await
+                .ok()
+                .flatten();
+            let parts = matches!(job.as_ref().and_then(|job| job.resume.clone()), Some(ResumeState::Upload(kept)) if !kept.parts.is_empty());
+            steps.push((
+                "an upload paused before quitting is still paused, with its parts".into(),
+                check(
+                    parts
+                        && job
+                            .as_ref()
+                            .is_some_and(|job| job.status == TransferStatus::Paused),
+                    format!("{:?}", job.map(|job| job.status)),
+                ),
+            ));
+            let continued = requests.continue_transfer(paused_upload.clone()).await;
+            let mut done = None;
+            for _ in 0..1500 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let job = requests
+                    .transfer_job(paused_upload.clone())
+                    .await
+                    .ok()
+                    .flatten();
+                if job.as_ref().is_some_and(|job| {
+                    matches!(
+                        job.status,
+                        TransferStatus::Completed
+                            | TransferStatus::Failed(_)
+                            | TransferStatus::Cancelled
+                    )
+                }) {
+                    done = job;
+                    break;
+                }
+            }
+            steps.push((
+                "and it goes on to the end".into(),
+                check(
+                    continued == Ok(true)
+                        && done.is_some_and(|job| job.status == TransferStatus::Completed),
+                    format!("{continued:?}"),
+                ),
+            ));
+            let root = Location::objects(&pid, &bucket, "");
+            for prefix in ["a/", "b/", "c/", "d/", ""] {
+                let here = Location::objects(&pid, &bucket, prefix);
+                let rows = requests
+                    .list(here.clone(), None, true, crate::listing::Sort::default())
+                    .await
+                    .unwrap_or_default()
+                    .entries;
+                if let Ok(deletion) = plan_deletion(&here, &rows) {
+                    let _ = requests.delete(deletion).await;
+                }
+            }
+            let _ = root;
+            let _ = requests
+                .unfinished_uploads(pid.clone(), bucket.clone())
+                .await;
+            let _ = requests
+                .delete_bucket(pid.clone(), bucket.clone(), bucket.clone())
+                .await;
+            let _ = requests.delete_profile(pid).await;
+        });
+        drop(backend);
+        let _ = std::fs::remove_dir_all(config);
+        let _ = std::fs::remove_dir_all(&work);
+        for (step, result) in &steps {
+            println!("{step}: {}", if result.is_ok() { "ok" } else { "FAILED" });
+        }
+        let failed: Vec<_> = steps.iter().filter(|(_, result)| result.is_err()).collect();
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    /// Pauses and continues an upload in parts and a download on real
+    /// storage, then compares the download with the original byte for byte.
+    /// Uses the SUPAS3_PANE1_* variables; run with
+    /// `SUPAS3_SMOKE_TEST=pause_and_continue` (size: SUPAS3_LARGE_MIB,
+    /// default 256).
+    #[test]
+    #[ignore]
+    fn pause_and_continue_on_real_storage() {
+        use crate::connection::{Draft, Service};
+        use crate::tasks::EventQueue;
+        use crate::transfer_plan::{plan, plan_deletion};
+        use supas3_core::transfer::resume::ResumeState;
+        use supas3_core::transfer::TransferStatus;
+        let _serial = super::one_backend_at_a_time();
+        let key = |field: &str| {
+            let name = format!("SUPAS3_PANE1_{field}");
+            std::env::var(&name).unwrap_or_else(|_| panic!("{name} is required"))
+        };
+        let service = match key("SERVICE").as_str() {
+            "oss" => Service::Oss,
+            "cos" => Service::Cos,
+            "obs" => Service::Obs,
+            "e2" => Service::IdriveE2,
+            _ => Service::Generic,
+        };
+        let mib: u64 = std::env::var("SUPAS3_LARGE_MIB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256);
+        let draft = Draft {
+            name: "pause".into(),
+            region: key("REGION"),
+            endpoint: key("ENDPOINT"),
+            access_key: key("ACCESS_KEY"),
+            secret_key: key("SECRET_KEY"),
+            bucket: key("BUCKET"),
+            ..Draft::new(service)
+        };
+        let config = test_dir("pause");
+        let work = dirs::home_dir()
+            .unwrap()
+            .join(format!(".supas3-pause-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(work.join("up")).unwrap();
+        std::fs::create_dir_all(work.join("down")).unwrap();
+        let original: Vec<u8> = (0..mib << 20)
+            .map(|i| ((i / 4096 * 13 + i) % 251) as u8)
+            .collect();
+        std::fs::write(work.join("up/paused.bin"), &original).unwrap();
+        let queue = std::sync::Arc::new(EventQueue::default());
+        let backend = Backend::start(config.clone(), queue.sink()).unwrap();
+        let requests = backend.requests().unwrap();
+        let run = format!("supas3-ui-pause/{}/", std::process::id());
+        let report = futures_lite(async {
+            let mut steps: Vec<(String, Result<(), String>)> = Vec::new();
+            let check = |ok: bool, detail: String| if ok { Ok(()) } else { Err(detail) };
+            let profile = requests
+                .save_profile(draft.to_profile(None), false)
+                .await
+                .unwrap();
+            let pid = profile.id.clone();
+            let here = Location::objects(&pid, &draft.bucket, &run);
+            // Queues a plan and gives the id of the one transfer it added.
+            let start = |from: Location, to: Location| {
+                let requests = requests.clone();
+                async move {
+                    let before: std::collections::HashSet<String> = requests
+                        .transfers()
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .map(|job| job.id)
+                        .collect();
+                    let rows: Vec<_> = requests
+                        .list(from.clone(), None, true, crate::listing::Sort::default())
+                        .await
+                        .unwrap()
+                        .entries
+                        .into_iter()
+                        .filter(|row| row.name == "paused.bin")
+                        .collect();
+                    requests
+                        .execute(plan(&from, &rows, &to).unwrap())
+                        .await
+                        .unwrap();
+                    requests
+                        .transfers()
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .map(|job| job.id)
+                        .find(|id| !before.contains(id))
+                        .unwrap()
+                }
+            };
+            // Waits until `ready` holds for the transfer, printing progress.
+            let wait = |id: String, ready: fn(&supas3_core::transfer::TransferJob) -> bool| {
+                let requests = requests.clone();
+                async move {
+                    for tick in 0..(4 * 3600) {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        if let Ok(Some(job)) = requests.transfer_job(id.clone()).await {
+                            if tick % 120 == 0 {
+                                println!(
+                                    "  {:?} {}/{}",
+                                    job.status, job.processed_bytes, job.total_bytes
+                                );
+                            }
+                            if ready(&job) {
+                                return Some(job);
+                            }
+                        }
+                    }
+                    None
+                }
+            };
+            fn ended(job: &supas3_core::transfer::TransferJob) -> bool {
+                matches!(
+                    job.status,
+                    TransferStatus::Completed
+                        | TransferStatus::Failed(_)
+                        | TransferStatus::Cancelled
+                )
+            }
+
+            // Upload: paused once the first part is in, then continued.
+            let id = start(Location::Local(work.join("up")), here.clone()).await;
+            let _ = wait(id.clone(), |job| {
+                job.processed_bytes > (140 << 20)
+                    || job.status != TransferStatus::InProgress && job.processed_bytes > 0
+            })
+            .await;
+            let paused = requests.pause_transfer(id.clone()).await;
+            let stopped = wait(id.clone(), |job| {
+                matches!(job.resume, Some(ResumeState::Upload(_))) || ended(job)
+            })
+            .await;
+            let parts = match stopped.and_then(|job| job.resume) {
+                Some(ResumeState::Upload(upload)) => upload.parts.len(),
+                _ => 0,
+            };
+            steps.push((
+                format!("pause an upload after its first part ({parts} kept)"),
+                check(paused == Ok(true) && parts >= 1, format!("{paused:?}")),
+            ));
+            let continued = requests.continue_transfer(id.clone()).await;
+            let done = wait(id.clone(), ended).await;
+            steps.push((
+                "continue it to the end".into(),
+                check(
+                    continued == Ok(true)
+                        && done
+                            .as_ref()
+                            .is_some_and(|job| job.status == TransferStatus::Completed),
+                    format!("{continued:?} {:?}", done.map(|job| job.status)),
+                ),
+            ));
+
+            // Download: paused part way, then continued.
+            let id = start(here.clone(), Location::Local(work.join("down"))).await;
+            let _ = wait(id.clone(), |job| {
+                job.processed_bytes > (40 << 20) || ended(job)
+            })
+            .await;
+            let paused = requests.pause_transfer(id.clone()).await;
+            let stopped = wait(id.clone(), |job| {
+                matches!(job.resume, Some(ResumeState::Download(_))) || ended(job)
+            })
+            .await;
+            let kept = match stopped.and_then(|job| job.resume) {
+                Some(ResumeState::Download(download)) => download.bytes,
+                _ => 0,
+            };
+            steps.push((
+                format!("pause a download part way ({} MiB kept)", kept >> 20),
+                check(paused == Ok(true) && kept > 0, format!("{paused:?}")),
+            ));
+            let continued = requests.continue_transfer(id.clone()).await;
+            let done = wait(id.clone(), ended).await;
+            steps.push((
+                "continue it to the end".into(),
+                check(
+                    continued == Ok(true)
+                        && done
+                            .as_ref()
+                            .is_some_and(|job| job.status == TransferStatus::Completed),
+                    format!("{continued:?} {:?}", done.map(|job| job.status)),
+                ),
+            ));
+            let same =
+                std::fs::read(work.join("down/paused.bin")).ok().as_deref() == Some(&original[..]);
+            steps.push((
+                "the download matches the original byte for byte".into(),
+                check(same, String::new()),
+            ));
+
+            let rows = requests
+                .list(here.clone(), None, true, crate::listing::Sort::default())
+                .await
+                .unwrap_or_default()
+                .entries;
+            if let Ok(deletion) = plan_deletion(&here, &rows) {
+                let _ = requests.delete(deletion).await;
+            }
+            let _ = requests.delete_profile(pid).await;
+            steps
+        });
+        drop(backend);
         let _ = std::fs::remove_dir_all(config);
         let _ = std::fs::remove_dir_all(&work);
         for (step, result) in &report {

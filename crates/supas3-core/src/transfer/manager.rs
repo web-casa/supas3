@@ -158,6 +158,8 @@ impl TransferManager {
         let mut jobs = self.jobs.write().await;
         let mut finished: Vec<_> = jobs
             .values()
+            // supaS3: a record still holding kept parts or a kept file stays.
+            .filter(|job| job.resume.is_none())
             .filter(|job| {
                 matches!(
                     job.status,
@@ -297,9 +299,9 @@ impl TransferManager {
     pub async fn cancel_job(&self, id: &str) -> bool {
         let mut jobs = self.jobs.write().await;
         if let Some(job) = jobs.get_mut(id) {
-            // Can only cancel Pending or InProgress jobs
+            // Can only cancel Pending or InProgress jobs (supaS3: or Paused)
             match job.status {
-                TransferStatus::Pending | TransferStatus::InProgress => {
+                TransferStatus::Pending | TransferStatus::InProgress | TransferStatus::Paused => {
                     job.status = TransferStatus::Cancelled;
                     job.progress.lock().unwrap().cancelled = true;
                     job.bytes_per_second = 0.0;
@@ -387,6 +389,15 @@ impl TransferManager {
 
     /// Retry a failed transfer
     pub async fn retry_job(&self, id: &str) -> Option<String> {
+        // supaS3: a transfer that kept what it sent goes on under its own id.
+        if self.get_job(id).await.is_some_and(|job| {
+            job.resume.is_some()
+                && matches!(job.status, TransferStatus::Failed(_))
+                && (!matches!(job.transfer_type, TransferType::Download)
+                    || job.download_destination.is_some())
+        }) {
+            return self.continue_job(id, None).await.then(|| id.to_string());
+        }
         let jobs = self.jobs.read().await;
         if let Some(job) = jobs.get(id) {
             // Can only retry Failed or Cancelled jobs
@@ -426,6 +437,7 @@ impl TransferManager {
                     new_job.replace_etag = job.replace_etag.clone();
                     new_job.version_id = job.version_id.clone();
                     new_job.bandwidth_limit = job.bandwidth_limit;
+                    new_job.resumable = job.resumable;
 
                     // Preserve grouping info
                     new_job.parent_group_id = job.parent_group_id.clone();
@@ -455,6 +467,8 @@ impl TransferManager {
                 total_bytes: job.total_bytes,
                 status: job.status.clone(),
                 finished_at: job.finished_at,
+                pausable: Self::can_pause(job),
+                kept: job.resume.is_some(),
             };
             let _ = app.emit("transfer-update", event);
         }
@@ -658,6 +672,16 @@ impl TransferManager {
                         | TransferStatus::Completed
                         | TransferStatus::Failed(_)
                 ) && job.status != status
+                {
+                    return;
+                }
+                // supaS3: the stopped attempt of a paused transfer ends in an
+                // error; the transfer stays paused.
+                if job.status == TransferStatus::Paused
+                    && matches!(
+                        status,
+                        TransferStatus::Failed(_) | TransferStatus::InProgress
+                    )
                 {
                     return;
                 }
@@ -962,75 +986,115 @@ impl TransferManager {
     ) -> crate::error::Result<()> {
         self.ensure_multipart_job_active(&job.id).await?;
         let plan = plan_multipart_upload(file_size)?;
-        let mut create_request = client
-            .create_multipart_upload()
-            .bucket(&job.bucket)
-            .key(&job.key)
-            .content_type(content_type);
-        if let Some(attributes) = attributes {
-            create_request = super::sync::apply_multipart(create_request, attributes);
-        }
-        if let Some(source) = &job.sync_source {
-            create_request = create_request.set_metadata(Some(super::sync_state::with_hash(
-                attributes.and_then(|a| a.head.metadata.as_ref()),
-                &source.sha256,
-            )));
-        }
-        let create_send = async {
-            let result = create_request.clone().send().await;
-            if result
-                .as_ref()
-                .err()
-                .is_some_and(super::sync::rejects_acl_grants)
-                && attributes.is_some_and(|a| a.acl.is_some())
-            {
-                create_request
-                    .set_grant_full_control(None)
-                    .set_grant_read(None)
-                    .set_grant_read_acp(None)
-                    .set_grant_write_acp(None)
-                    .send()
-                    .await
-            } else {
-                result
-            }
+        // supaS3: go on with the parts an earlier attempt kept, while the
+        // file is unchanged and the service still has them.
+        let started_as =
+            crate::fsutil::FileIdentity::of(std::path::Path::new(&job.local_path)).ok();
+        let resumed = self.resumed_upload(client, job, started_as).await?;
+        let plan = match &resumed {
+            Some(kept) => super::resume::plan_of(file_size, kept.part_size),
+            None => plan,
         };
-        let created = match tokio::time::timeout(METADATA_REQUEST_TIMEOUT, create_send).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(error)) => {
-                return Err(crate::error::AppError::S3Error(format!(
-                    "Could not start multipart upload for s3://{}/{}: {}",
-                    job.bucket,
-                    job.key,
-                    DisplayErrorContext(&error)
-                )));
-            }
-            Err(_) => {
-                return Err(crate::error::AppError::S3Error(format!(
+        let upload_id = match &resumed {
+            Some(kept) => kept.upload_id.clone(),
+            None => {
+                let mut create_request = client
+                    .create_multipart_upload()
+                    .bucket(&job.bucket)
+                    .key(&job.key)
+                    .content_type(content_type);
+                if let Some(attributes) = attributes {
+                    create_request = super::sync::apply_multipart(create_request, attributes);
+                }
+                if let Some(source) = &job.sync_source {
+                    create_request =
+                        create_request.set_metadata(Some(super::sync_state::with_hash(
+                            attributes.and_then(|a| a.head.metadata.as_ref()),
+                            &source.sha256,
+                        )));
+                }
+                let create_send = async {
+                    let result = create_request.clone().send().await;
+                    if result
+                        .as_ref()
+                        .err()
+                        .is_some_and(super::sync::rejects_acl_grants)
+                        && attributes.is_some_and(|a| a.acl.is_some())
+                    {
+                        create_request
+                            .set_grant_full_control(None)
+                            .set_grant_read(None)
+                            .set_grant_read_acp(None)
+                            .set_grant_write_acp(None)
+                            .send()
+                            .await
+                    } else {
+                        result
+                    }
+                };
+                let created = match tokio::time::timeout(METADATA_REQUEST_TIMEOUT, create_send)
+                    .await
+                {
+                    Ok(Ok(output)) => output,
+                    Ok(Err(error)) => {
+                        return Err(crate::error::AppError::S3Error(format!(
+                            "Could not start multipart upload for s3://{}/{}: {}",
+                            job.bucket,
+                            job.key,
+                            DisplayErrorContext(&error)
+                        )));
+                    }
+                    Err(_) => {
+                        return Err(crate::error::AppError::S3Error(format!(
                     "Starting multipart upload timed out after {}s for s3://{}/{} with no response from S3 \
                      (check the endpoint, region, network/proxy, and TLS configuration)",
                     METADATA_REQUEST_TIMEOUT.as_secs(),
                     job.bucket,
                     job.key
                 )));
+                    }
+                };
+                created
+                    .upload_id()
+                    .ok_or_else(|| {
+                        crate::error::AppError::S3Error(format!(
+                            "S3 did not return an upload ID for s3://{}/{}",
+                            job.bucket, job.key
+                        ))
+                    })?
+                    .to_string()
             }
         };
-        let upload_id = created.upload_id().ok_or_else(|| {
-            crate::error::AppError::S3Error(format!(
-                "S3 did not return an upload ID for s3://{}/{}",
-                job.bucket, job.key
-            ))
-        })?;
-        let mut guard =
-            MultipartUploadGuard::new(client.clone(), &job.bucket, &job.key, upload_id.to_string());
+        let mut guard = MultipartUploadGuard::new(client.clone(), &job.bucket, &job.key, upload_id);
+        let kept_parts = resumed.map(|kept| kept.parts).unwrap_or_default();
+        let mut sent = kept_parts.clone();
+        let mut in_part = false;
 
         let upload_result: crate::error::Result<()> = async {
             self.ensure_multipart_job_active(&job.id).await?;
             let mut completed_parts = Vec::with_capacity(plan.parts.len());
             let mut uploaded_bytes = 0_u64;
+            for part in &kept_parts {
+                completed_parts.push(
+                    CompletedPart::builder()
+                        .part_number(part.number)
+                        .e_tag(&part.etag)
+                        .build(),
+                );
+                uploaded_bytes += part.length;
+            }
+            // Kept parts belong to plain uploads, which start at 0.
+            if uploaded_bytes > 0 {
+                job.progress.lock().unwrap().position = uploaded_bytes;
+                self.update_job_progress(&job.id, uploaded_bytes).await;
+            }
 
             for part in &plan.parts {
+                if kept_parts.iter().any(|kept| kept.number == part.number) {
+                    continue;
+                }
                 self.ensure_multipart_job_active(&job.id).await?;
+                in_part = true;
                 let body = ByteStream::read_from()
                     .path(&job.local_path)
                     .offset(part.offset)
@@ -1060,6 +1124,15 @@ impl TransferManager {
                 let output = match tokio::time::timeout(part_timeout, part_send).await {
                     Ok(Ok(output)) => output,
                     Ok(Err(error)) => {
+                        // supaS3: refused outright (not a busy service): the
+                        // parts are not worth keeping.
+                        if error
+                            .raw_response()
+                            .map(|raw| raw.status().as_u16())
+                            .is_some_and(|status| status < 500 && status != 408 && status != 429)
+                        {
+                            in_part = false;
+                        }
                         return Err(crate::error::AppError::S3Error(format!(
                             "Multipart upload failed at part {} of {} for s3://{}/{}: {}",
                             part.number,
@@ -1095,11 +1168,18 @@ impl TransferManager {
                         .e_tag(e_tag)
                         .build(),
                 );
+                sent.push(super::resume::DonePart {
+                    number: part.number,
+                    etag: e_tag.to_string(),
+                    length: part.length,
+                });
+                in_part = false;
                 uploaded_bytes += part.length;
                 self.update_job_progress(&job.id, offset + uploaded_bytes).await;
             }
 
             self.ensure_multipart_job_active(&job.id).await?;
+            completed_parts.sort_by_key(|part| part.part_number());
             let completed_upload = CompletedMultipartUpload::builder()
                 .set_parts(Some(completed_parts))
                 .build();
@@ -1150,6 +1230,24 @@ impl TransferManager {
         .await;
 
         if let Err(error) = upload_result {
+            // supaS3: paused, or cut off while sending a part: keep the parts
+            // for the next attempt instead of aborting them.
+            let kept = super::resume::UploadResume {
+                upload_id: guard.upload_id().to_string(),
+                part_size: plan.part_size,
+                file: started_as.unwrap_or(crate::fsutil::FileIdentity {
+                    size: 0,
+                    modified_nanos: 0,
+                    changed_nanos: 0,
+                    volume: 0,
+                    index: 0,
+                }),
+                parts: sent,
+            };
+            if self.keep_upload(job, started_as, in_part, kept).await {
+                guard.disarm();
+                return Err(error);
+            }
             if let Err(abort_error) = guard.abort().await {
                 log::error!("{}", abort_error);
             }
@@ -1384,6 +1482,21 @@ impl TransferManager {
                                 .await?
                                 .clone()
                         };
+                        // supaS3: parts kept against the first region go.
+                        if let Some(super::resume::ResumeState::Upload(kept)) =
+                            self.take_resume(&job.id).await
+                        {
+                            let _ = tokio::time::timeout(
+                                METADATA_REQUEST_TIMEOUT,
+                                client
+                                    .abort_multipart_upload()
+                                    .bucket(&job.bucket)
+                                    .key(&job.key)
+                                    .upload_id(&kept.upload_id)
+                                    .send(),
+                            )
+                            .await;
+                        }
                         self.update_job_progress(&job.id, 0).await;
                         self.upload_file(&retry_client, job, &content_type)
                             .await
@@ -1403,43 +1516,54 @@ impl TransferManager {
                 }
             }
             TransferType::Download => {
-                let result = tokio::time::timeout(
-                    METADATA_REQUEST_TIMEOUT,
-                    client
-                        .get_object()
-                        .bucket(&job.bucket)
-                        .key(&job.key)
-                        .set_version_id(job.version_id.clone())
-                        .send(),
-                )
-                .await;
+                // supaS3: a kept part of this download is gone on with while
+                // the object is unchanged.
+                let resumed = self.resumed_download(&client, job).await?;
+                let (mut output, mut download, mut downloaded, resumed_total) = match resumed {
+                    Some(resumed) => (
+                        resumed.output,
+                        resumed.download,
+                        resumed.from,
+                        Some(resumed.total),
+                    ),
+                    None => {
+                        let result = tokio::time::timeout(
+                            METADATA_REQUEST_TIMEOUT,
+                            client
+                                .get_object()
+                                .bucket(&job.bucket)
+                                .key(&job.key)
+                                .set_version_id(job.version_id.clone())
+                                .send(),
+                        )
+                        .await;
 
-                let mut output = match result {
-                    Ok(Ok(output)) => output,
-                    Err(_) => {
-                        return Err(crate::error::AppError::S3Error(format!(
+                        let output = match result {
+                            Ok(Ok(output)) => output,
+                            Err(_) => {
+                                return Err(crate::error::AppError::S3Error(format!(
                             "Download timed out after {}s for s3://{}/{} with no response from S3 \
                              (check the endpoint, region, network/proxy, and TLS configuration)",
                             METADATA_REQUEST_TIMEOUT.as_secs(),
                             job.bucket,
                             job.key
                         )));
-                    }
-                    Ok(Err(err)) => {
-                        log::warn!(
-                            "download transfer failed, attempting region discovery: {}",
-                            DisplayErrorContext(&err)
-                        );
+                            }
+                            Ok(Err(err)) => {
+                                log::warn!(
+                                    "download transfer failed, attempting region discovery: {}",
+                                    DisplayErrorContext(&err)
+                                );
 
-                        if let Some(new_region) = detect_region.await? {
-                            let retry_client = {
-                                let mut s3 = s3_manager.write().await;
-                                s3.get_client_for_region(profile, &new_region)
-                                    .await?
-                                    .clone()
-                            };
+                                if let Some(new_region) = detect_region.await? {
+                                    let retry_client = {
+                                        let mut s3 = s3_manager.write().await;
+                                        s3.get_client_for_region(profile, &new_region)
+                                            .await?
+                                            .clone()
+                                    };
 
-                            tokio::time::timeout(
+                                    tokio::time::timeout(
                                 METADATA_REQUEST_TIMEOUT,
                                 retry_client
                                     .get_object()
@@ -1464,61 +1588,81 @@ impl TransferManager {
                                     DisplayErrorContext(&e)
                                 ))
                                 })?
-                        } else {
-                            return Err(crate::error::AppError::S3Error(format!(
-                                "{}",
-                                DisplayErrorContext(&err)
-                            )));
-                        }
-                    }
-                };
+                                } else {
+                                    return Err(crate::error::AppError::S3Error(format!(
+                                        "{}",
+                                        DisplayErrorContext(&err)
+                                    )));
+                                }
+                            }
+                        };
 
-                // A version asked for by id must be the one that arrived.
-                if let Some(expected) = &job.version_id {
-                    // In a bucket without versioning the one version is
-                    // "null", and the answer may name no version at all.
-                    let answered = output.version_id().unwrap_or("null");
-                    if answered != expected {
-                        return Err(crate::error::AppError::S3Error(format!(
+                        // A version asked for by id must be the one that arrived.
+                        if let Some(expected) = &job.version_id {
+                            // In a bucket without versioning the one version is
+                            // "null", and the answer may name no version at all.
+                            let answered = output.version_id().unwrap_or("null");
+                            if answered != expected {
+                                return Err(crate::error::AppError::S3Error(format!(
                             "The service returned a different version of s3://{}/{} than the one \
                              asked for; nothing was saved.",
                             job.bucket, job.key
                         )));
-                    }
-                }
-                let destination = job.download_destination.as_ref().ok_or_else(|| {
-                    crate::error::AppError::IoError(
-                        "Missing download destination. Queue the download again.".to_string(),
-                    )
-                })?;
-                let mut download = destination.begin()?;
-
-                let mut downloaded: u64 = 0;
-                let mut last_update = std::time::Instant::now();
-
-                while let Some(bytes) =
-                    tokio::time::timeout(METADATA_REQUEST_TIMEOUT, output.body.try_next())
-                        .await
-                        .map_err(|_| {
-                            crate::error::AppError::S3Error(
-                                "Download stalled for 60 seconds. Check the connection and retry."
-                                    .into(),
+                            }
+                        }
+                        let destination = job.download_destination.as_ref().ok_or_else(|| {
+                            crate::error::AppError::IoError(
+                                "Missing download destination. Queue the download again."
+                                    .to_string(),
                             )
-                        })?
-                        .map_err(|e| {
-                            crate::error::AppError::S3Error(format!("{}", DisplayErrorContext(&e)))
-                        })?
-                {
-                    for chunk in bytes.chunks(16 * 1024) {
-                        self.pace_download(job, chunk.len() as u64).await?;
-                        download.write_all(chunk).await?;
+                        })?;
+                        let download = destination.begin()?;
+                        (output, download, 0_u64, None)
                     }
+                };
 
-                    downloaded += bytes.len() as u64;
+                let mut last_update = std::time::Instant::now();
+                // supaS3: what a stopped download needs to be gone on with.
+                let etag = output.e_tag().map(str::to_string);
+                let total = resumed_total
+                    .or_else(|| output.content_length().map(|length| length.max(0) as u64));
+                let mut cut_off = false;
+                let read: crate::error::Result<()> = async {
+                    while let Some(bytes) = super::resume::next_chunk(
+                        &mut output.body,
+                        &job.progress,
+                        METADATA_REQUEST_TIMEOUT,
+                    )
+                    .await
+                    .inspect_err(|_| cut_off = true)?
+                    {
+                        for chunk in bytes.chunks(16 * 1024) {
+                            self.pace_download(job, chunk.len() as u64).await?;
+                            download.write_all(chunk).await?;
+                        }
 
-                    if last_update.elapsed() >= std::time::Duration::from_millis(100) {
-                        self.update_job_progress(&job.id, downloaded).await;
-                        last_update = std::time::Instant::now();
+                        downloaded += bytes.len() as u64;
+
+                        if last_update.elapsed() >= std::time::Duration::from_millis(100) {
+                            self.update_job_progress(&job.id, downloaded).await;
+                            last_update = std::time::Instant::now();
+                        }
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = read {
+                    self.keep_download(job, download, cut_off, etag, total)
+                        .await;
+                    return Err(error);
+                }
+                // A download gone on with must come out whole.
+                if let Some(total) = resumed_total {
+                    if download.written().await? != total {
+                        return Err(crate::error::AppError::S3Error(
+                            "The resumed download did not add up to the object's size; try again."
+                                .into(),
+                        ));
                     }
                 }
 
@@ -1531,7 +1675,11 @@ impl TransferManager {
                 let current = jobs.get_mut(&job.id).ok_or_else(|| {
                     crate::error::AppError::IoError("Download was removed".to_string())
                 })?;
-                if current.status != TransferStatus::InProgress {
+                // supaS3: paused after the last byte arrived: it is done.
+                if !matches!(
+                    current.status,
+                    TransferStatus::InProgress | TransferStatus::Paused
+                ) {
                     return Err(crate::error::AppError::IoError(
                         "Download was cancelled".to_string(),
                     ));
@@ -1545,6 +1693,394 @@ impl TransferManager {
         }
 
         Ok(())
+    }
+}
+
+/// supaS3: pausing, going on, and what a stopped transfer keeps.
+impl TransferManager {
+    /// Whether a transfer can be paused and gone on with later: a plain
+    /// download, or a plain upload large enough to go in parts.
+    pub fn can_pause(job: &TransferJob) -> bool {
+        super::resume::may_keep(job)
+            && (matches!(job.transfer_type, TransferType::Download)
+                || Self::is_multipart_upload_job(job))
+    }
+
+    /// Marks transfers the user started directly; only these keep what they
+    /// sent when they stop.
+    pub async fn mark_resumable(&self, ids: &[String]) {
+        let mut marked = Vec::new();
+        {
+            let mut jobs = self.jobs.write().await;
+            for id in ids {
+                if let Some(job) = jobs.get_mut(id) {
+                    job.resumable = true;
+                    marked.push(job.clone());
+                }
+            }
+        }
+        self.persist_or_log().await;
+        for job in &marked {
+            self.emit_update(job).await;
+        }
+    }
+
+    /// Stops a transfer so that it can be gone on with: its attempt ends
+    /// and keeps what it sent.
+    pub async fn pause_job(&self, id: &str) -> bool {
+        let paused = {
+            let mut jobs = self.jobs.write().await;
+            let Some(job) = jobs.get_mut(id) else {
+                return false;
+            };
+            if !Self::can_pause(job)
+                || !matches!(
+                    job.status,
+                    TransferStatus::Pending | TransferStatus::InProgress
+                )
+            {
+                return false;
+            }
+            job.status = TransferStatus::Paused;
+            job.bytes_per_second = 0.0;
+            job.progress.lock().unwrap().cancelled = true;
+            job.clone()
+        };
+        self.queue.lock().await.retain(|queued| queued != id);
+        self.persist_or_log().await;
+        self.emit_update(&paused).await;
+        true
+    }
+
+    /// Goes on with a paused transfer, or a failed one that kept what it
+    /// sent, under the same id, once its stopped attempt has ended. A
+    /// download from an earlier run needs its destination again.
+    pub async fn continue_job(
+        &self,
+        id: &str,
+        destination: Option<Arc<super::download::DownloadDestination>>,
+    ) -> bool {
+        // The stopped attempt must have ended: two attempts on one transfer
+        // would write over each other's state and data.
+        let mut waited = 0;
+        while self
+            .abort_handles
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            if waited >= 100 {
+                return false;
+            }
+            waited += 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let job = {
+            let mut jobs = self.jobs.write().await;
+            let Some(job) = jobs.get_mut(id) else {
+                return false;
+            };
+            let may = match &job.status {
+                TransferStatus::Paused => true,
+                TransferStatus::Failed(_) => job.resume.is_some(),
+                _ => false,
+            };
+            if !may {
+                return false;
+            }
+            if destination.is_some() {
+                job.download_destination = destination;
+            }
+            if matches!(job.transfer_type, TransferType::Download)
+                && job.download_destination.is_none()
+            {
+                return false;
+            }
+            job.status = TransferStatus::Pending;
+            job.finished_at = None;
+            job.bytes_per_second = 0.0;
+            job.progress = Default::default();
+            job.processed_bytes = job.resume.as_ref().map_or(0, |kept| kept.done_bytes());
+            job.clone()
+        };
+        self.queue.lock().await.push_back(id.to_string());
+        self.persist_or_log().await;
+        self.emit_update(&job).await;
+        true
+    }
+
+    /// Takes what a stopped transfer kept, leaving it to the caller.
+    pub async fn take_resume(&self, id: &str) -> Option<super::resume::ResumeState> {
+        let taken = self
+            .jobs
+            .write()
+            .await
+            .get_mut(id)
+            .and_then(|job| job.resume.take());
+        if taken.is_some() {
+            self.persist_or_log().await;
+        }
+        taken
+    }
+
+    /// Gives back what [`Self::take_resume`] took, when letting go of it
+    /// failed.
+    pub async fn restore_resume(&self, id: &str, state: super::resume::ResumeState) {
+        self.keep_resume(id, state).await;
+    }
+
+    /// Records what a stopped transfer kept, unless it was cancelled or
+    /// removed meanwhile: then nobody would let go of it. True when kept.
+    async fn keep_resume(&self, id: &str, state: super::resume::ResumeState) -> bool {
+        let kept = match self.jobs.write().await.get_mut(id) {
+            Some(job) if job.status != TransferStatus::Cancelled => {
+                job.resume = Some(state);
+                true
+            }
+            _ => false,
+        };
+        if kept {
+            self.persist_or_log().await;
+        }
+        kept
+    }
+
+    /// The parts an earlier attempt kept that can still be used, or `None`
+    /// to start afresh (after letting go of anything unusable). Without an
+    /// answer from the service, what was kept stays for the next attempt.
+    async fn resumed_upload(
+        &self,
+        client: &Client,
+        job: &TransferJob,
+        started_as: Option<crate::fsutil::FileIdentity>,
+    ) -> crate::error::Result<Option<super::resume::UploadResume>> {
+        use super::resume::{list_parts, usable, ListError, Listed, ResumeState};
+        let Some(ResumeState::Upload(kept)) = self.take_resume(&job.id).await else {
+            return Ok(None);
+        };
+        let current = self.get_job(&job.id).await;
+        if current.as_ref().is_some_and(super::resume::may_keep) && started_as == Some(kept.file) {
+            let listed = tokio::time::timeout(
+                METADATA_REQUEST_TIMEOUT,
+                list_parts(client, &job.bucket, &job.key, &kept.upload_id),
+            )
+            .await
+            .unwrap_or_else(|_| Err(ListError::Unreachable("no answer".into())));
+            match listed {
+                Ok(Listed::Parts(listed)) => {
+                    let parts = usable(&kept.parts, &listed);
+                    if !parts.is_empty() {
+                        return Ok(Some(super::resume::UploadResume { parts, ..kept }));
+                    }
+                }
+                Ok(Listed::Gone) => return Ok(None),
+                Err(ListError::Unreachable(error)) => {
+                    self.keep_resume(&job.id, ResumeState::Upload(kept)).await;
+                    return Err(crate::error::AppError::S3Error(format!(
+                        "Could not reach the service to go on with the upload: {error}"
+                    )));
+                }
+                Err(ListError::Refused(error)) => {
+                    log::warn!("Could not list the kept parts: {error}")
+                }
+            }
+        }
+        let _ = tokio::time::timeout(
+            METADATA_REQUEST_TIMEOUT,
+            client
+                .abort_multipart_upload()
+                .bucket(&job.bucket)
+                .key(&job.key)
+                .upload_id(&kept.upload_id)
+                .send(),
+        )
+        .await;
+        Ok(None)
+    }
+
+    /// Keeps the parts of an upload that was paused, or cut off while
+    /// sending a part, while the file is unchanged. True when kept.
+    async fn keep_upload(
+        &self,
+        job: &TransferJob,
+        started_as: Option<crate::fsutil::FileIdentity>,
+        in_part: bool,
+        kept: super::resume::UploadResume,
+    ) -> bool {
+        // The record as it is now: marked resumable perhaps after this
+        // attempt started.
+        let Some(current) = self.get_job(&job.id).await else {
+            return false;
+        };
+        let paused = current.status == TransferStatus::Paused;
+        if !super::resume::may_keep(&current)
+            || kept.parts.is_empty()
+            || !(paused || (in_part && current.status == TransferStatus::InProgress))
+        {
+            return false;
+        }
+        let now = crate::fsutil::FileIdentity::of(std::path::Path::new(&job.local_path)).ok();
+        if started_as.is_none() || now != started_as {
+            return false;
+        }
+        self.keep_resume(&job.id, super::resume::ResumeState::Upload(kept))
+            .await
+    }
+
+    /// The rest of a download an earlier attempt kept part of, or `None` to
+    /// start afresh (after removing the kept file if it cannot be used).
+    async fn resumed_download(
+        &self,
+        client: &Client,
+        job: &TransferJob,
+    ) -> crate::error::Result<Option<super::resume::ResumedDownload>> {
+        use super::resume::{continues, ResumeState, ResumedDownload};
+        let Some(ResumeState::Download(kept)) = self.take_resume(&job.id).await else {
+            return Ok(None);
+        };
+        let Some(destination) = job.download_destination.as_ref() else {
+            let _ = super::resume::discard_download(&kept);
+            return Ok(None);
+        };
+        if !self
+            .get_job(&job.id)
+            .await
+            .is_some_and(|current| super::resume::may_keep(&current))
+        {
+            destination.discard(&kept.temporary_name, kept.file);
+            return Ok(None);
+        }
+        let answer = tokio::time::timeout(
+            METADATA_REQUEST_TIMEOUT,
+            client
+                .get_object()
+                .bucket(&job.bucket)
+                .key(&job.key)
+                .set_version_id(job.version_id.clone())
+                .range(format!("bytes={}-", kept.bytes))
+                .if_match(&kept.etag)
+                .send(),
+        )
+        .await;
+        let output = match answer {
+            Ok(Ok(output)) if continues(output.content_range(), output.e_tag(), &kept) => output,
+            Ok(Ok(_)) => {
+                destination.discard(&kept.temporary_name, kept.file);
+                return Ok(None);
+            }
+            Ok(Err(error)) => {
+                let status = error.raw_response().map(|raw| raw.status().as_u16());
+                match status {
+                    // Everything was there already.
+                    Some(416) if kept.bytes == kept.total => {
+                        aws_sdk_s3::operation::get_object::GetObjectOutput::builder().build()
+                    }
+                    // The object changed or is gone: start over.
+                    Some(404 | 412 | 416) => {
+                        destination.discard(&kept.temporary_name, kept.file);
+                        return Ok(None);
+                    }
+                    // No answer, a busy service, or a refusal that may pass:
+                    // keep it for the next try.
+                    _ => {
+                        self.keep_resume(&job.id, ResumeState::Download(kept)).await;
+                        return Err(crate::error::AppError::S3Error(
+                            DisplayErrorContext(&error).to_string(),
+                        ));
+                    }
+                }
+            }
+            Err(_) => {
+                self.keep_resume(&job.id, ResumeState::Download(kept)).await;
+                return Err(crate::error::AppError::S3Error(format!(
+                    "Download timed out after {}s with no response from S3",
+                    METADATA_REQUEST_TIMEOUT.as_secs()
+                )));
+            }
+        };
+        match destination
+            .resume(&kept.temporary_name, kept.bytes, kept.file)
+            .await
+        {
+            Ok(download) => {
+                job.progress.lock().unwrap().position = kept.bytes;
+                self.update_job_progress(&job.id, kept.bytes).await;
+                Ok(Some(ResumedDownload {
+                    output,
+                    download,
+                    from: kept.bytes,
+                    total: kept.total,
+                }))
+            }
+            // Gone or changed since: start over (a changed file is left
+            // alone, as it is not the one kept).
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+                ) =>
+            {
+                log::warn!("Could not go on with the kept download: {error}");
+                Ok(None)
+            }
+            // Something in the way (such as a file now at the target): keep
+            // it, and say why.
+            Err(error) => {
+                self.keep_resume(&job.id, ResumeState::Download(kept)).await;
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Keeps the temporary file of a download that was paused or cut off by
+    /// the network, when the object's ETag and size are known.
+    async fn keep_download(
+        &self,
+        job: &TransferJob,
+        mut download: super::download::PendingDownload,
+        cut_off: bool,
+        etag: Option<String>,
+        total: Option<u64>,
+    ) {
+        let Some(current) = self.get_job(&job.id).await else {
+            return;
+        };
+        let paused = current.status == TransferStatus::Paused;
+        if !super::resume::may_keep(&current)
+            || !(paused || (cut_off && current.status == TransferStatus::InProgress))
+        {
+            return;
+        }
+        let (Some(etag), Some(total)) = (etag, total) else {
+            return;
+        };
+        if !matches!(download.written().await, Ok(written) if written > 0 && written <= total) {
+            return;
+        }
+        let Some(folder) = std::path::Path::new(&job.local_path).parent() else {
+            return;
+        };
+        match download.keep().await {
+            Ok((temporary_name, bytes, file)) => {
+                let kept = super::resume::DownloadResume {
+                    folder: folder.to_path_buf(),
+                    temporary_name,
+                    bytes,
+                    total,
+                    etag,
+                    file,
+                };
+                // Cancelled meanwhile: nobody would let go of it.
+                if !self
+                    .keep_resume(&job.id, super::resume::ResumeState::Download(kept.clone()))
+                    .await
+                {
+                    let _ = super::resume::discard_download(&kept);
+                }
+            }
+            Err(error) => log::warn!("Could not keep the download's temporary file: {error}"),
+        }
     }
 }
 

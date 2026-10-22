@@ -129,6 +129,8 @@ enum Metadata {
 }
 
 pub struct DetailsPanel {
+    /// Taken when Tab moves through the window's regions.
+    focus: FocusHandle,
     /// Where the subject's rows were read from.
     source: Option<Location>,
     subject: Option<Subject>,
@@ -144,8 +146,9 @@ pub struct DetailsPanel {
 impl EventEmitter<DetailsEvent> for DetailsPanel {}
 
 impl DetailsPanel {
-    pub fn new() -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
+            focus: cx.focus_handle(),
             source: None,
             subject: None,
             connection: None,
@@ -154,6 +157,10 @@ impl DetailsPanel {
             versioning: None,
             generation: 0,
         }
+    }
+
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
     }
 
     /// Describes `subject`, read from `source`. Showing the same subject
@@ -878,10 +885,15 @@ impl Render for DetailsPanel {
         };
 
         v_flex()
+            .track_focus(&self.focus)
             .size_full()
             .min_w_0()
             .border_l_1()
-            .border_color(cx.theme().border)
+            .border_color(if self.focus.is_focused(window) {
+                cx.theme().ring
+            } else {
+                cx.theme().border
+            })
             .bg(cx.theme().background)
             .child(
                 h_flex()
